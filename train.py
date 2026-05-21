@@ -1,0 +1,599 @@
+"""Single-GPU training loop for speech-llm.
+
+Trains WhisperEncoder + AudioAdapter + Llama jointly with differential learning
+rates (encoder 1e-5, adapter and LLM 1e-4). Supports gradient accumulation,
+mixed precision (torch.amp), periodic checkpointing, and optional W&B logging.
+
+Usage:
+    python train.py \\
+      --shards_file  data/subset_shards.txt \\
+      --tokenizer    data/pruned_tokenizer/ \\
+      --whisper_ckpt weights/whisper_small.pt \\
+      --llama_ckpt   /home/goivagoi/.llama/checkpoints/Llama3.1-8B/ \\
+      --batch_size   4 \\
+      --accum_steps  8 \\
+      --max_steps    100 \\
+      --wandb
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from pathlib import Path
+
+import torch
+
+from data import build_dataloader, build_eval_dataloader, list_shards, PrunedTokenizer
+from model.adapter import AudioAdapter, EvalPrefixBatch, prepare_input
+from model.llama import Llama, LlamaConfig
+from model.whisper_encoder import WhisperEncoder
+
+INSTRUCTION_VARIANTS = [
+    "Transcribe the following audio without formatting.",
+    "Transcribe the following audio with proper formatting.",
+]
+
+# (instruction_text, transcript_key) pairs consumed by build_dataloader.
+# build_eval_dataloader always evaluates both variants regardless of training mode.
+_INSTRUCTION_PAIRS: list[tuple[str, str]] = [
+    (INSTRUCTION_VARIANTS[0], "unformatted.txt"),
+    (INSTRUCTION_VARIANTS[1], "formatted.txt"),
+]
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train SpeechLLM on LibriSpeech shards.")
+
+    shard_group = p.add_mutually_exclusive_group(required=True)
+    shard_group.add_argument(
+        "--shards_file", type=Path,
+        help="Text file listing shard paths, one per line (e.g. data/subset_shards.txt).",
+    )
+    shard_group.add_argument(
+        "--shards", type=str,
+        help="Brace/glob pattern for shards (e.g. 'data/shards/train-{000000..000200}.tar').",
+    )
+
+    p.add_argument("--tokenizer",    type=Path, required=True,
+                   help="Path to pruned tokenizer directory (build_vocab.py output).")
+    p.add_argument("--whisper_ckpt", type=Path, default=None,
+                   help="Path to whisper_small.pt checkpoint. Omit with --stub.")
+    p.add_argument("--llama_ckpt",   type=Path, default=None,
+                   help="Path to Llama 3.1 8B checkpoint directory. Omit with --stub.")
+
+    p.add_argument(
+        "--stub", action="store_true",
+        help=(
+            "Use a tiny randomly-initialised model (no pretrained weights) to "
+            "validate the training pipeline on hardware that cannot fit Llama 8B. "
+            "Config matches smoke_test.py: n_layers=2, d_model=512."
+        ),
+    )
+
+    p.add_argument("--batch_size",      type=int, default=4)
+    p.add_argument("--num_workers",     type=int, default=4)
+    p.add_argument("--accum_steps",     type=int, default=8,
+                   help="Gradient accumulation steps before each optimizer update.")
+    p.add_argument("--max_steps",       type=int, default=None,
+                   help="Stop after this many optimizer steps (for smoke runs).")
+    p.add_argument("--save_every",      type=int, default=500,
+                   help="Save a checkpoint every N optimizer steps.")
+    p.add_argument("--checkpoint_dir",  type=Path, default=Path("checkpoints"))
+    p.add_argument("--seed",            type=int, default=42)
+    p.add_argument("--wandb",           action="store_true",
+                   help="Enable Weights & Biases logging.")
+    p.add_argument("--wandb_project",   type=str, default="speech-llm-dev",
+                   help=(
+                       "W&B project name. Default 'speech-llm-dev' is for local "
+                       "development. Use 'speech-llm' for real training runs."
+                   ))
+
+    # ── Evaluation shards (each a single .tar file) ───────────────────────────
+    p.add_argument("--eval_dev_clean",  type=Path, default=None,
+                   help="Path to dev-clean-000000.tar shard.")
+    p.add_argument("--eval_dev_other",  type=Path, default=None,
+                   help="Path to dev-other-000000.tar shard.")
+    p.add_argument("--eval_test_clean", type=Path, default=None,
+                   help="Path to test-clean-000000.tar shard.")
+    p.add_argument("--eval_test_other", type=Path, default=None,
+                   help="Path to test-other-000000.tar shard.")
+    p.add_argument("--eval_batch_size", type=int, default=8,
+                   help="Batch size for WER evaluation forward passes.")
+    p.add_argument("--max_eval_batches", type=int, default=None,
+                   help="Cap eval at N batches per split (useful during development).")
+
+    p.add_argument(
+        "--instruction_mode",
+        choices=["unformatted", "formatted", "both"],
+        default="unformatted",
+        help=(
+            "Which instruction variant(s) to use during training. "
+            "'unformatted' trains only on the plain-text instruction+label pair. "
+            "'formatted' trains only on the punctuated instruction+label pair. "
+            "'both' randomly alternates between the two per sample (original behaviour). "
+            "Eval always runs both variants regardless of this setting."
+        ),
+    )
+    p.add_argument(
+        "--n_sample_transcriptions", type=int, default=20,
+        help=(
+            "Number of (reference, hypothesis) pairs to sample per split per "
+            "instruction type and log to W&B as a comparison table at each eval."
+        ),
+    )
+
+    return p.parse_args()
+
+
+@torch.no_grad()
+def _greedy_generate(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    mel: torch.Tensor,
+    audio_lengths: torch.Tensor,
+    instruction_ids: torch.Tensor,
+    instruction_lengths: torch.Tensor,
+    sep_token_id: int,
+    max_new_tokens: int = 448,
+) -> list[list[int]]:
+    """Greedy-decode a batch of samples in parallel using EvalPrefixBatch.
+
+    All B sequences generate simultaneously. When a sequence emits the SEP
+    token, it is marked finished and subsequent steps append a zero column to
+    maintain tensor alignment without polluting its causal attention history.
+    Generation stops once every sequence is finished or max_new_tokens is reached.
+
+    Prefix lengths differ across samples (different audio durations). EvalPrefixBatch
+    right-pads shorter prefixes with zeros and inserts each generated token at
+    gen_pos[i] rather than at the absolute end, so causal attention never sees
+    a padding zero in the history of real tokens — matching the training distribution.
+
+    Args:
+        mel:                (B, 80, T_mel)
+        audio_lengths:      (B,)
+        instruction_ids:    (B, T_inst_max)
+        instruction_lengths:(B,)
+        sep_token_id:       stop token — generation halts when this is emitted
+        max_new_tokens:     hard cap; applied per sequence
+
+    Returns:
+        list of B lists of pruned token IDs (stop token excluded)
+    """
+    B      = mel.shape[0]
+    device = mel.device
+
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        enc_out     = encoder(mel)
+        adapter_out = adapter(enc_out)
+
+    pfx = EvalPrefixBatch(
+        adapter_out, audio_lengths,
+        instruction_ids, instruction_lengths,
+        llama.embed_tokens, sep_token_id,
+    )
+
+    finished   = torch.zeros(B, dtype=torch.bool, device=device)
+    generated: list[list[int]] = [[] for _ in range(B)]
+
+    for _ in range(max_new_tokens):
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            logits, _ = llama(pfx.get_batch(), labels=None)  # (B, S, vocab)
+
+        # Read the logit at each sequence's current generation position
+        idx_t    = pfx.logit_indices                          # (B,)
+        next_ids = logits[torch.arange(B, device=device), idx_t, :].argmax(dim=-1)
+
+        for i in range(B):
+            if not finished[i]:
+                if int(next_ids[i].item()) == sep_token_id:
+                    finished[i] = True
+                else:
+                    generated[i].append(int(next_ids[i].item()))
+
+        if finished.all():
+            break
+
+        safe_ids    = next_ids.masked_fill(finished, 0)
+        next_embeds = llama.embed_tokens(safe_ids.unsqueeze(1))  # (B, 1, d)
+        pfx.append(next_embeds, finished)
+
+    return generated
+
+
+def _evaluate_all_splits(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    eval_loaders: dict[str, torch.utils.data.DataLoader],
+    tokenizer: PrunedTokenizer,
+    sep_token_id: int,
+    device: torch.device,
+    max_batches: int | None = None,
+    n_samples: int = 20,
+    sample_seed: int = 0,
+) -> tuple[dict[str, float], list[dict]]:
+    """Run batched greedy WER evaluation on every eval split with both instructions.
+
+    For each split, generation is run twice per batch — once with the unformatted
+    instruction and once with the formatted instruction — and WER is reported
+    separately for each. No text normalisation is applied so the scores reflect
+    whether the model actually follows the formatting instruction.
+
+    Also randomly samples up to n_samples (reference, hypothesis) pairs per split
+    per instruction type for qualitative inspection.
+
+    Args:
+        eval_loaders:  split name → DataLoader (from build_eval_dataloader)
+        tokenizer:     PrunedTokenizer for decoding generated IDs to text
+        max_batches:   cap per split (None = full eval)
+        n_samples:     number of (ref, hyp) pairs to sample per split per type
+        sample_seed:   RNG seed for reproducible sampling
+
+    Returns:
+        wer_dict:    keys like "dev-clean/unformatted" and "dev-clean/formatted"
+        sample_rows: list of dicts with keys split, type, reference, hypothesis
+    """
+    import jiwer
+
+    encoder.eval()
+    adapter.eval()
+    llama.eval()
+
+    results:     dict[str, float] = {}
+    sample_rows: list[dict]       = []
+    rng = random.Random(sample_seed)
+
+    for split_name, loader in eval_loaders.items():
+        pairs_unfmt: list[tuple[str, str]] = []   # (ref, hyp)
+        pairs_fmt:   list[tuple[str, str]] = []
+
+        for batch_idx, batch in enumerate(loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            (mel, audio_lengths,
+             unfmt_ids, unfmt_lens,
+             fmt_ids,   fmt_lens,
+             refs_unformatted, refs_formatted) = batch
+
+            mel           = mel.to(device)
+            audio_lengths = audio_lengths.to(device)
+            unfmt_ids     = unfmt_ids.to(device)
+            unfmt_lens    = unfmt_lens.to(device)
+            fmt_ids       = fmt_ids.to(device)
+            fmt_lens      = fmt_lens.to(device)
+
+            batch_hyps_unfmt = _greedy_generate(
+                encoder, adapter, llama,
+                mel, audio_lengths, unfmt_ids, unfmt_lens,
+                sep_token_id=sep_token_id,
+            )
+            batch_hyps_fmt = _greedy_generate(
+                encoder, adapter, llama,
+                mel, audio_lengths, fmt_ids, fmt_lens,
+                sep_token_id=sep_token_id,
+            )
+
+            for i in range(len(batch_hyps_unfmt)):
+                pairs_unfmt.append((refs_unformatted[i], tokenizer.decode(batch_hyps_unfmt[i])))
+                pairs_fmt.append((refs_formatted[i],     tokenizer.decode(batch_hyps_fmt[i])))
+
+        refs_unfmt = [r for r, _ in pairs_unfmt]
+        hyps_unfmt = [h for _, h in pairs_unfmt]
+        refs_fmt   = [r for r, _ in pairs_fmt]
+        hyps_fmt   = [h for _, h in pairs_fmt]
+
+        wer_unfmt = jiwer.wer(refs_unfmt, hyps_unfmt) if hyps_unfmt else float("nan")
+        wer_fmt   = jiwer.wer(refs_fmt,   hyps_fmt)   if hyps_fmt   else float("nan")
+
+        n = len(hyps_unfmt)
+        print(f"  WER {split_name}/unformatted: {wer_unfmt:.1%}  ({n} samples)")
+        print(f"  WER {split_name}/formatted:   {wer_fmt:.1%}")
+
+        results[f"{split_name}/unformatted"] = wer_unfmt
+        results[f"{split_name}/formatted"]   = wer_fmt
+
+        # Random sample for qualitative table
+        for ref, hyp in rng.sample(pairs_unfmt, min(n_samples, len(pairs_unfmt))):
+            sample_rows.append({
+                "split": split_name, "type": "unformatted",
+                "reference": ref, "hypothesis": hyp,
+            })
+        for ref, hyp in rng.sample(pairs_fmt, min(n_samples, len(pairs_fmt))):
+            sample_rows.append({
+                "split": split_name, "type": "formatted",
+                "reference": ref, "hypothesis": hyp,
+            })
+
+    encoder.train()
+    adapter.train()
+    llama.train()
+
+    return results, sample_rows
+
+
+def _load_shard_list(args: argparse.Namespace) -> list[str]:
+    if args.shards_file is not None:
+        lines = args.shards_file.read_text().splitlines()
+        return [ln.strip() for ln in lines if ln.strip()]
+    return list_shards(args.shards)
+
+
+def main() -> None:
+    """Parse CLI arguments and run the training loop."""
+    args = _parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── Pruned vocab config ───────────────────────────────────────────────────
+    config_path = Path(args.tokenizer) / "pruned_config.json"
+    with config_path.open() as f:
+        pruned_cfg = json.load(f)
+    vocab_size   = pruned_cfg["vocab_size"]    # 40148
+    sep_token_id = pruned_cfg["sep_token_id"]  # 40147
+    print(f"Pruned vocab: {vocab_size} tokens  SEP id: {sep_token_id}")
+
+    # ── Model instantiation ───────────────────────────────────────────────────
+    if args.stub:
+        # Tiny model for pipeline validation when full 8B does not fit in VRAM/RAM.
+        # Matches smoke_test.py stub config exactly.
+        llama_cfg = LlamaConfig(
+            n_layers=6, d_model=512, n_heads=8, n_kv_heads=2,
+            intermediate_size=1024, vocab_size=vocab_size,
+        )
+        llama_dim = 512
+        print("STUB mode: using tiny randomly-initialised model (no pretrained weights).")
+    else:
+        llama_cfg = LlamaConfig(vocab_size=vocab_size)
+        llama_dim = 4096
+
+    encoder = WhisperEncoder()
+    adapter = AudioAdapter(llama_dim=llama_dim)
+    llama   = Llama(llama_cfg)
+
+    # ── Load pretrained weights ───────────────────────────────────────────────
+    if not args.stub:
+        if args.whisper_ckpt is None or args.llama_ckpt is None:
+            raise ValueError("--whisper_ckpt and --llama_ckpt are required unless --stub is set.")
+        print("Loading Whisper encoder weights …")
+        encoder.load_openai_weights(args.whisper_ckpt)
+        print("Loading Llama transformer weights (embedding trained from scratch) …")
+        llama.load_meta_weights(args.llama_ckpt)
+    elif args.whisper_ckpt is not None:
+        print("Loading Whisper encoder weights …")
+        encoder.load_openai_weights(args.whisper_ckpt)
+
+    encoder = encoder.to(device)
+    adapter = adapter.to(device)
+    llama   = llama.to(device)
+
+    encoder.train()
+    adapter.train()
+    llama.train()
+
+    n_enc   = sum(p.numel() for p in encoder.parameters())
+    n_ada   = sum(p.numel() for p in adapter.parameters())
+    n_llm   = sum(p.numel() for p in llama.parameters())
+    print(
+        f"Parameters — encoder: {n_enc / 1e6:.1f}M  "
+        f"adapter: {n_ada / 1e6:.1f}M  "
+        f"llama: {n_llm / 1e6:.0f}M  "
+        f"total: {(n_enc + n_ada + n_llm) / 1e9:.2f}B"
+    )
+
+    # ── Optimizer ─────────────────────────────────────────────────────────────
+    optimizer = torch.optim.AdamW([
+        {"params": encoder.parameters(), "lr": 1e-5},
+        {"params": adapter.parameters(), "lr": 1e-4},
+        {"params": llama.parameters(),   "lr": 1e-4},
+    ])
+    scaler = torch.amp.GradScaler("cuda")
+
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    if args.wandb:
+        import os
+        import wandb
+        api_key = os.environ.get("WANDB_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "WANDB_API_KEY is not set. "
+                "Add 'export WANDB_API_KEY=...' to ~/.bashrc and reload your shell."
+            )
+        wandb.login(key=api_key, relogin=False)
+        wandb.init(project=args.wandb_project)
+        # Use wall_time_min as x-axis for all metrics so the graph shows real
+        # elapsed time rather than optimizer step count.  Valleys become visible
+        # whenever a checkpoint save stalls the step (disk I/O included in the
+        # step's elapsed window — see throughput reset logic below).
+        wandb.define_metric("wall_time_min")
+        wandb.define_metric("*", step_metric="wall_time_min")
+
+    # ── Instruction mode ──────────────────────────────────────────────────────
+    if args.instruction_mode == "unformatted":
+        train_pairs = [_INSTRUCTION_PAIRS[0]]
+    elif args.instruction_mode == "formatted":
+        train_pairs = [_INSTRUCTION_PAIRS[1]]
+    else:
+        train_pairs = list(_INSTRUCTION_PAIRS)
+    print(f"Instruction mode: {args.instruction_mode}  ({len(train_pairs)} variant(s))")
+
+    # ── Shards ───────────────────────────────────────────────────────────────
+    all_shards = _load_shard_list(args)
+    if not all_shards:
+        raise FileNotFoundError("No shards found; check --shards_file or --shards.")
+    print(f"Training on {len(all_shards)} shards.")
+
+    # ── Eval dataloaders ──────────────────────────────────────────────────────
+    tokenizer = PrunedTokenizer(args.tokenizer)
+    _EVAL_SHARD_ARGS = {
+        "dev-clean":  args.eval_dev_clean,
+        "dev-other":  args.eval_dev_other,
+        "test-clean": args.eval_test_clean,
+        "test-other": args.eval_test_other,
+    }
+    eval_loaders: dict[str, torch.utils.data.DataLoader] = {
+        name: build_eval_dataloader(
+            shard_path=path,
+            tokenizer_path=args.tokenizer,
+            instruction_variants=INSTRUCTION_VARIANTS,
+            batch_size=args.eval_batch_size,
+        )
+        for name, path in _EVAL_SHARD_ARGS.items()
+        if path is not None
+    }
+    if eval_loaders:
+        print(f"Eval splits: {list(eval_loaders)}")
+    else:
+        print("No eval splits provided — skipping WER evaluation.")
+
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    global_step   = 0     # optimizer steps
+    micro_step    = 0     # gradient accumulation steps
+    accum_loss    = 0.0
+
+    # Throughput tracking — audio-seconds processed per wall-clock second.
+    # step_start resets AFTER checkpoint saving so that checkpoint I/O is
+    # included in that step's elapsed time, which produces the valley effect.
+    train_start   = time.perf_counter()
+    step_start    = time.perf_counter()
+    step_audio_s  = 0.0   # audio-seconds accumulated in the current step window
+    total_audio_s = 0.0   # cumulative audio-seconds for the whole run
+
+    optimizer.zero_grad()
+
+    epoch = 0
+    while True:
+        epoch_shards = list(all_shards)
+        random.Random(args.seed + epoch).shuffle(epoch_shards)
+
+        loader = build_dataloader(
+            epoch_shards,
+            tokenizer_path=args.tokenizer,
+            sep_token_id=sep_token_id,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            instruction_variants=train_pairs,
+        )
+
+        for batch in loader:
+            (mel, audio_lengths,
+             instruction_ids, instruction_lengths,
+             transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
+
+            # audio_lengths[i] = adapter tokens = ceil(T_mel/2/4).
+            # Reverse: T_mel ≈ audio_lengths * 8 frames; each frame = 10 ms.
+            step_audio_s += audio_lengths.sum().item() * 8 * 0.01
+
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                enc_out     = encoder(mel)
+                adapter_out = adapter(enc_out)
+                inputs, labels = prepare_input(
+                    adapter_out,
+                    audio_lengths,
+                    instruction_ids,
+                    instruction_lengths,
+                    transcript_ids,
+                    transcript_lengths,
+                    llama.embed_tokens,
+                    sep_token_id,
+                )
+                _, loss = llama(inputs, labels)
+
+            scaler.scale(loss / args.accum_steps).backward()
+            accum_loss += loss.item()
+            micro_step += 1
+
+            if micro_step % args.accum_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                global_step += 1
+
+                avg_loss = accum_loss / args.accum_steps
+                accum_loss = 0.0
+
+                if global_step % args.save_every == 0:
+                    ckpt_path = args.checkpoint_dir / f"step_{global_step:07d}.pt"
+                    torch.save(
+                        {
+                            "step":      global_step,
+                            "encoder":   encoder.state_dict(),
+                            "adapter":   adapter.state_dict(),
+                            "llama":     llama.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scaler":    scaler.state_dict(),
+                        },
+                        ckpt_path,
+                    )
+                    print(f"Checkpoint saved → {ckpt_path}")
+
+                    if eval_loaders:
+                        print("Running WER evaluation …")
+                        wer_results, sample_rows = _evaluate_all_splits(
+                            encoder, adapter, llama,
+                            eval_loaders, tokenizer, sep_token_id, device,
+                            max_batches=args.max_eval_batches,
+                            n_samples=args.n_sample_transcriptions,
+                            sample_seed=global_step,
+                        )
+                        if args.wandb:
+                            table = wandb.Table(
+                                columns=["split", "type", "reference", "hypothesis"]
+                            )
+                            for row in sample_rows:
+                                table.add_data(
+                                    row["split"], row["type"],
+                                    row["reference"], row["hypothesis"],
+                                )
+                            wandb.log(
+                                {
+                                    **{f"wer/{k}": v for k, v in wer_results.items()},
+                                    "transcription_samples": table,
+                                    "wall_time_min": (time.perf_counter() - train_start) / 60,
+                                },
+                                step=global_step,
+                            )
+
+                # Throughput: reset AFTER checkpoint save so disk I/O is folded
+                # into this step's elapsed time → produces a visible valley.
+                t_now        = time.perf_counter()
+                elapsed      = max(t_now - step_start, 1e-9)
+                throughput   = step_audio_s / elapsed   # audio-sec / wall-sec
+                total_audio_s += step_audio_s
+                step_audio_s  = 0.0
+                step_start    = t_now
+
+                print(
+                    f"step {global_step:6d}  loss {avg_loss:.4f}"
+                    f"  {throughput:.2f}× realtime"
+                )
+
+                if args.wandb:
+                    wandb.log(
+                        {
+                            "loss":                        avg_loss,
+                            "throughput_audio_sec_per_sec": throughput,
+                            "cumulative_audio_hours":       total_audio_s / 3600,
+                            "wall_time_min":               (t_now - train_start) / 60,
+                        },
+                        step=global_step,
+                    )
+
+                if args.max_steps is not None and global_step >= args.max_steps:
+                    print(f"Reached --max_steps {args.max_steps}. Done.")
+                    return
+
+        epoch += 1
+
+
+if __name__ == "__main__":
+    main()

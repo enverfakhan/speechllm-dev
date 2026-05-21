@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model weights and data (large binaries, downloaded separately)
+weights/
+data/
+checkpoints/
+
+# Wandb
+wandb/
+
+# OS
+.DS_Store

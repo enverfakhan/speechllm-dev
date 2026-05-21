@@ -1,0 +1,12 @@
+# PyTorch is installed separately (CUDA-specific wheel):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+numpy==1.26.4
+soundfile==0.13.1         # scripts/preprocess.py audio loading (avoids torchcodec)
+webdataset==1.0.2
+transformers==4.44.2      # data.py (tokenizer) and scripts/preprocess.py (normalizers) only
+openai-whisper==20231117  # scripts/preprocess.py normalizers only
+deepmultilingualpunctuation==1.0.1  # scripts/preprocess.py formatted transcript
+tqdm==4.66.5
+wandb==0.17.9             # optional; only used when --wandb flag is passed to train.py
+jiwer==3.0.4              # WER evaluation in train.py
