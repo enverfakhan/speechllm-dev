@@ -13,7 +13,7 @@ Weight loading supports two on-disk formats:
 """
 
 from __future__ import annotations
-
+import math
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,6 +242,13 @@ class LlamaBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.d_model, config.rms_norm_eps)
         self.mlp                      = SwiGLUMLP(config)
 
+        # Scale residual projections so signal magnitude doesn't compound across layers.
+        # This is the "scaled init" from the GPT-2 paper: std = 0.02 / sqrt(n_layers).
+        # Applied to the two projections that write into the residual stream.
+        std = 0.02 / math.sqrt(config.n_layers)
+        nn.init.normal_(self.self_attn.o_proj.weight, mean=0.0, std=std)
+        nn.init.normal_(self.mlp.down_proj.weight,    mean=0.0, std=std)
+
     def forward(
         self,
         x:   torch.Tensor,
@@ -293,6 +300,15 @@ class Llama(nn.Module):
         # named_parameters() deduplicates, so only embed_tokens.weight is trained;
         # lm_head.weight is an alias, not a separate parameter.
         self.lm_head.weight = self.embed_tokens.weight
+
+        # Initialise embed_tokens (and tied lm_head) with small std so initial
+        # logits are near-zero → output distribution starts near-uniform →
+        # loss starts near log(vocab_size) ≈ 10.6 instead of 300+.
+        # Without this, random matrix multiplications across N layers compound
+        # to produce logits with magnitude ~50-200, causing near-one-hot
+        # predictions on arbitrary tokens and 300+ steps of saturation escape
+        # before any real learning happens.
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02 / math.sqrt(config.n_layers))
 
         # Precomputed RoPE tables — stored as non-trainable buffers so they move
         # with the model when calling .to(device) or .cuda()

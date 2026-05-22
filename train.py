@@ -30,6 +30,8 @@ from data import build_dataloader, build_eval_dataloader, list_shards, PrunedTok
 from model.adapter import AudioAdapter, EvalPrefixBatch, prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
+from diagnostics import Diagnostics
+
 
 INSTRUCTION_VARIANTS = [
     "Transcribe the following audio without formatting.",
@@ -79,8 +81,33 @@ def _parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps before each optimizer update.")
     p.add_argument("--max_steps",       type=int, default=None,
                    help="Stop after this many optimizer steps (for smoke runs).")
-    p.add_argument("--save_every",      type=int, default=500,
-                   help="Save a checkpoint every N optimizer steps.")
+    p.add_argument(
+        "--save_every", type=int, default=None,
+        help=(
+            "Save a checkpoint every N optimizer steps. "
+            "Default None = no checkpointing. Disable during development to avoid "
+            "expensive disk I/O and WER evaluation."
+        ),
+    )
+    p.add_argument(
+        "--log_every", type=int, default=10,
+        help=(
+            "Print and log diagnostic metrics every N optimizer steps. "
+            "Also controls how often the --diag_shard eval pass is triggered."
+        ),
+    )
+    p.add_argument(
+        "--no_grad_clip", action="store_true",
+        help=(
+            "Disable gradient norm clipping. Only use during development / "
+            "single-speaker overfitting where fast memorisation is desired and "
+            "training stability is not a concern."
+        ),
+    )
+    p.add_argument(
+        "--grad_clip_max_norm", type=float, default=1.0,
+        help="Max gradient norm for clipping (default 1.0). Ignored when --no_grad_clip is set.",
+    )
     p.add_argument("--checkpoint_dir",  type=Path, default=Path("checkpoints"))
     p.add_argument("--seed",            type=int, default=42)
     p.add_argument("--wandb",           action="store_true",
@@ -104,6 +131,32 @@ def _parse_args() -> argparse.Namespace:
                    help="Batch size for WER evaluation forward passes.")
     p.add_argument("--max_eval_batches", type=int, default=None,
                    help="Cap eval at N batches per split (useful during development).")
+    p.add_argument(
+        "--eval_at_end", action="store_true",
+        help=(
+            "Run WER evaluation once after training finishes (after --max_steps is "
+            "reached or the data is exhausted). Evaluation is NOT run mid-training. "
+            "Useful during development to avoid expensive eval every checkpoint."
+        ),
+    )
+
+    # ── Diagnostic shard ─────────────────────────────────────────────────────
+    p.add_argument(
+        "--diag_shard", type=Path, default=None,
+        help=(
+            "Path to a single .tar shard for in-loop diagnostic evaluation. "
+            "When provided, a small eval pass is run every --log_every steps "
+            "and results are logged under the 'diag_eval/' prefix alongside "
+            "the training diagnostics. Produced by scripts/make_dev_dataset.py."
+        ),
+    )
+    p.add_argument(
+        "--max_diag_batches", type=int, default=3,
+        help=(
+            "Maximum number of batches to process from --diag_shard per eval pass. "
+            "Kept small (default 3) so the diag pass does not stall the training loop."
+        ),
+    )
 
     p.add_argument(
         "--instruction_mode",
@@ -390,10 +443,10 @@ def main() -> None:
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW([
-        {"params": encoder.parameters(), "lr": 1e-5},
-        {"params": adapter.parameters(), "lr": 1e-4},
-        {"params": llama.parameters(),   "lr": 1e-4},
-    ])
+        {"params": encoder.parameters(), "lr": 1e-6},
+        {"params": adapter.parameters(), "lr": 1e-5},
+        {"params": llama.parameters(),   "lr": 1e-5},
+    ], weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda")
 
     # ── W&B ───────────────────────────────────────────────────────────────────
@@ -432,6 +485,31 @@ def main() -> None:
 
     # ── Eval dataloaders ──────────────────────────────────────────────────────
     tokenizer = PrunedTokenizer(args.tokenizer)
+    diag = Diagnostics(
+        tokenizer=tokenizer,
+        sep_token_id=sep_token_id,
+        log_every=args.log_every,
+        top_k=5,
+    )
+
+    # ── Diagnostic shard dataloader ───────────────────────────────────────────
+    # Iterated every --log_every steps for in-loop eval without WER generation.
+    # WebDataset is infinite so _diag_iter never raises StopIteration.
+    _diag_iter = None
+    if args.diag_shard is not None:
+        if not args.diag_shard.exists():
+            raise FileNotFoundError(f"--diag_shard not found: {args.diag_shard}")
+        _diag_loader = build_dataloader(
+            [str(args.diag_shard)],
+            tokenizer_path=args.tokenizer,
+            sep_token_id=sep_token_id,
+            batch_size=args.batch_size,
+            num_workers=0,
+            instruction_variants=train_pairs,
+            shuffle_buffer=1,
+        )
+        _diag_iter = iter(_diag_loader)
+        print(f"Diagnostic shard: {args.diag_shard}")
     _EVAL_SHARD_ARGS = {
         "dev-clean":  args.eval_dev_clean,
         "dev-other":  args.eval_dev_other,
@@ -471,7 +549,9 @@ def main() -> None:
     optimizer.zero_grad()
 
     epoch = 0
-    while True:
+    done  = False
+    cached_batch = None
+    while not done:
         epoch_shards = list(all_shards)
         random.Random(args.seed + epoch).shuffle(epoch_shards)
 
@@ -485,6 +565,10 @@ def main() -> None:
         )
 
         for batch in loader:
+            if cached_batch is None:
+                cached_batch = batch
+            else:
+                batch = cached_batch
             (mel, audio_lengths,
              instruction_ids, instruction_lengths,
              transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
@@ -506,22 +590,31 @@ def main() -> None:
                     llama.embed_tokens,
                     sep_token_id,
                 )
-                _, loss = llama(inputs, labels)
+                logits, loss = llama(inputs, labels)
 
+            diag.record_micro_with_logits(labels, logits, loss.detach())
             scaler.scale(loss / args.accum_steps).backward()
             accum_loss += loss.item()
             micro_step += 1
 
             if micro_step % args.accum_steps == 0:
+                scaler.unscale_(optimizer)
+                if not args.no_grad_clip:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for grp in optimizer.param_groups for p in grp["params"]],
+                        args.grad_clip_max_norm,
+                    )
+                diag.record_grad_norms(encoder, adapter, llama)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
                 global_step += 1
 
-                avg_loss = accum_loss / args.accum_steps
+                avg_loss   = accum_loss / args.accum_steps
                 accum_loss = 0.0
 
-                if global_step % args.save_every == 0:
+                # ── Checkpoint (optional) ─────────────────────────────────────
+                if args.save_every is not None and global_step % args.save_every == 0:
                     ckpt_path = args.checkpoint_dir / f"step_{global_step:07d}.pt"
                     torch.save(
                         {
@@ -536,38 +629,37 @@ def main() -> None:
                     )
                     print(f"Checkpoint saved → {ckpt_path}")
 
-                    if eval_loaders:
-                        print("Running WER evaluation …")
-                        wer_results, sample_rows = _evaluate_all_splits(
-                            encoder, adapter, llama,
-                            eval_loaders, tokenizer, sep_token_id, device,
-                            max_batches=args.max_eval_batches,
-                            n_samples=args.n_sample_transcriptions,
-                            sample_seed=global_step,
-                        )
-                        if args.wandb:
-                            table = wandb.Table(
-                                columns=["split", "type", "reference", "hypothesis"]
+                # ── Diagnostic shard eval pass ────────────────────────────────
+                eval_diag_metrics: dict = {}
+                if _diag_iter is not None and global_step % args.log_every == 0:
+                    encoder.eval()
+                    adapter.eval()
+                    llama.eval()
+                    for _ in range(args.max_diag_batches):
+                        diag_batch = next(_diag_iter)
+                        (d_mel, d_audio_len,
+                         d_inst_ids, d_inst_lens,
+                         d_trans_ids, d_trans_lens) = [t.to(device) for t in diag_batch]
+                        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+                            d_enc  = encoder(d_mel)
+                            d_ada  = adapter(d_enc)
+                            d_inp, d_lbl = prepare_input(
+                                d_ada, d_audio_len,
+                                d_inst_ids, d_inst_lens,
+                                d_trans_ids, d_trans_lens,
+                                llama.embed_tokens, sep_token_id,
                             )
-                            for row in sample_rows:
-                                table.add_data(
-                                    row["split"], row["type"],
-                                    row["reference"], row["hypothesis"],
-                                )
-                            wandb.log(
-                                {
-                                    **{f"wer/{k}": v for k, v in wer_results.items()},
-                                    "transcription_samples": table,
-                                    "wall_time_min": (time.perf_counter() - train_start) / 60,
-                                },
-                                step=global_step,
-                            )
+                            d_logits, d_loss = llama(d_inp, d_lbl)
+                        diag.record_eval_micro_with_logits(d_lbl, d_logits, d_loss.detach())
+                    encoder.train()
+                    adapter.train()
+                    llama.train()
+                    eval_diag_metrics = diag.flush_eval(global_step)
 
-                # Throughput: reset AFTER checkpoint save so disk I/O is folded
-                # into this step's elapsed time → produces a visible valley.
-                t_now        = time.perf_counter()
-                elapsed      = max(t_now - step_start, 1e-9)
-                throughput   = step_audio_s / elapsed   # audio-sec / wall-sec
+                # ── Throughput: reset AFTER checkpoint so disk I/O folds in ──
+                t_now         = time.perf_counter()
+                elapsed       = max(t_now - step_start, 1e-9)
+                throughput    = step_audio_s / elapsed
                 total_audio_s += step_audio_s
                 step_audio_s  = 0.0
                 step_start    = t_now
@@ -576,23 +668,53 @@ def main() -> None:
                     f"step {global_step:6d}  loss {avg_loss:.4f}"
                     f"  {throughput:.2f}× realtime"
                 )
-
+                diag_metrics = diag.flush(global_step)
                 if args.wandb:
                     wandb.log(
                         {
-                            "loss":                        avg_loss,
+                            "loss":                         avg_loss,
                             "throughput_audio_sec_per_sec": throughput,
-                            "cumulative_audio_hours":       total_audio_s / 3600,
-                            "wall_time_min":               (t_now - train_start) / 60,
+                            "cumulative_audio_hours":        total_audio_s / 3600,
+                            "wall_time_min":                (t_now - train_start) / 60,
+                            **diag_metrics,
+                            **eval_diag_metrics,
                         },
                         step=global_step,
                     )
 
                 if args.max_steps is not None and global_step >= args.max_steps:
                     print(f"Reached --max_steps {args.max_steps}. Done.")
-                    return
+                    done = True
+                    break
 
-        epoch += 1
+        if not done:
+            epoch += 1
+
+    # ── End-of-training WER evaluation ───────────────────────────────────────
+    if args.eval_at_end and eval_loaders:
+        print("Running end-of-training WER evaluation …")
+        wer_results, sample_rows = _evaluate_all_splits(
+            encoder, adapter, llama,
+            eval_loaders, tokenizer, sep_token_id, device,
+            max_batches=args.max_eval_batches,
+            n_samples=args.n_sample_transcriptions,
+            sample_seed=global_step,
+        )
+        if args.wandb:
+            table = wandb.Table(columns=["split", "type", "reference", "hypothesis"])
+            for row in sample_rows:
+                table.add_data(
+                    row["split"], row["type"],
+                    row["reference"], row["hypothesis"],
+                )
+            wandb.log(
+                {
+                    **{f"wer/{k}": v for k, v in wer_results.items()},
+                    "transcription_samples": table,
+                    "wall_time_min": (time.perf_counter() - train_start) / 60,
+                },
+                step=global_step,
+            )
 
 
 if __name__ == "__main__":
