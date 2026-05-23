@@ -178,6 +178,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
 
+    p.add_argument(
+        "--freeze_encoder", action="store_true",
+        help=(
+            "Freeze the Whisper encoder: disable gradients and exclude it from the "
+            "optimizer. Useful when overfitting on a small dataset and you want to "
+            "isolate adapter+LLM training. Logged as train/encoder_frozen=1 in W&B."
+        ),
+    )
+
     return p.parse_args()
 
 
@@ -393,6 +402,12 @@ def main() -> None:
     sep_token_id = pruned_cfg["sep_token_id"]  # 40147
     print(f"Pruned vocab: {vocab_size} tokens  SEP id: {sep_token_id}")
 
+    # baseline values for milestone target during training. 
+    baseline_path = Path("baselines.json")
+    if baseline_path.exists():
+        baselines_data = json.loads(baseline_path.read_text())
+    else:
+        baselines_data = {}
     # ── Model instantiation ───────────────────────────────────────────────────
     if args.stub:
         # Tiny model for pipeline validation when full 8B does not fit in VRAM/RAM.
@@ -431,6 +446,13 @@ def main() -> None:
     adapter.train()
     llama.train()
 
+    # ── Encoder freeze (must happen before optimizer construction) ────────────
+    if args.freeze_encoder:
+        encoder.requires_grad_(False)
+        print("Encoder: FROZEN")
+    else:
+        print("Encoder: trainable")
+
     n_enc   = sum(p.numel() for p in encoder.parameters())
     n_ada   = sum(p.numel() for p in adapter.parameters())
     n_llm   = sum(p.numel() for p in llama.parameters())
@@ -442,11 +464,14 @@ def main() -> None:
     )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW([
-        {"params": encoder.parameters(), "lr": 1e-6},
+    _param_groups = []
+    if not args.freeze_encoder:
+        _param_groups.append({"params": encoder.parameters(), "lr": 1e-6})
+    _param_groups += [
         {"params": adapter.parameters(), "lr": 1e-5},
         {"params": llama.parameters(),   "lr": 1e-5},
-    ], weight_decay=0.01)
+    ]
+    optimizer = torch.optim.AdamW(_param_groups, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda")
 
     # ── W&B ───────────────────────────────────────────────────────────────────
@@ -461,12 +486,8 @@ def main() -> None:
             )
         wandb.login(key=api_key, relogin=False)
         wandb.init(project=args.wandb_project)
-        # Use wall_time_min as x-axis for all metrics so the graph shows real
-        # elapsed time rather than optimizer step count.  Valleys become visible
-        # whenever a checkpoint save stalls the step (disk I/O included in the
-        # step's elapsed window — see throughput reset logic below).
-        wandb.define_metric("wall_time_min")
-        wandb.define_metric("*", step_metric="wall_time_min")
+
+    _encoder_frozen_val = 1.0 if args.freeze_encoder else 0.0
 
     # ── Instruction mode ──────────────────────────────────────────────────────
     if args.instruction_mode == "unformatted":
@@ -507,6 +528,7 @@ def main() -> None:
             num_workers=0,
             instruction_variants=train_pairs,
             shuffle_buffer=1,
+            partial=True,   # keep the final incomplete batch on small shards
         )
         _diag_iter = iter(_diag_loader)
         print(f"Diagnostic shard: {args.diag_shard}")
@@ -537,6 +559,8 @@ def main() -> None:
     global_step   = 0     # optimizer steps
     micro_step    = 0     # gradient accumulation steps
     accum_loss    = 0.0
+    loss_ema: float | None = None
+    _EMA_ALPHA = 0.98
 
     # Throughput tracking — audio-seconds processed per wall-clock second.
     # step_start resets AFTER checkpoint saving so that checkpoint I/O is
@@ -550,7 +574,7 @@ def main() -> None:
 
     epoch = 0
     done  = False
-    cached_batch = None
+    # cached_batch = None
     while not done:
         epoch_shards = list(all_shards)
         random.Random(args.seed + epoch).shuffle(epoch_shards)
@@ -565,10 +589,10 @@ def main() -> None:
         )
 
         for batch in loader:
-            if cached_batch is None:
-                cached_batch = batch
-            else:
-                batch = cached_batch
+            # if cached_batch is None:
+            #     cached_batch = batch
+            # else:
+            #     batch = cached_batch
             (mel, audio_lengths,
              instruction_ids, instruction_lengths,
              transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
@@ -612,6 +636,7 @@ def main() -> None:
 
                 avg_loss   = accum_loss / args.accum_steps
                 accum_loss = 0.0
+                loss_ema   = avg_loss if loss_ema is None else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
 
                 # ── Checkpoint (optional) ─────────────────────────────────────
                 if args.save_every is not None and global_step % args.save_every == 0:
@@ -636,7 +661,12 @@ def main() -> None:
                     adapter.eval()
                     llama.eval()
                     for _ in range(args.max_diag_batches):
-                        diag_batch = next(_diag_iter)
+                        try:
+                            diag_batch = next(_diag_iter)
+                        except StopIteration:
+                            # shard exhausted — restart from the beginning
+                            _diag_iter = iter(_diag_loader)
+                            diag_batch = next(_diag_iter)
                         (d_mel, d_audio_len,
                          d_inst_ids, d_inst_lens,
                          d_trans_ids, d_trans_lens) = [t.to(device) for t in diag_batch]
@@ -670,18 +700,43 @@ def main() -> None:
                 )
                 diag_metrics = diag.flush(global_step)
                 if args.wandb:
+                    # Load and log corpus baselines as wandb summary values.
+                    # These appear as horizontal reference lines when you use
+                    # wandb's "add reference line" feature on any loss chart.
+                    if baselines_data:
+                        baselines = {
+                        "baseline/unigram_loss":     baselines_data["unigram_loss"],
+                        "baseline/bigram_loss":      baselines_data["bigram_loss"],
+                        "baseline/first_token_loss": baselines_data["first_token_loss"],
+                        "baseline/uniform_loss":     baselines_data["uniform_loss"],
+                        }
+                    else:
+                        baselines = {}
+                    _gap: dict[str, float] = {}
+                    _tr = diag_metrics.get("loss/train_rest")
+                    _er = eval_diag_metrics.get("loss/eval_rest")
+                    _tf = diag_metrics.get("loss/train_first_token")
+                    _ef = eval_diag_metrics.get("loss/eval_first_token")
+                    if _tr is not None and _er is not None:
+                        _gap["loss/gap_rest"] = _er - _tr
+                    if _tf is not None and _ef is not None:
+                        _gap["loss/gap_first_token"] = _ef - _tf
                     wandb.log(
                         {
-                            "loss":                         avg_loss,
-                            "throughput_audio_sec_per_sec": throughput,
-                            "cumulative_audio_hours":        total_audio_s / 3600,
-                            "wall_time_min":                (t_now - train_start) / 60,
+                            "train/loss":                            avg_loss,
+                            "train/loss_ema":                        loss_ema,
+                            "train/lr":                              optimizer.param_groups[-1]["lr"],
+                            "train/encoder_frozen":                  _encoder_frozen_val,
+                            "runtime/throughput_audio_sec_per_sec":  throughput,
+                            "runtime/cumulative_audio_hours":         total_audio_s / 3600,
+                            "runtime/wall_time_min":                  (t_now - train_start) / 60,
                             **diag_metrics,
                             **eval_diag_metrics,
+                            **_gap,
+                            **baselines,
                         },
                         step=global_step,
-                    )
-
+                    ) 
                 if args.max_steps is not None and global_step >= args.max_steps:
                     print(f"Reached --max_steps {args.max_steps}. Done.")
                     done = True
@@ -710,8 +765,9 @@ def main() -> None:
             wandb.log(
                 {
                     **{f"wer/{k}": v for k, v in wer_results.items()},
-                    "transcription_samples": table,
-                    "wall_time_min": (time.perf_counter() - train_start) / 60,
+                    "transcription_samples":   table,
+                    "runtime/wall_time_min":   (time.perf_counter() - train_start) / 60,
+                    "train/encoder_frozen":    _encoder_frozen_val,
                 },
                 step=global_step,
             )

@@ -446,6 +446,19 @@ class Diagnostics:
 
         metrics: dict[str, float | str] = {}
 
+        # ── Gradient norms — logged every optimizer step, not gated by log_every ──
+        # Per-component norms reveal training dynamics that may spike or collapse
+        # between log_every windows and should not be sub-sampled.
+        if self._grad_enc is not None:
+            metrics["grad/encoder"] = self._grad_enc
+        if self._grad_ada is not None:
+            metrics["grad/adapter"] = self._grad_ada
+        if self._grad_llm is not None:
+            metrics["grad/llama"]   = self._grad_llm
+        if self._grad_enc is not None and self._grad_llm is not None:
+            denom = self._grad_llm if self._grad_llm > 1e-12 else 1e-12
+            metrics["grad/enc_llm_ratio"] = self._grad_enc / denom
+
         if should_log:
             # ── 1. Token budget ────────────────────────────────────────────────
             tokens_per_step = self._transcript_tokens / max(self._micro_count, 1)
@@ -454,30 +467,18 @@ class Diagnostics:
 
             # ── 2. Loss decomposition ──────────────────────────────────────────
             if self._loss_first_n > 0:
-                metrics["diag/loss_first_token"] = (
+                metrics["loss/train_first_token"] = (
                     self._loss_first_sum / self._loss_first_n
                 )
             if self._loss_rest_n > 0:
-                metrics["diag/loss_rest_tokens"] = (
+                metrics["loss/train_rest"] = (
                     self._loss_rest_sum / self._loss_rest_n
                 )
             # A healthy model: loss_first > loss_rest (first token is hardest).
             # Collapse symptom: loss_first ≈ loss_rest, both very low (predicting SEP).
 
-            # ── 3. Gradient norms ──────────────────────────────────────────────
-            if self._grad_enc is not None:
-                metrics["diag/grad_norm_encoder"] = self._grad_enc
-            if self._grad_ada is not None:
-                metrics["diag/grad_norm_adapter"] = self._grad_ada
-            if self._grad_llm is not None:
-                metrics["diag/grad_norm_llama"]   = self._grad_llm
+            # ── 3. Top-k first-token predictions ──────────────────────────────
 
-            # Ratio: how much encoder gradient vs LLM gradient
-            if self._grad_enc is not None and self._grad_llm is not None:
-                denom = self._grad_llm if self._grad_llm > 1e-12 else 1e-12
-                metrics["diag/grad_ratio_enc_llm"] = self._grad_enc / denom
-
-            # ── 4. Top-k first-token predictions ──────────────────────────────
             if self._first_token_votes:
                 top = sorted(
                     self._first_token_votes.items(), key=lambda kv: kv[1], reverse=True
@@ -493,7 +494,7 @@ class Diagnostics:
                 sep_frac = self._first_token_votes.get(self._sep_id, 0) / max(
                     sum(self._first_token_votes.values()), 1
                 )
-                metrics["diag/first_token_sep_fraction"] = sep_frac
+                metrics["collapse/train_sep_fraction"] = sep_frac
 
             # ── 5. Logit entropy ───────────────────────────────────────────────
             max_entropy = math.log(
@@ -503,8 +504,7 @@ class Diagnostics:
             )
             if self._entropy_n > 0:
                 mean_entropy = self._entropy_sum / self._entropy_n
-                metrics["diag/train_entropy"]             = mean_entropy
-                metrics["diag/train_entropy_fraction"]    = mean_entropy / max_entropy
+                metrics["entropy/train"] = mean_entropy / max_entropy
                 # 1.0 = uniform over vocab (model knows nothing)
                 # 0.0 = perfectly confident
                 # Healthy range mid-training: 0.3–0.7
@@ -519,7 +519,7 @@ class Diagnostics:
                 metrics["diag/mean_max_logit"] = self._logit_max_sum / self._logit_max_n
 
             # ── Console summary ────────────────────────────────────────────────
-            _print_summary(global_step, metrics, label="TRAIN DIAG")
+            _print_summary(global_step, metrics, label="TRAIN DIAG", mode="train")
 
         # Always reset training accumulators
         self._reset()
@@ -558,11 +558,11 @@ class Diagnostics:
             )
 
             if self._eval_loss_first_n > 0:
-                metrics[pfx + "loss_first_token"] = (
+                metrics["loss/eval_first_token"] = (
                     self._eval_loss_first_sum / self._eval_loss_first_n
                 )
             if self._eval_loss_rest_n > 0:
-                metrics[pfx + "loss_rest_tokens"] = (
+                metrics["loss/eval_rest"] = (
                     self._eval_loss_rest_sum / self._eval_loss_rest_n
                 )
 
@@ -580,20 +580,19 @@ class Diagnostics:
                 sep_frac = self._eval_first_token_votes.get(self._sep_id, 0) / max(
                     sum(self._eval_first_token_votes.values()), 1
                 )
-                metrics[pfx + "first_token_sep_fraction"] = sep_frac
+                metrics["collapse/eval_sep_fraction"] = sep_frac
 
             max_entropy = math.log(40148)
             if self._eval_entropy_n > 0:
                 mean_entropy = self._eval_entropy_sum / self._eval_entropy_n
-                metrics[pfx + "train_entropy"]          = mean_entropy
-                metrics[pfx + "train_entropy_fraction"] = mean_entropy / max_entropy
+                metrics["entropy/eval"] = mean_entropy / max_entropy
 
             if self._eval_logit_max_n > 0:
                 metrics[pfx + "mean_max_logit"] = (
                     self._eval_logit_max_sum / self._eval_logit_max_n
                 )
 
-            _print_summary(global_step, metrics, label="EVAL DIAG")
+            _print_summary(global_step, metrics, label="EVAL DIAG", mode="eval")
 
         self._reset_eval()
         return metrics
@@ -632,56 +631,69 @@ class Diagnostics:
 
 # ── Console printer ────────────────────────────────────────────────────────────
 
-def _print_summary(step: int, m: dict, label: str = "TRAIN DIAG") -> None:
+def _print_summary(
+    step: int,
+    m: dict,
+    label: str = "TRAIN DIAG",
+    mode: str = "train",
+) -> None:
     """Print a compact diagnostic block to stdout.
 
     Args:
         step:  current optimizer step
         m:     metrics dict produced by flush() or flush_eval()
         label: header label — "TRAIN DIAG" or "EVAL DIAG"
+        mode:  "train" or "eval" — selects which key names to look up
     """
     sep = "─" * 56
     print(f"\n{sep}")
     print(f"  {label}  step {step}")
     print(sep)
 
-    # Resolve the key prefix so the same printer works for both "diag/" and "diag_eval/"
-    pfx = next(
-        (k.rsplit("/", 1)[0] + "/" for k in m if "/" in k),
-        "diag/",
-    )
+    if mode == "train":
+        tkn       = m.get("diag/transcript_tokens_per_micro")
+        lf        = m.get("loss/train_first_token")
+        lr        = m.get("loss/train_rest")
+        ge        = m.get("grad/encoder")
+        ga        = m.get("grad/adapter")
+        gl        = m.get("grad/llama")
+        ratio     = m.get("grad/enc_llm_ratio")
+        top5      = m.get("diag/first_token_top5")
+        sep_frac  = m.get("collapse/train_sep_fraction")
+        ent       = m.get("entropy/train")
+        gen_ent   = m.get("diag/gen_entropy_fraction")
+        max_logit = m.get("diag/mean_max_logit")
+    else:
+        tkn       = m.get("diag_eval/transcript_tokens_per_micro")
+        lf        = m.get("loss/eval_first_token")
+        lr        = m.get("loss/eval_rest")
+        ge = ga = gl = ratio = gen_ent = None
+        top5      = m.get("diag_eval/first_token_top5")
+        sep_frac  = m.get("collapse/eval_sep_fraction")
+        ent       = m.get("entropy/eval")
+        max_logit = m.get("diag_eval/mean_max_logit")
 
-    tkn = m.get(pfx + "transcript_tokens_per_micro")
     if tkn is not None:
         print(f"  token budget     {tkn:.1f} transcript tokens/micro-step")
 
-    lf = m.get(pfx + "loss_first_token")
-    lr = m.get(pfx + "loss_rest_tokens")
     if lf is not None and lr is not None:
         arrow = "↑ healthy" if lf > lr else "⚠ collapse signal"
         print(f"  loss first tok   {lf:.3f}   rest {lr:.3f}   {arrow}")
     elif lf is not None:
         print(f"  loss first tok   {lf:.3f}   (rest: n/a)")
 
-    ge = m.get(pfx + "grad_norm_encoder")
-    ga = m.get(pfx + "grad_norm_adapter")
-    gl = m.get(pfx + "grad_norm_llama")
     if ge is not None:
         print(f"  grad norms       enc {ge:.3e}  ada {ga:.3e}  llm {gl:.3e}")
-    ratio = m.get(pfx + "grad_ratio_enc_llm")
     if ratio is not None:
         flag = "  ⚠ enc >> llm" if ratio > 10 else ""
         print(f"  grad enc/llm     {ratio:.2f}{flag}")
 
-    top5 = m.get(pfx + "first_token_top5")
     if top5:
         print(f"  first-tok top5   {top5}")
-    sep_frac = m.get(pfx + "first_token_sep_fraction")
     if sep_frac is not None:
         flag = "  ⚠ EOS COLLAPSE" if sep_frac > 0.5 else ""
         print(f"  SEP fraction     {sep_frac:.1%}{flag}")
 
-    ent = m.get(pfx + "train_entropy_fraction")
     if ent is not None:
         if ent > 0.85:
             ent_label = "⚠ near-uniform (model knows nothing)"
@@ -691,11 +703,9 @@ def _print_summary(step: int, m: dict, label: str = "TRAIN DIAG") -> None:
             ent_label = "✓ healthy range"
         print(f"  train entropy    {ent:.2f}  {ent_label}")
 
-    gen_ent = m.get(pfx + "gen_entropy_fraction")
     if gen_ent is not None:
         print(f"  gen entropy      {gen_ent:.2f}  (at generation decision point)")
 
-    max_logit = m.get(pfx + "mean_max_logit")
     if max_logit is not None:
         flag = "  ⚠ saturating" if max_logit > 50 else ""
         print(f"  mean max logit   {max_logit:.2f}{flag}")

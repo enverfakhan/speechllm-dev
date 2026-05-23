@@ -138,6 +138,7 @@ def build_dataloader(
     num_workers: int,
     instruction_variants: list[tuple[str, str]],
     shuffle_buffer: int = 1000,
+    partial: bool = False,
 ) -> torch.utils.data.DataLoader:
     """Build a DataLoader over preprocessed WebDataset shards.
 
@@ -160,6 +161,9 @@ def build_dataloader(
                               One pair is chosen uniformly at random per sample.
         shuffle_buffer:       in-flight sample buffer; 2–3× batch_size is sufficient
                               when shards are pre-shuffled on disk
+        partial:              if True, include the final incomplete batch (useful for
+                              small diagnostic shards where dropping it may leave no
+                              batches at all)
 
     Returns:
         DataLoader yielding 6-tuples:
@@ -224,7 +228,7 @@ def build_dataloader(
         wds.WebDataset(shards, shardshuffle=False, nodesplitter=wds.split_by_node)
         .map(_process)
         .shuffle(shuffle_buffer)
-        .batched(batch_size, collation_fn=_collate, partial=False)
+        .batched(batch_size, collation_fn=_collate, partial=partial)
     )
 
     return torch.utils.data.DataLoader(

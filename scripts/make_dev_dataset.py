@@ -23,7 +23,7 @@ Usage:
     # Explicit speaker, two holdout chapters, with precomputed labels:
     python scripts/make_dev_dataset.py \\
       --librispeech_dir data/librispeech/LibriSpeech/train-clean-100 \\
-      --speaker_id      1284 \\
+      --speaker_id      2196 \\
       --output_dir      data/dev_shards/ \\
       --output_train    data/dev_train_shards.txt \\
       --output_diag     data/dev_diag_shard.txt \\
