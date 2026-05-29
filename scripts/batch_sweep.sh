@@ -104,6 +104,7 @@ for multiplier in 1 2 4 8; do
         --log_every          "$LOG_EVERY" \
         --num_workers        "$NUM_WORKERS" \
         --wandb \
+        --gradient_checkpointing \
         --early_stop_metric    eval_first_token_loss \
         --early_stop_threshold 4.88 \
         --early_stop_min_steps "$EARLY_STOP_MIN_STEPS" \
@@ -196,6 +197,7 @@ for multiplier in 1 2 4 8; do
         --log_every          "$LOG_EVERY" \
         --num_workers        "$NUM_WORKERS" \
         --wandb \
+        --gradient_checkpointing \
         --early_stop_metric    eval_loss \
         --early_stop_threshold 2.30 \
         --early_stop_min_steps "$EARLY_STOP_MIN_STEPS" \

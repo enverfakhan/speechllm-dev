@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -317,6 +318,8 @@ class Llama(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+        self.gradient_checkpointing = False
+
     def forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -339,7 +342,10 @@ class Llama(nn.Module):
 
         x = inputs_embeds
         for layer in self.layers:
-            x = layer(x, cos, sin)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(layer, x, cos, sin, use_reentrant=False)
+            else:
+                x = layer(x, cos, sin)
 
         x      = self.norm(x)
         logits = self.lm_head(x)   # (B, S, vocab_size)
@@ -356,6 +362,10 @@ class Llama(nn.Module):
             )
 
         return logits, loss
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable activation recomputation during backward to reduce peak VRAM."""
+        self.gradient_checkpointing = True
 
     def load_meta_weights(
         self,

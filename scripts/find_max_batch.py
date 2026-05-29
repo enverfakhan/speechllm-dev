@@ -13,6 +13,13 @@ Both stages use:
 Usage:
     python scripts/find_max_batch.py --stage 1
     python scripts/find_max_batch.py --stage 2
+
+# To verify gradient checkpointing is active during the probe:
+# Insert temporarily after loss.backward():
+#   from torch.utils.checkpoint import CheckpointFunction
+#   print("recompute count:", CheckpointFunction._recompute_count)
+# A non-zero count confirms recomputation is happening.
+# Remove after verification.
 """
 
 from __future__ import annotations
@@ -70,6 +77,8 @@ def _build_models(stage: int) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
         encoder.requires_grad_(False)
         llama.requires_grad_(False)
 
+    llama.enable_gradient_checkpointing()
+
     return encoder, adapter, llama
 
 
@@ -114,6 +123,9 @@ def _try_batch(
 
         from model.adapter import prepare_input
 
+        encoder.train()
+        adapter.train()
+        llama.train()
         optimizer.zero_grad()
 
         with torch.autocast("cuda", dtype=torch.bfloat16):

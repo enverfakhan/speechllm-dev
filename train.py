@@ -189,6 +189,14 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--gradient_checkpointing", action="store_true",
+        help=(
+            "Enable gradient checkpointing on the Llama model to reduce activation "
+            "memory at the cost of ~20-30% extra compute during the backward pass. "
+            "Recommended for all GCP/RunPod training runs. Not needed for stub runs."
+        ),
+    )
+    p.add_argument(
         "--freeze_encoder", action="store_true",
         help=(
             "Freeze the Whisper encoder: disable gradients and exclude it from the "
@@ -593,6 +601,13 @@ def main() -> None:
     adapter = adapter.to(device)
     llama   = llama.to(device)
 
+    if args.gradient_checkpointing:
+        if args.stub:
+            print("[warn] --gradient_checkpointing ignored with --stub")
+        else:
+            llama.enable_gradient_checkpointing()
+            print("[info] gradient checkpointing enabled")
+
     encoder.train()
     adapter.train()
     llama.train()
@@ -670,8 +685,9 @@ def main() -> None:
                 "grad_clip_max_norm": args.grad_clip_max_norm,
                 "instruction_mode":   args.instruction_mode,
                 "seed":               args.seed,
-                "resume_ckpt":        str(args.resume_ckpt) if args.resume_ckpt else None,
-                "adapter_ckpt":       str(args.adapter_ckpt) if args.adapter_ckpt else None,
+                "resume_ckpt":             str(args.resume_ckpt) if args.resume_ckpt else None,
+                "adapter_ckpt":            str(args.adapter_ckpt) if args.adapter_ckpt else None,
+                "gradient_checkpointing":  args.gradient_checkpointing,
             },
         )
 
