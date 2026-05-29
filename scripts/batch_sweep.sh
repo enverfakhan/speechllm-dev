@@ -126,7 +126,7 @@ echo "════════════════════════�
 echo "  STAGE 1 SUMMARY"
 echo "════════════════════════════════════════"
 printf "%-30s  %-16s  %s\n" "run_name" "effective_batch" "wall_clock_min"
-for multiplier in 1 2 4 8; do
+for multiplier in 1; do
     effective_batch=$(( PER_GPU_BATCH_STAGE1 * multiplier ))
     run_name="stage1-bs$(printf '%04d' $effective_batch)"
     printf "%-30s  %-16d  %d\n" "$run_name" "$effective_batch" "${STAGE1_TIMES[$run_name]:-?}"
