@@ -1,7 +1,32 @@
 #!/usr/bin/env bash
-# Batch-size sweep: stage 1 (adapter only) then stage 2 (full fine-tune).
+# Batch-size sweep: stage 1 (adapter only) and/or stage 2 (full fine-tune).
 # Run find_max_batch.py first to set PER_GPU_BATCH_STAGE1/2 below.
+#
+# Usage:
+#   bash scripts/batch_sweep.sh           # run both stages (default)
+#   bash scripts/batch_sweep.sh --stage 1 # stage 1 only
+#   bash scripts/batch_sweep.sh --stage 2 # stage 2 only (BEST_STAGE1_ADAPTER_CKPT must be set)
 set -e
+
+# ── CLI argument parsing ──────────────────────────────────────────────────────
+RUN_STAGE=""   # empty = both; "1" = stage 1 only; "2" = stage 2 only
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stage)
+            RUN_STAGE="$2"
+            if [[ "$RUN_STAGE" != "1" && "$RUN_STAGE" != "2" ]]; then
+                echo "ERROR: --stage must be 1 or 2 (got '$RUN_STAGE')" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            echo "ERROR: unknown argument '$1'" >&2
+            echo "Usage: $0 [--stage 1|2]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ── Configurable variables ────────────────────────────────────────────────────
 GCS_BUCKET="gs://speechllm-data"
@@ -41,6 +66,7 @@ _diag_args() {
 }
 
 # ── Stage 1 loop ──────────────────────────────────────────────────────────────
+if [[ -z "$RUN_STAGE" || "$RUN_STAGE" == "1" ]]; then
 echo ""
 echo "════════════════════════════════════════"
 echo "  STAGE 1: adapter-only training"
@@ -115,7 +141,19 @@ if [[ -z "$BEST_STAGE1_ADAPTER_CKPT" ]]; then
     exit 1
 fi
 
+fi  # end stage 1 block
+
 # ── Stage 2 loop ──────────────────────────────────────────────────────────────
+if [[ -z "$RUN_STAGE" || "$RUN_STAGE" == "2" ]]; then
+
+# When jumping straight to stage 2 (skipping stage 1 in this run), validate
+# that BEST_STAGE1_ADAPTER_CKPT is set before doing any work.
+if [[ -z "$BEST_STAGE1_ADAPTER_CKPT" ]]; then
+    echo "ERROR: BEST_STAGE1_ADAPTER_CKPT is not set." >&2
+    echo "Set it to the adapter checkpoint from your best stage-1 run and re-run with --stage 2." >&2
+    exit 1
+fi
+
 echo ""
 echo "════════════════════════════════════════"
 echo "  STAGE 2: full fine-tune"
@@ -180,3 +218,5 @@ done
 
 echo ""
 echo "Batch sweep complete."
+
+fi  # end stage 2 block
