@@ -46,7 +46,7 @@ LLAMA_CKPT="data/weights/Llama3.1-8B/"
 DIAG_SHARD="data/full-eval-test-dev-clean-other.tar"           # optional: path to diag shard; leave empty to omit
 MAX_DIAG_BATCHES=15
 INSTRUCTION_MODE="unformatted"
-NUM_WORKERS=1
+NUM_WORKERS=4
 LOG_EVERY=50
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
