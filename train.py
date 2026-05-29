@@ -716,7 +716,7 @@ def main() -> None:
             batch_size=args.batch_size,
             num_workers=0,
             instruction_variants=train_pairs,
-            shuffle_buffer=1,
+            shuffle_buffer=100,
             partial=True,   # keep the final incomplete batch on small shards
         )
         _diag_iter = iter(_diag_loader)
