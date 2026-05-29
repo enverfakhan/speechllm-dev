@@ -240,6 +240,33 @@ def _parse_args() -> argparse.Namespace:
         help="Explicit W&B run name. If None, W&B auto-generates one.",
     )
 
+    p.add_argument(
+        "--early_stop_metric",
+        type=str, default=None,
+        choices=["eval_first_token_loss", "eval_loss"],
+        help=(
+            "Metric to monitor for early stopping. Requires --diag_shard. "
+            "'eval_first_token_loss' monitors the diag eval first-token loss; "
+            "'eval_loss' monitors the diag eval mean loss."
+        ),
+    )
+    p.add_argument(
+        "--early_stop_threshold",
+        type=float, default=None,
+        help=(
+            "Stop training when the monitored metric drops below this value. "
+            "Required if --early_stop_metric is set."
+        ),
+    )
+    p.add_argument(
+        "--early_stop_min_steps",
+        type=int, default=500,
+        help=(
+            "Do not trigger early stopping before this many optimizer steps. "
+            "Prevents stopping on a lucky early eval before the model has settled."
+        ),
+    )
+
     return p.parse_args()
 
 
@@ -491,6 +518,10 @@ def main() -> None:
     if args.staged_llama:
         # TODO: mirror --staged_encoder once implemented
         raise NotImplementedError("--staged_llama is not yet implemented.")
+    if args.early_stop_metric is not None and args.diag_shard is None:
+        raise argparse.ArgumentTypeError(
+            "--early_stop_metric requires --diag_shard to be set"
+        )
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -1026,6 +1057,61 @@ def main() -> None:
                     print(f"Reached --max_steps {args.max_steps}. Done.")
                     done = True
                     break
+
+                # ── Early stopping ────────────────────────────────────────────
+                if (args.early_stop_metric is not None
+                        and args.early_stop_threshold is not None
+                        and global_step >= args.early_stop_min_steps):
+                    if args.early_stop_metric == "eval_first_token_loss":
+                        _es_val = eval_diag_metrics.get("loss/eval_first_token")
+                    else:  # eval_loss
+                        _es_val = eval_diag_metrics.get("loss/eval_rest")
+
+                    if _es_val is not None and _es_val < args.early_stop_threshold:
+                        print(
+                            f"[early stop] {args.early_stop_metric}={_es_val:.4f}"
+                            f" < {args.early_stop_threshold}"
+                            f" at step {global_step} — stopping."
+                        )
+                        if args.wandb:
+                            wandb.log({
+                                "early_stop/metric":    _es_val,
+                                "early_stop/threshold": args.early_stop_threshold,
+                                "early_stop/step":      global_step,
+                            })
+                        _es_ckpt_dir  = args.checkpoint_dir
+                        _es_ckpt_path = _es_ckpt_dir / f"checkpoint-step{global_step}-early-stop.pt"
+                        _es_ckpt_dict = {
+                            "step":                global_step,
+                            "epoch":               epoch,
+                            "micro_step_in_epoch": micro_step_in_epoch,
+                            "batch_size":          args.batch_size,
+                            "adapter":             adapter.state_dict(),
+                            "optimizer":           optimizer.state_dict(),
+                            "scaler":              scaler.state_dict(),
+                        }
+                        if not args.freeze_encoder:
+                            _es_ckpt_dict["encoder"] = encoder.state_dict()
+                        if not args.freeze_llama:
+                            _es_ckpt_dict["llama"] = llama.state_dict()
+                        torch.save(_es_ckpt_dict, _es_ckpt_path)
+                        print(f"Early-stop checkpoint saved → {_es_ckpt_path}")
+                        if args.freeze_encoder and args.freeze_llama:
+                            _es_adapter_path = _es_ckpt_dir / f"adapter-step{global_step}-early-stop.pt"
+                            torch.save(
+                                {
+                                    "step":                global_step,
+                                    "epoch":               epoch,
+                                    "micro_step_in_epoch": micro_step_in_epoch,
+                                    "batch_size":          args.batch_size,
+                                    "adapter":             adapter.state_dict(),
+                                    "optimizer_adapter":   optimizer.state_dict(),
+                                },
+                                _es_adapter_path,
+                            )
+                            print(f"Early-stop adapter checkpoint saved → {_es_adapter_path}")
+                        done = True
+                        break
 
         if not done:
             epoch += 1

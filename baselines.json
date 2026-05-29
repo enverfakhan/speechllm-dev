@@ -1,0 +1,17 @@
+{
+  "uniform_loss": 10.60032790493369,
+  "unigram_loss": 7.130623904575242,
+  "bigram_loss": 4.987206110793211,
+  "first_token_loss": 4.886218945678192,
+  "uniform_perplexity": 40147.99999999999,
+  "unigram_perplexity": 1249.6563900843855,
+  "bigram_perplexity": 146.52647235370833,
+  "first_token_perplexity": 132.4518185457013,
+  "total_tokens": 10324763,
+  "total_utterances": 281241,
+  "total_bigram_tokens": 10043522,
+  "vocab_coverage": 0.7214057985453821,
+  "unique_bigrams_seen": 1734813,
+  "_note_bigram": "Computed on training corpus \u2014 optimistic lower bound. loss/eval_rest below this means model uses context > 1 token.",
+  "_note_first_token": "loss/eval_first_token below this means model uses audio signal, not just which words tend to start utterances."
+}

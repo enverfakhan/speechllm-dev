@@ -32,20 +32,21 @@ done
 GCS_BUCKET="gs://speechllm-data"
 PER_GPU_BATCH_STAGE1=16      # set from: python scripts/find_max_batch.py --stage 1
 PER_GPU_BATCH_STAGE2=16      # set from: python scripts/find_max_batch.py --stage 2
-MAX_STEPS_STAGE1=5000
-MAX_STEPS_STAGE2=5000
+MAX_STEPS_STAGE1=2000
+MAX_STEPS_STAGE2=2000
 BEST_STAGE1_ADAPTER_CKPT=""  # fill in between stages (e.g. checkpoints/stage1-bs0128/adapter-step5000.pt)
 WANDB_PROJECT="speechllm-batch-sweep"
+EARLY_STOP_MIN_STEPS=500
 
 # Fixed paths — adjust if your layout differs
 SHARDS_FILE="data/subset_shards.txt"
 TOKENIZER="data/pruned_tokenizer/"
 WHISPER_CKPT="weights/whisper_small.pt"
 LLAMA_CKPT="/home/goivagoi/.llama/checkpoints/Llama3.1-8B/"
-DIAG_SHARD=""           # optional: path to diag shard; leave empty to omit
-MAX_DIAG_BATCHES=3
+DIAG_SHARD="data/full-eval-test-dev-clean-other.tar"           # optional: path to diag shard; leave empty to omit
+MAX_DIAG_BATCHES=15
 INSTRUCTION_MODE="unformatted"
-NUM_WORKERS=4
+NUM_WORKERS=1
 LOG_EVERY=50
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -103,6 +104,9 @@ for multiplier in 1 2 4 8; do
         --log_every          "$LOG_EVERY" \
         --num_workers        "$NUM_WORKERS" \
         --wandb \
+        --early_stop_metric    eval_first_token_loss \
+        --early_stop_threshold 4.88 \
+        --early_stop_min_steps "$EARLY_STOP_MIN_STEPS" \
         $(_diag_args) \
         |& tee "$log_file"
 
@@ -192,6 +196,9 @@ for multiplier in 1 2 4 8; do
         --log_every          "$LOG_EVERY" \
         --num_workers        "$NUM_WORKERS" \
         --wandb \
+        --early_stop_metric    eval_loss \
+        --early_stop_threshold 2.30 \
+        --early_stop_min_steps "$EARLY_STOP_MIN_STEPS" \
         $(_diag_args) \
         |& tee "$log_file"
 
