@@ -73,7 +73,7 @@ echo "════════════════════════�
 echo "  STAGE 1: adapter-only training"
 echo "════════════════════════════════════════"
 
-for multiplier in 1 2 4 8; do
+for multiplier in 1; do
     effective_batch=$(( PER_GPU_BATCH_STAGE1 * multiplier ))
     accum=$(( multiplier ))
     run_name="stage1-bs$(printf '%04d' $effective_batch)"
@@ -167,7 +167,7 @@ echo "════════════════════════�
 
 declare -A STAGE2_TIMES
 
-for multiplier in 1 2 4 8; do
+for multiplier in 1; do
     effective_batch=$(( PER_GPU_BATCH_STAGE2 * multiplier ))
     accum=$(( multiplier ))
     run_name="stage2-bs$(printf '%04d' $effective_batch)"
