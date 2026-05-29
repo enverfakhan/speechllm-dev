@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -196,6 +197,13 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--freeze_llama", action="store_true",
+        help=(
+            "Freeze Llama: set requires_grad=False on all Llama parameters and "
+            "exclude them from the optimizer. Logged as train/llama_frozen=1 in W&B."
+        ),
+    )
+    p.add_argument(
         "--staged_encoder", action="store_true",
         help=(
             "Start with the encoder frozen. Once loss/train_first_token drops below "
@@ -205,6 +213,31 @@ def _parse_args() -> argparse.Namespace:
             "Requires baselines.json to contain first_token_loss. "
             "Mutually exclusive with --freeze_encoder (permanent freeze wins)."
         ),
+    )
+    p.add_argument(
+        "--staged_llama", action="store_true",
+        help="Placeholder — raises NotImplementedError if passed.",
+    )
+    p.add_argument(
+        "--adapter_ckpt", type=Path, default=None,
+        help=(
+            "Path to a saved adapter-only checkpoint (.pt) containing at minimum "
+            "{'adapter': state_dict} and optionally {'optimizer_adapter': optimizer "
+            "state for adapter params}. Used for cross-stage loading."
+        ),
+    )
+    p.add_argument(
+        "--resume_ckpt", type=Path, default=None,
+        help=(
+            "Path to a full checkpoint (.pt) for same-stage resume. Loads encoder, "
+            "adapter, llama, optimizer, scaler, step, epoch, micro_step_in_epoch, "
+            "batch_size. When passed, --whisper_ckpt / --llama_ckpt / --adapter_ckpt "
+            "are ignored for weight loading."
+        ),
+    )
+    p.add_argument(
+        "--wandb_run_name", type=str, default=None,
+        help="Explicit W&B run name. If None, W&B auto-generates one.",
     )
 
     return p.parse_args()
@@ -398,6 +431,53 @@ def _evaluate_all_splits(
     return results, sample_rows
 
 
+def _load_adapter_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    saved_opt_state: dict,
+    adapter: "AudioAdapter",
+) -> None:
+    """Copy saved adapter optimizer state into the current optimizer.
+
+    Matches adapter parameters by their position within the adapter's own
+    parameter list, then inserts matching state entries into optimizer.state
+    keyed by the live parameter tensors. param_groups are left untouched.
+    """
+    adapter_ptrs = {p.data_ptr(): p for p in adapter.parameters()}
+
+    # Build a flat ordered list of live adapter params as they appear in the optimizer
+    live_adapter_params: list[torch.Tensor] = []
+    for grp in optimizer.param_groups:
+        for p in grp["params"]:
+            if p.data_ptr() in adapter_ptrs:
+                live_adapter_params.append(p)
+
+    # Build a flat ordered list of saved adapter params from saved_opt_state
+    saved_params_flat: list[int] = []
+    for grp in saved_opt_state.get("param_groups", []):
+        saved_params_flat.extend(grp["params"])
+
+    saved_state: dict = saved_opt_state.get("state", {})
+    for live_idx, (live_p, saved_idx) in enumerate(
+        zip(live_adapter_params, saved_params_flat)
+    ):
+        if saved_idx in saved_state:
+            optimizer.state[live_p] = saved_state[saved_idx]
+
+
+def _exhaust_dataloader(loader: torch.utils.data.DataLoader, n_steps: int) -> None:
+    """Advance the dataloader by n_steps batches without processing them.
+
+    Used to skip data already seen in a prior training stage so stage 2
+    does not train on data seen in stage 1.
+    """
+    it = iter(loader)
+    for _ in range(n_steps):
+        try:
+            next(it)
+        except StopIteration:
+            break
+
+
 def _load_shard_list(args: argparse.Namespace) -> list[str]:
     if args.shards_file is not None:
         lines = args.shards_file.read_text().splitlines()
@@ -408,6 +488,9 @@ def _load_shard_list(args: argparse.Namespace) -> list[str]:
 def main() -> None:
     """Parse CLI arguments and run the training loop."""
     args = _parse_args()
+    if args.staged_llama:
+        # TODO: mirror --staged_encoder once implemented
+        raise NotImplementedError("--staged_llama is not yet implemented.")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -490,6 +573,14 @@ def main() -> None:
     else:
         print("Encoder: trainable")
 
+    # ── Llama freeze (must happen before optimizer construction) ──────────────
+    if args.freeze_llama:
+        for p in llama.parameters():
+            p.requires_grad_(False)
+        print("Llama: FROZEN")
+    else:
+        print("Llama: trainable")
+
     n_enc   = sum(p.numel() for p in encoder.parameters())
     n_ada   = sum(p.numel() for p in adapter.parameters())
     n_llm   = sum(p.numel() for p in llama.parameters())
@@ -506,10 +597,9 @@ def main() -> None:
     _param_groups = []
     if not args.freeze_encoder and not _staged_encoder:
         _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
-    _param_groups += [
-        {"params": adapter.parameters(), "lr": 1e-5},
-        {"params": llama.parameters(),   "lr": 1e-5},
-    ]
+    _param_groups.append({"params": adapter.parameters(), "lr": 1e-5})
+    if not args.freeze_llama:
+        _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(_param_groups, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda")
@@ -530,9 +620,32 @@ def main() -> None:
                 "Add 'export WANDB_API_KEY=...' to ~/.bashrc and reload your shell."
             )
         wandb.login(key=api_key, relogin=False)
-        wandb.init(project=args.wandb_project)
+        _stage = 1 if (args.freeze_encoder and args.freeze_llama) else 2
+        # adapter LR is always in the first param group
+        _lr_for_config = _param_groups[0]["lr"]
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "stage":              _stage,
+                "effective_batch":    args.batch_size * args.accum_steps,
+                "batch_size":         args.batch_size,
+                "accum_steps":        args.accum_steps,
+                "max_steps":          args.max_steps,
+                "freeze_encoder":     args.freeze_encoder,
+                "freeze_llama":       args.freeze_llama,
+                "staged_encoder":     args.staged_encoder,
+                "lr":                 _lr_for_config,
+                "grad_clip_max_norm": args.grad_clip_max_norm,
+                "instruction_mode":   args.instruction_mode,
+                "seed":               args.seed,
+                "resume_ckpt":        str(args.resume_ckpt) if args.resume_ckpt else None,
+                "adapter_ckpt":       str(args.adapter_ckpt) if args.adapter_ckpt else None,
+            },
+        )
 
     _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder) else 0.0
+    _llama_frozen_val   = 1.0 if args.freeze_llama else 0.0
 
     # ── Instruction mode ──────────────────────────────────────────────────────
     if args.instruction_mode == "unformatted":
@@ -600,8 +713,49 @@ def main() -> None:
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Checkpoint loading ────────────────────────────────────────────────────
+    resume_global_step         = 0
+    resume_epoch               = 0
+    resume_micro_step_in_epoch = 0
+    resume_batch_size          = args.batch_size
+    _cross_stage_resume        = False
+
+    if args.resume_ckpt:
+        print(f"Resuming from checkpoint: {args.resume_ckpt}")
+        _ckpt = torch.load(args.resume_ckpt, map_location="cpu")
+        if "encoder" in _ckpt:
+            encoder.load_state_dict(_ckpt["encoder"])
+        if "adapter" in _ckpt:
+            adapter.load_state_dict(_ckpt["adapter"])
+        if "llama" in _ckpt:
+            llama.load_state_dict(_ckpt["llama"])
+        optimizer.load_state_dict(_ckpt["optimizer"])
+        scaler.load_state_dict(_ckpt["scaler"])
+        resume_global_step         = _ckpt["step"]
+        resume_epoch               = _ckpt.get("epoch", 0)
+        resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
+        resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
+        print(
+            f"  Resumed at step={resume_global_step}  epoch={resume_epoch}  "
+            f"micro_step_in_epoch={resume_micro_step_in_epoch}"
+        )
+    elif args.adapter_ckpt:
+        print(f"Cross-stage load from adapter checkpoint: {args.adapter_ckpt}")
+        _ckpt = torch.load(args.adapter_ckpt, map_location="cpu")
+        adapter.load_state_dict(_ckpt["adapter"])
+        if "optimizer_adapter" in _ckpt:
+            _load_adapter_optimizer_state(optimizer, _ckpt["optimizer_adapter"], adapter)
+        resume_epoch               = _ckpt.get("epoch", 0)
+        resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
+        resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
+        _cross_stage_resume        = True
+        print(
+            f"  Cross-stage: epoch={resume_epoch}  "
+            f"micro_step_in_epoch={resume_micro_step_in_epoch}"
+        )
+
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step   = 0     # optimizer steps
+    global_step   = resume_global_step
     micro_step    = 0     # gradient accumulation steps
     accum_loss    = 0.0
     loss_ema: float | None = None
@@ -617,7 +771,8 @@ def main() -> None:
 
     optimizer.zero_grad()
 
-    epoch = 0
+    epoch               = resume_epoch
+    micro_step_in_epoch = 0
     done  = False
     # cached_batch = None
     while not done:
@@ -633,7 +788,22 @@ def main() -> None:
             instruction_variants=train_pairs,
         )
 
+        # ── Cross-stage fast-forward (first epoch only) ───────────────────────
+        if _cross_stage_resume and epoch == resume_epoch:
+            n_skip = math.floor(
+                resume_micro_step_in_epoch * resume_batch_size / args.batch_size
+            )
+            if n_skip > 0:
+                print(
+                    f"[resume] skipping {n_skip} batches in epoch {epoch} "
+                    f"to avoid stage-1 data"
+                )
+                _exhaust_dataloader(loader, n_skip)
+                micro_step_in_epoch = n_skip
+            _cross_stage_resume = False  # only fast-forward once
+
         for batch in loader:
+            micro_step_in_epoch += 1
             # if cached_batch is None:
             #     cached_batch = batch
             # else:
@@ -687,19 +857,39 @@ def main() -> None:
                 _save_regular = args.save_every is not None and global_step % args.save_every == 0
                 _save_staged  = _staged_thawed and global_step % (2 * args.log_every) == 0
                 if _save_regular or _save_staged:
-                    ckpt_path = args.checkpoint_dir / f"step_{global_step:07d}.pt"
-                    torch.save(
-                        {
-                            "step":      global_step,
-                            "encoder":   encoder.state_dict(),
-                            "adapter":   adapter.state_dict(),
-                            "llama":     llama.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "scaler":    scaler.state_dict(),
-                        },
-                        ckpt_path,
-                    )
+                    ckpt_dir  = args.checkpoint_dir
+                    ckpt_path = ckpt_dir / f"step_{global_step:07d}.pt"
+                    _ckpt_dict = {
+                        "step":                global_step,
+                        "epoch":               epoch,
+                        "micro_step_in_epoch": micro_step_in_epoch,
+                        "batch_size":          args.batch_size,
+                        "adapter":             adapter.state_dict(),
+                        "optimizer":           optimizer.state_dict(),
+                        "scaler":              scaler.state_dict(),
+                    }
+                    if not args.freeze_encoder:
+                        _ckpt_dict["encoder"] = encoder.state_dict()
+                    if not args.freeze_llama:
+                        _ckpt_dict["llama"] = llama.state_dict()
+                    torch.save(_ckpt_dict, ckpt_path)
                     print(f"Checkpoint saved → {ckpt_path}")
+
+                    # Adapter-only file for cross-stage loading (stage 1 only)
+                    if args.freeze_encoder and args.freeze_llama:
+                        adapter_ckpt_path = ckpt_dir / f"adapter-step{global_step}.pt"
+                        torch.save(
+                            {
+                                "step":                global_step,
+                                "epoch":               epoch,
+                                "micro_step_in_epoch": micro_step_in_epoch,
+                                "batch_size":          args.batch_size,
+                                "adapter":             adapter.state_dict(),
+                                "optimizer_adapter":   optimizer.state_dict(),
+                            },
+                            adapter_ckpt_path,
+                        )
+                        print(f"Adapter checkpoint saved → {adapter_ckpt_path}")
 
                 # ── Diagnostic shard eval pass ────────────────────────────────
                 eval_diag_metrics: dict = {}
@@ -800,9 +990,15 @@ def main() -> None:
                         _gap["loss/gap_rest"] = _er - _tr
                     if _tf is not None and _ef is not None:
                         _gap["loss/gap_first_token"] = _ef - _tf
-                    # In staged mode: adapter=0, llama=1, encoder=2(after thaw).
-                    # In normal mode: encoder=0(if trainable), adapter=..., llama=-1.
-                    _llama_pg_idx = 1 if (_staged_encoder or args.freeze_encoder) else -1
+                    # In staged mode: adapter=0, llama=1(if unfrozen), encoder=last(after thaw).
+                    # In normal mode: encoder=0(if trainable), adapter=next, llama=last.
+                    # When llama is frozen it has no param group — use adapter group (idx 0).
+                    if args.freeze_llama:
+                        _llama_pg_idx = 0  # adapter group; llama has no param group
+                    elif _staged_encoder or args.freeze_encoder:
+                        _llama_pg_idx = 1
+                    else:
+                        _llama_pg_idx = -1
                     _enc_lr_log = (
                         optimizer.param_groups[-1]["lr"] if _staged_thawed
                         else (0.0 if (args.freeze_encoder or _staged_encoder)
@@ -815,6 +1011,7 @@ def main() -> None:
                             "train/lr":                              optimizer.param_groups[_llama_pg_idx]["lr"],
                             "train/lr_encoder":                      _enc_lr_log,
                             "train/encoder_frozen":                  _encoder_frozen_val,
+                            "train/llama_frozen":                    _llama_frozen_val,
                             "runtime/throughput_audio_sec_per_sec":  throughput,
                             "runtime/cumulative_audio_hours":         total_audio_s / 3600,
                             "runtime/wall_time_min":                  (t_now - train_start) / 60,
@@ -832,6 +1029,7 @@ def main() -> None:
 
         if not done:
             epoch += 1
+            micro_step_in_epoch = 0
 
     # ── End-of-training WER evaluation ───────────────────────────────────────
     if args.eval_at_end and eval_loaders:
