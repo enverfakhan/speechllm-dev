@@ -78,14 +78,18 @@ class PrunedTokenizer:
     def encode(self, text: str) -> list[int]:
         """Tokenize text and remap to pruned vocabulary IDs.
 
+        Tokens whose original IDs are absent from the pruned vocab (e.g. tokens
+        unique to dev/test splits that were not seen during vocab building) are
+        silently dropped, consistent with how decode() handles unknown IDs.
+
         Args:
             text: plain-text string
 
         Returns:
-            list of token IDs in the pruned vocabulary space
+            list of token IDs in the pruned vocabulary space (unknown tokens omitted)
         """
         old_ids = self._tok.encode(text, add_special_tokens=False)
-        return [self._vocab_map[i] for i in old_ids]
+        return [self._vocab_map[i] for i in old_ids if i in self._vocab_map]
 
     def decode(self, pruned_ids: list[int]) -> str:
         """Convert pruned vocabulary IDs back to a text string.

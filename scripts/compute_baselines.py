@@ -15,10 +15,10 @@ Interpretation ladder for loss/eval_rest:
                             model is using the audio signal
 
 Usage:
-    python scripts/compute_baselines.py \
-        --shards data/dev_train_shards.txt \
-        --tokenizer data/pruned_tokenizer/ \
-        --output baselines.json
+python scripts/compute_baselines.py \
+    --shards data/full_training_shards.txt \
+    --tokenizer data/pruned_tokenizer/ \
+    --output baselines.json
 """
 
 from __future__ import annotations

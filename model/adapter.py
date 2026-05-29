@@ -14,7 +14,7 @@ seeing padding tokens in the history of real tokens.
 """
 
 from __future__ import annotations
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,13 +33,21 @@ class AudioAdapter(nn.Module):
     Output: (B,  375, llama_dim) — ready to be passed to prepare_input()
     """
 
-    def __init__(self, llama_dim: int = _LLAMA_DIM) -> None:
-        """Initialise with random weights (no pretrained checkpoint).
+    def __init__(
+        self,
+        llama_dim: int = _LLAMA_DIM,
+        pca_init_path: str | None = None,
+    ) -> None:
+        """Initialise with random weights, optionally loading a PCA-based init.
 
         Args:
-            llama_dim: output dimension; must match the Llama model's d_model.
-                       Defaults to 4096 (full Llama 3.1 8B). Pass a smaller
-                       value (e.g. 512) when using a stub config for testing.
+            llama_dim:     output dimension; must match the Llama model's d_model.
+                           Defaults to 4096 (full Llama 3.1 8B). Pass a smaller
+                           value (e.g. 512) when using a stub config for testing.
+            pca_init_path: path to a .pt file produced by
+                           scripts/compute_adapter_pca_init.py. When provided,
+                           mlp[0].weight is replaced with the saved PCA basis and
+                           mlp[0].bias is zeroed. mlp[2] is unaffected.
         """
         super().__init__()
         self.mlp = nn.Sequential(
@@ -47,6 +55,40 @@ class AudioAdapter(nn.Module):
             nn.GELU(),
             nn.Linear(_HIDDEN_DIM, llama_dim),
         )
+        # initialise output projection to near-zero so adapter starts as identity-ish
+        nn.init.normal_(self.mlp[2].weight, mean=0.0, std=0.02 / math.sqrt(6))
+        nn.init.zeros_(self.mlp[2].bias)
+
+        if pca_init_path is not None:
+            self._load_pca_init(pca_init_path)
+
+    def _load_pca_init(self, path: str) -> None:
+        """Replace mlp[0] weights with the PCA basis saved at *path*.
+
+        The file must contain a dict with key 'weight' of shape
+        (_HIDDEN_DIM, _ENCODER_DIM) = (2048, 768).
+        """
+        data   = torch.load(path, map_location="cpu", weights_only=True)
+        weight = data["weight"]   # (2048, 768)
+
+        expected = self.mlp[0].weight.shape
+        if weight.shape != expected:
+            raise ValueError(
+                f"PCA weight shape {tuple(weight.shape)} does not match "
+                f"first linear layer {tuple(expected)}"
+            )
+
+        with torch.no_grad():
+            self.mlp[0].weight.copy_(weight)
+            nn.init.zeros_(self.mlp[0].bias)
+
+        if "explained_variance_ratio" in data:
+            evr    = data["explained_variance_ratio"].float()
+            cum_ev = evr.sum().item()
+            print(
+                f"PCA init loaded from '{path}'  "
+                f"(cumulative explained variance: {cum_ev:.4f} = {cum_ev:.2%})"
+            )
 
     def forward(self, encoder_out: torch.Tensor) -> torch.Tensor:
         """Pool and project encoder hidden states.

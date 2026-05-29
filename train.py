@@ -179,11 +179,31 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--adapter_pca_init", type=str, default=None,
+        help=(
+            "Path to a PCA init file produced by scripts/compute_adapter_pca_init.py. "
+            "When provided, AudioAdapter.mlp[0].weight is initialised with the saved "
+            "PCA basis instead of the default random init."
+        ),
+    )
+
+    p.add_argument(
         "--freeze_encoder", action="store_true",
         help=(
             "Freeze the Whisper encoder: disable gradients and exclude it from the "
             "optimizer. Useful when overfitting on a small dataset and you want to "
             "isolate adapter+LLM training. Logged as train/encoder_frozen=1 in W&B."
+        ),
+    )
+    p.add_argument(
+        "--staged_encoder", action="store_true",
+        help=(
+            "Start with the encoder frozen. Once loss/train_first_token drops below "
+            "baselines['first_token_loss'] (from baselines.json), the encoder is "
+            "unfrozen and its LR linearly warms up from adapter_lr/100 to adapter_lr/10 "
+            "over 100 optimizer steps, then stays at adapter_lr/10. "
+            "Requires baselines.json to contain first_token_loss. "
+            "Mutually exclusive with --freeze_encoder (permanent freeze wins)."
         ),
     )
 
@@ -402,12 +422,26 @@ def main() -> None:
     sep_token_id = pruned_cfg["sep_token_id"]  # 40147
     print(f"Pruned vocab: {vocab_size} tokens  SEP id: {sep_token_id}")
 
-    # baseline values for milestone target during training. 
+    # baseline values for milestone target during training.
     baseline_path = Path("baselines.json")
     if baseline_path.exists():
         baselines_data = json.loads(baseline_path.read_text())
     else:
         baselines_data = {}
+
+    # Staged encoder: freeze encoder initially, auto-thaw when first_token_loss crossed.
+    _staged_encoder = args.staged_encoder
+    if _staged_encoder:
+        if args.freeze_encoder:
+            print("WARNING: --freeze_encoder overrides --staged_encoder; encoder permanently frozen.")
+            _staged_encoder = False
+        elif baselines_data.get("first_token_loss") is None:
+            print("WARNING: --staged_encoder set but baselines.json has no first_token_loss; staged training disabled.")
+            _staged_encoder = False
+    print(
+        f"Staged encoder: {'ACTIVE' if _staged_encoder else 'disabled'}"
+        + (f"  (threshold first_token_loss={baselines_data['first_token_loss']:.4f})" if _staged_encoder else "")
+    )
     # ── Model instantiation ───────────────────────────────────────────────────
     if args.stub:
         # Tiny model for pipeline validation when full 8B does not fit in VRAM/RAM.
@@ -423,7 +457,7 @@ def main() -> None:
         llama_dim = 4096
 
     encoder = WhisperEncoder()
-    adapter = AudioAdapter(llama_dim=llama_dim)
+    adapter = AudioAdapter(llama_dim=llama_dim, pca_init_path=args.adapter_pca_init)
     llama   = Llama(llama_cfg)
 
     # ── Load pretrained weights ───────────────────────────────────────────────
@@ -447,9 +481,9 @@ def main() -> None:
     llama.train()
 
     # ── Encoder freeze (must happen before optimizer construction) ────────────
-    if args.freeze_encoder:
+    if args.freeze_encoder or _staged_encoder:
         encoder.requires_grad_(False)
-        print("Encoder: FROZEN")
+        print("Encoder: FROZEN" + (" (staged — will auto-thaw)" if _staged_encoder else ""))
     else:
         print("Encoder: trainable")
 
@@ -464,15 +498,23 @@ def main() -> None:
     )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
+    # In staged mode the encoder is excluded here; added via add_param_group on thaw.
+    # Adapter is always param_groups[0] when encoder is absent (frozen or staged).
     _param_groups = []
-    if not args.freeze_encoder:
-        _param_groups.append({"params": encoder.parameters(), "lr": 1e-6})
+    if not args.freeze_encoder and not _staged_encoder:
+        _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
     _param_groups += [
         {"params": adapter.parameters(), "lr": 1e-5},
         {"params": llama.parameters(),   "lr": 1e-5},
     ]
-    optimizer = torch.optim.AdamW(_param_groups, weight_decay=0.01)
+    import bitsandbytes as bnb
+    optimizer = bnb.optim.AdamW8bit(_param_groups, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda")
+
+    # ── Staged encoder state ──────────────────────────────────────────────────
+    _staged_thawed      = False   # becomes True when trigger fires
+    _encoder_thaw_step  = 0       # global_step when encoder was thawed
+    _ENCODER_WARMUP_STEPS = 100   # steps to ramp from adapter_lr/100 → adapter_lr/10
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     if args.wandb:
@@ -487,7 +529,7 @@ def main() -> None:
         wandb.login(key=api_key, relogin=False)
         wandb.init(project=args.wandb_project)
 
-    _encoder_frozen_val = 1.0 if args.freeze_encoder else 0.0
+    _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder) else 0.0
 
     # ── Instruction mode ──────────────────────────────────────────────────────
     if args.instruction_mode == "unformatted":
@@ -639,7 +681,9 @@ def main() -> None:
                 loss_ema   = avg_loss if loss_ema is None else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
 
                 # ── Checkpoint (optional) ─────────────────────────────────────
-                if args.save_every is not None and global_step % args.save_every == 0:
+                _save_regular = args.save_every is not None and global_step % args.save_every == 0
+                _save_staged  = _staged_thawed and global_step % (2 * args.log_every) == 0
+                if _save_regular or _save_staged:
                     ckpt_path = args.checkpoint_dir / f"step_{global_step:07d}.pt"
                     torch.save(
                         {
@@ -699,6 +743,38 @@ def main() -> None:
                     f"  {throughput:.2f}× realtime"
                 )
                 diag_metrics = diag.flush(global_step)
+
+                # ── Staged encoder: trigger check ─────────────────────────────
+                # Fires at most once: when train_first_token first drops below
+                # the corpus first_token_loss baseline.
+                if _staged_encoder and not _staged_thawed:
+                    _ftl = diag_metrics.get("loss/train_first_token")
+                    if _ftl is not None and _ftl < baselines_data["first_token_loss"]:
+                        encoder.requires_grad_(True)
+                        _adapter_lr = optimizer.param_groups[0]["lr"]
+                        optimizer.add_param_group(
+                            {"params": list(encoder.parameters()), "lr": _adapter_lr / 100}
+                        )
+                        _staged_thawed     = True
+                        _encoder_thaw_step = global_step
+                        _encoder_frozen_val = 0.0
+                        print(
+                            f"[step {global_step}] Encoder THAWED — "
+                            f"train_first_token={_ftl:.4f} < baseline={baselines_data['first_token_loss']:.4f}"
+                        )
+
+                # ── Staged encoder: LR warmup (every step after thaw) ─────────
+                # Encoder is always the last param group when staged.
+                if _staged_thawed:
+                    steps_since_thaw = global_step - _encoder_thaw_step
+                    _adapter_lr = optimizer.param_groups[0]["lr"]
+                    if steps_since_thaw <= _ENCODER_WARMUP_STEPS:
+                        t = steps_since_thaw / _ENCODER_WARMUP_STEPS
+                        new_enc_lr = _adapter_lr * (0.01 + 0.09 * t)
+                    else:
+                        new_enc_lr = _adapter_lr / 10
+                    optimizer.param_groups[-1]["lr"] = new_enc_lr
+
                 if args.wandb:
                     # Load and log corpus baselines as wandb summary values.
                     # These appear as horizontal reference lines when you use
@@ -721,11 +797,20 @@ def main() -> None:
                         _gap["loss/gap_rest"] = _er - _tr
                     if _tf is not None and _ef is not None:
                         _gap["loss/gap_first_token"] = _ef - _tf
+                    # In staged mode: adapter=0, llama=1, encoder=2(after thaw).
+                    # In normal mode: encoder=0(if trainable), adapter=..., llama=-1.
+                    _llama_pg_idx = 1 if (_staged_encoder or args.freeze_encoder) else -1
+                    _enc_lr_log = (
+                        optimizer.param_groups[-1]["lr"] if _staged_thawed
+                        else (0.0 if (args.freeze_encoder or _staged_encoder)
+                              else optimizer.param_groups[0]["lr"])
+                    )
                     wandb.log(
                         {
                             "train/loss":                            avg_loss,
                             "train/loss_ema":                        loss_ema,
-                            "train/lr":                              optimizer.param_groups[-1]["lr"],
+                            "train/lr":                              optimizer.param_groups[_llama_pg_idx]["lr"],
+                            "train/lr_encoder":                      _enc_lr_log,
                             "train/encoder_frozen":                  _encoder_frozen_val,
                             "runtime/throughput_audio_sec_per_sec":  throughput,
                             "runtime/cumulative_audio_hours":         total_audio_s / 3600,
