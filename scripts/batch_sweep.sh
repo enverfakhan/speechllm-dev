@@ -30,13 +30,13 @@ done
 
 # ── Configurable variables ────────────────────────────────────────────────────
 GCS_BUCKET="gs://speechllm-data"
-PER_GPU_BATCH_STAGE1=16      # set from: python scripts/find_max_batch.py --stage 1
-PER_GPU_BATCH_STAGE2=16      # set from: python scripts/find_max_batch.py --stage 2
-MAX_STEPS_STAGE1=2000
-MAX_STEPS_STAGE2=2000
+PER_GPU_BATCH_STAGE1=64      # set from: python scripts/find_max_batch.py --stage 1
+PER_GPU_BATCH_STAGE2=8      # set from: python scripts/find_max_batch.py --stage 2
+MAX_STEPS_STAGE1=10
+MAX_STEPS_STAGE2=10
 BEST_STAGE1_ADAPTER_CKPT=""  # fill in between stages (e.g. checkpoints/stage1-bs0128/adapter-step5000.pt)
 WANDB_PROJECT="speechllm-batch-sweep"
-EARLY_STOP_MIN_STEPS=500
+EARLY_STOP_MIN_STEPS=1
 
 # Fixed paths — adjust if your layout differs
 SHARDS_FILE="data/subset_shards.txt"

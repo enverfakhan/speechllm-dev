@@ -1133,6 +1133,38 @@ def main() -> None:
             epoch += 1
             micro_step_in_epoch = 0
 
+    # ── Final checkpoint (always saved at end of training) ───────────────────
+    _final_ckpt_path = args.checkpoint_dir / f"checkpoint-step{global_step}-final.pt"
+    _final_ckpt_dict = {
+        "step":                global_step,
+        "epoch":               epoch,
+        "micro_step_in_epoch": micro_step_in_epoch,
+        "batch_size":          args.batch_size,
+        "adapter":             adapter.state_dict(),
+        "optimizer":           optimizer.state_dict(),
+        "scaler":              scaler.state_dict(),
+    }
+    if not args.freeze_encoder:
+        _final_ckpt_dict["encoder"] = encoder.state_dict()
+    if not args.freeze_llama:
+        _final_ckpt_dict["llama"] = llama.state_dict()
+    torch.save(_final_ckpt_dict, _final_ckpt_path)
+    print(f"Final checkpoint saved → {_final_ckpt_path}")
+    if args.freeze_encoder and args.freeze_llama:
+        _final_adapter_path = args.checkpoint_dir / f"adapter-step{global_step}-final.pt"
+        torch.save(
+            {
+                "step":                global_step,
+                "epoch":               epoch,
+                "micro_step_in_epoch": micro_step_in_epoch,
+                "batch_size":          args.batch_size,
+                "adapter":             adapter.state_dict(),
+                "optimizer_adapter":   optimizer.state_dict(),
+            },
+            _final_adapter_path,
+        )
+        print(f"Final adapter checkpoint saved → {_final_adapter_path}")
+
     # ── End-of-training WER evaluation ───────────────────────────────────────
     if args.eval_at_end and eval_loaders:
         print("Running end-of-training WER evaluation …")
