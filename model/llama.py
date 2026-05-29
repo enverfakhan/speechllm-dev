@@ -357,7 +357,11 @@ class Llama(nn.Module):
 
         return logits, loss
 
-    def load_meta_weights(self, checkpoint_dir: Path) -> None:
+    def load_meta_weights(
+        self,
+        checkpoint_dir: Path,
+        vocab_map: dict[str, int] | None = None,
+    ) -> None:
         """Load pretrained Llama 3.1 weights from a local checkpoint directory.
 
         Supports two on-disk formats:
@@ -367,14 +371,18 @@ class Llama(nn.Module):
         Asserts on every parameter shape before copying. Raises immediately on
         any mismatch so shape bugs are never silent.
 
-        Note: if the model was initialised with a pruned vocabulary
-        (vocab_size < 32000), the embed_tokens assertion will fail because the
-        checkpoint embedding matrix has 32 000 rows.  Use
-        LlamaConfig(vocab_size=32000) when loading pretrained weights and apply
-        vocab pruning separately afterwards.
+        When the model is initialised with a pruned vocabulary (vocab_size < full
+        checkpoint vocab size), the embedding matrix row counts will differ.
+        Pass vocab_map (the dict from vocab_map.json, mapping old_id_str → new_id)
+        to extract the relevant rows from the checkpoint and initialise the pruned
+        embedding from pretrained weights.  Without vocab_map the embedding is skipped
+        and left at its random initialisation.
 
         Args:
             checkpoint_dir: directory containing the checkpoint files
+            vocab_map:      optional {str(old_token_id): new_token_id} mapping produced
+                            by build_vocab.py; enables pretrained embedding init for
+                            pruned vocabularies
         """
         checkpoint_dir = Path(checkpoint_dir)
 
@@ -463,14 +471,31 @@ class Llama(nn.Module):
                 continue
             param = own_params[our_key]
             if tensor.shape != param.shape:
-                # Embedding mismatch is expected when training with a pruned vocab:
-                # Decision 005 initialises embed_tokens from scratch at pruned size,
-                # so the full-vocab checkpoint row is intentionally not loaded.
                 if our_key == "embed_tokens.weight":
+                    if vocab_map is not None:
+                        # Extract the rows for pruned tokens from the full checkpoint embedding.
+                        # vocab_map maps str(old_id) → new_id; invert to new_id → old_id index list.
+                        new_to_old = [0] * param.shape[0]
+                        for old_str, new_id in vocab_map.items():
+                            new_to_old[new_id] = int(old_str)
+                        pruned = tensor[new_to_old, :]
+                        assert pruned.shape == param.shape, (
+                            f"Pruned embedding shape {tuple(pruned.shape)} != "
+                            f"model shape {tuple(param.shape)}"
+                        )
+                        with torch.no_grad():
+                            param.copy_(pruned)
+                        loaded += 1
+                        print(
+                            f"[load_meta_weights] embed_tokens.weight initialised from "
+                            f"pretrained rows (checkpoint {tuple(tensor.shape)} → "
+                            f"pruned {tuple(pruned.shape)})"
+                        )
+                        continue
                     print(
                         f"[load_meta_weights] skipping embed_tokens.weight "
                         f"(checkpoint {tuple(tensor.shape)} vs model {tuple(param.shape)})"
-                        " — embedding trained from scratch with pruned vocabulary"
+                        " — pass vocab_map to initialise from pretrained rows"
                     )
                     skipped += 1
                     continue

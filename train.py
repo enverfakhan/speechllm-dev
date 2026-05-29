@@ -466,8 +466,11 @@ def main() -> None:
             raise ValueError("--whisper_ckpt and --llama_ckpt are required unless --stub is set.")
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
-        print("Loading Llama transformer weights (embedding trained from scratch) …")
-        llama.load_meta_weights(args.llama_ckpt)
+        vocab_map_path = Path(args.tokenizer) / "vocab_map.json"
+        with vocab_map_path.open() as f:
+            vocab_map = json.load(f)
+        print("Loading Llama transformer weights (embedding initialised from pretrained rows) …")
+        llama.load_meta_weights(args.llama_ckpt, vocab_map=vocab_map)
     elif args.whisper_ckpt is not None:
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
