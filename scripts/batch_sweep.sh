@@ -39,7 +39,7 @@ WANDB_PROJECT="speechllm-batch-sweep"
 EARLY_STOP_MIN_STEPS=1
 
 # Fixed paths — adjust if your layout differs
-SHARDS_FILE="data/subset_shards.txt"
+SHARDS_FILE="data/full_training_shards.txt"
 TOKENIZER="data/pruned_tokenizer/"
 WHISPER_CKPT="weights/whisper_small.pt"
 LLAMA_CKPT="weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/"

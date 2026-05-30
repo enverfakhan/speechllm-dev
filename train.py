@@ -665,7 +665,7 @@ def main() -> None:
                 "WANDB_API_KEY is not set. "
                 "Add 'export WANDB_API_KEY=...' to ~/.bashrc and reload your shell."
             )
-        wandb.login(key=api_key, relogin=False)
+        # wandb.login(key=api_key, relogin=False)
         _stage = 1 if (args.freeze_encoder and args.freeze_llama) else 2
         # adapter LR is always in the first param group
         _lr_for_config = _param_groups[0]["lr"]
