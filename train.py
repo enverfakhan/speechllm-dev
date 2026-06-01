@@ -597,9 +597,9 @@ def main() -> None:
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
 
-    encoder = encoder.to(torch.bfloat16).to(device)
-    adapter = adapter.to(torch.bfloat16).to(device)
-    llama   = llama.to(torch.bfloat16).to(device)
+    encoder = encoder.to(device)
+    adapter = adapter.to(device)
+    llama   = llama.to(device)
 
     if args.gradient_checkpointing:
         if args.stub:
