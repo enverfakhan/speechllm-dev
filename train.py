@@ -597,9 +597,9 @@ def main() -> None:
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
 
-    encoder = encoder.to(device)
-    adapter = adapter.to(device)
-    llama   = llama.to(device)
+    encoder = encoder.to(torch.float16).to(device)
+    adapter = adapter.to(torch.float16).to(device)
+    llama   = llama.to(torch.float16).to(device)
 
     if args.gradient_checkpointing:
         if args.stub:
@@ -863,7 +863,7 @@ def main() -> None:
             # Reverse: T_mel ≈ audio_lengths * 8 frames; each frame = 10 ms.
             step_audio_s += audio_lengths.sum().item() * 8 * 0.01
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out     = encoder(mel)
                 adapter_out = adapter(enc_out)
                 inputs, labels = prepare_input(
