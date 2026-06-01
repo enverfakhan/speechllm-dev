@@ -64,9 +64,11 @@ def _parse_args() -> argparse.Namespace:
 
 def _build_models(stage: int) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
     llama_cfg = LlamaConfig(vocab_size=_VOCAB_SIZE)
-    encoder   = WhisperEncoder().load_openai_weights("./weights/whisper_small.pt")
+    encoder   = WhisperEncoder()
+    encoder.load_openai_weights("./weights/whisper_small.pt")
     adapter   = AudioAdapter(llama_dim=4096)
-    llama     = Llama(llama_cfg).load_meta_weights("./weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/")
+    llama     = Llama(llama_cfg)
+    llama.load_meta_weights("./weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/")
 
     device = torch.device("cuda")
     encoder = encoder.to(device)
