@@ -44,10 +44,10 @@ TOKENIZER="data/pruned_tokenizer/"
 WHISPER_CKPT="weights/whisper_small.pt"
 LLAMA_CKPT="weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/"
 DIAG_SHARD="data/full-eval-test-dev-clean-other.tar"           # optional: path to diag shard; leave empty to omit
-MAX_DIAG_BATCHES=15
+MAX_DIAG_BATCHES=10
 INSTRUCTION_MODE="unformatted"
-NUM_WORKERS=4
-LOG_EVERY=50
+NUM_WORKERS=32
+LOG_EVERY=90
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 mkdir -p logs checkpoints
@@ -98,7 +98,7 @@ for multiplier in 1 2 4 8; do
         --wandb_run_name     "$run_name" \
         --wandb_project      "$WANDB_PROJECT" \
         --checkpoint_dir     "$ckpt_dir" \
-        --save_every         500 \
+        --save_every         180 \
         --max_steps          "$MAX_STEPS_STAGE1" \
         --instruction_mode   "$INSTRUCTION_MODE" \
         --log_every          "$LOG_EVERY" \
@@ -191,7 +191,7 @@ for multiplier in 1 2 4 8; do
         --wandb_run_name     "$run_name" \
         --wandb_project      "$WANDB_PROJECT" \
         --checkpoint_dir     "$ckpt_dir" \
-        --save_every         500 \
+        --save_every         180 \
         --max_steps          "$MAX_STEPS_STAGE2" \
         --instruction_mode   "$INSTRUCTION_MODE" \
         --log_every          "$LOG_EVERY" \
