@@ -39,11 +39,11 @@ WANDB_PROJECT="speechllm-batch-sweep"
 EARLY_STOP_MIN_STEPS=1
 
 # Fixed paths — adjust if your layout differs
-SHARDS_FILE="data/data/full_training_shards.txt"
-TOKENIZER="data/data/pruned_tokenizer/"
+SHARDS_FILE="data/full_training_shards.txt"
+TOKENIZER="data/pruned_tokenizer/"
 WHISPER_CKPT="weights/whisper_small.pt"
 LLAMA_CKPT="weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/"
-DIAG_SHARD="data/data/full-eval-test-dev-clean-other.tar"           # optional: path to diag shard; leave empty to omit
+DIAG_SHARD="data/full-eval-test-dev-clean-other.tar"           # optional: path to diag shard; leave empty to omit
 MAX_DIAG_BATCHES=15
 INSTRUCTION_MODE="unformatted"
 NUM_WORKERS=4
