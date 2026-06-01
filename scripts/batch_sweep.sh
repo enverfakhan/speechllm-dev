@@ -30,7 +30,7 @@ done
 
 # ── Configurable variables ────────────────────────────────────────────────────
 GCS_BUCKET="gs://speechllm-data"
-PER_GPU_BATCH_STAGE1=64      # set from: python scripts/find_max_batch.py --stage 1
+PER_GPU_BATCH_STAGE1=128      # set from: python scripts/find_max_batch.py --stage 1
 PER_GPU_BATCH_STAGE2=32      # set from: python scripts/find_max_batch.py --stage 2
 MAX_STEPS_STAGE1=2500
 MAX_STEPS_STAGE2=10000
