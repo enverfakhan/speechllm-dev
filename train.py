@@ -597,9 +597,9 @@ def main() -> None:
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
 
-    encoder = encoder.to(device)
-    adapter = adapter.to(device)
-    llama   = llama.to(device)
+    encoder = encoder.to(torch.bfloat16).to(device)
+    adapter = adapter.to(torch.bfloat16).to(device)
+    llama   = llama.to(torch.bfloat16).to(device)
 
     if args.gradient_checkpointing:
         if args.stub:
@@ -648,7 +648,7 @@ def main() -> None:
         _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(_param_groups, weight_decay=0.01)
-    scaler = torch.amp.GradScaler("cuda")
+    # scaler = torch.amp.GradScaler("cuda")
 
     # ── Staged encoder state ──────────────────────────────────────────────────
     _staged_thawed      = False   # becomes True when trigger fires
@@ -777,7 +777,7 @@ def main() -> None:
         if "llama" in _ckpt:
             llama.load_state_dict(_ckpt["llama"])
         optimizer.load_state_dict(_ckpt["optimizer"])
-        scaler.load_state_dict(_ckpt["scaler"])
+        # scaler.load_state_dict(_ckpt["scaler"])
         resume_global_step         = _ckpt["step"]
         resume_epoch               = _ckpt.get("epoch", 0)
         resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
@@ -863,7 +863,7 @@ def main() -> None:
             # Reverse: T_mel ≈ audio_lengths * 8 frames; each frame = 10 ms.
             step_audio_s += audio_lengths.sum().item() * 8 * 0.01
 
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 enc_out     = encoder(mel)
                 adapter_out = adapter(enc_out)
                 inputs, labels = prepare_input(
@@ -879,20 +879,20 @@ def main() -> None:
                 logits, loss = llama(inputs, labels)
 
             diag.record_micro_with_logits(labels, logits, loss.detach())
-            scaler.scale(loss / args.accum_steps).backward()
+            # scaler.scale(loss / args.accum_steps).backward()
             accum_loss += loss.item()
             micro_step += 1
 
             if micro_step % args.accum_steps == 0:
-                scaler.unscale_(optimizer)
+                # scaler.unscale_(optimizer)
                 if not args.no_grad_clip:
                     torch.nn.utils.clip_grad_norm_(
                         [p for grp in optimizer.param_groups for p in grp["params"]],
                         args.grad_clip_max_norm,
                     )
                 diag.record_grad_norms(encoder, adapter, llama)
-                scaler.step(optimizer)
-                scaler.update()
+                # scaler.step(optimizer)
+                # scaler.update()
                 optimizer.zero_grad()
                 global_step += 1
 
@@ -913,7 +913,7 @@ def main() -> None:
                         "batch_size":          args.batch_size,
                         "adapter":             adapter.state_dict(),
                         "optimizer":           optimizer.state_dict(),
-                        "scaler":              scaler.state_dict(),
+                        # "scaler":              scaler.state_dict(),
                     }
                     if not args.freeze_encoder:
                         _ckpt_dict["encoder"] = encoder.state_dict()
@@ -1104,7 +1104,7 @@ def main() -> None:
                             "batch_size":          args.batch_size,
                             "adapter":             adapter.state_dict(),
                             "optimizer":           optimizer.state_dict(),
-                            "scaler":              scaler.state_dict(),
+                            # "scaler":              scaler.state_dict(),
                         }
                         if not args.freeze_encoder:
                             _es_ckpt_dict["encoder"] = encoder.state_dict()
@@ -1142,7 +1142,7 @@ def main() -> None:
         "batch_size":          args.batch_size,
         "adapter":             adapter.state_dict(),
         "optimizer":           optimizer.state_dict(),
-        "scaler":              scaler.state_dict(),
+        # "scaler":              scaler.state_dict(),
     }
     if not args.freeze_encoder:
         _final_ckpt_dict["encoder"] = encoder.state_dict()
