@@ -592,7 +592,7 @@ def main() -> None:
         with vocab_map_path.open() as f:
             vocab_map = json.load(f)
         print("Loading Llama transformer weights (embedding initialised from pretrained rows) …")
-        llama.load_meta_weights(args.llama_ckpt, vocab_map=vocab_map)
+        llama.load_meta_weights(args.llama_ckpt, vocab_map=None)
     elif args.whisper_ckpt is not None:
         print("Loading Whisper encoder weights …")
         encoder.load_openai_weights(args.whisper_ckpt)
