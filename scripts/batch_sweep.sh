@@ -31,12 +31,18 @@ done
 # ── Configurable variables ────────────────────────────────────────────────────
 GCS_BUCKET="gs://speechllm-data"
 PER_GPU_BATCH_STAGE1=64      # set from: python scripts/find_max_batch.py --stage 1
-PER_GPU_BATCH_STAGE2=8      # set from: python scripts/find_max_batch.py --stage 2
+PER_GPU_BATCH_STAGE2=8       # set from: python scripts/find_max_batch.py --stage 2
 MAX_STEPS_STAGE1=5000
 MAX_STEPS_STAGE2=10000
 BEST_STAGE1_ADAPTER_CKPT=""  # fill in between stages (e.g. checkpoints/stage1-bs0128/adapter-step5000.pt)
 WANDB_PROJECT="speechllm-batch-sweep"
 EARLY_STOP_MIN_STEPS=500
+
+# Stage-2 LR schedule — tune at PER_GPU_BATCH_STAGE2=8, hold constant across the sweep.
+LR_ENCODER=1e-6
+LR_ADAPTER=5e-5
+LR_LLAMA=1.5e-5
+WARMUP_STEPS=1000
 
 # Fixed paths — adjust if your layout differs
 SHARDS_FILE="data/full_training_shards.txt"
@@ -87,6 +93,7 @@ for multiplier in 1 2 4 8; do
 
     # shellcheck disable=SC2046
     python train.py \
+        --stage              1 \
         --shards_file        "$SHARDS_FILE" \
         --tokenizer          "$TOKENIZER" \
         --whisper_ckpt       "$WHISPER_CKPT" \
@@ -181,11 +188,16 @@ for multiplier in 1 2 4 8; do
 
     # shellcheck disable=SC2046
     python train.py \
+        --stage              2 \
         --shards_file        "$SHARDS_FILE" \
         --tokenizer          "$TOKENIZER" \
         --whisper_ckpt       "$WHISPER_CKPT" \
         --llama_ckpt         "$LLAMA_CKPT" \
         --adapter_ckpt       "$BEST_STAGE1_ADAPTER_CKPT" \
+        --lr_encoder         "$LR_ENCODER" \
+        --lr_adapter         "$LR_ADAPTER" \
+        --lr_llama           "$LR_LLAMA" \
+        --warmup_steps       "$WARMUP_STEPS" \
         --batch_size         "$PER_GPU_BATCH_STAGE2" \
         --accum_steps        "$accum" \
         --wandb_run_name     "$run_name" \

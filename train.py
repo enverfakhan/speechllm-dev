@@ -243,6 +243,48 @@ def _parse_args() -> argparse.Namespace:
             "are ignored for weight loading."
         ),
     )
+    # ── Training stage and stage-2 LR schedule ───────────────────────────────
+    p.add_argument(
+        "--stage", type=int, default=1, choices=[1, 2],
+        help=(
+            "Training stage. "
+            "1 = adapter-only (encoder + Llama frozen, existing behaviour). "
+            "2 = all three modules unfrozen, linear LR warmup then constant. "
+            "Stage 2 requires --adapter_ckpt (stage-1 weights) or --resume_ckpt."
+        ),
+    )
+    p.add_argument(
+        "--lr_encoder", type=float, default=1e-6,
+        help="Stage-2 peak LR for the Whisper encoder (default 1e-6). Pretrained, most fragile.",
+    )
+    p.add_argument(
+        "--lr_adapter", type=float, default=5e-5,
+        help="Stage-2 peak LR for the MLP adapter (default 5e-5). Must re-track the moving Llama.",
+    )
+    p.add_argument(
+        "--lr_llama", type=float, default=1.5e-5,
+        help="Stage-2 peak LR for the Llama backbone (default 1.5e-5). Gentle full fine-tune.",
+    )
+    p.add_argument(
+        "--warmup_steps", type=int, default=1000,
+        help=(
+            "Stage-2 linear LR warmup duration in optimizer steps (default 1000). "
+            "LR is held constant at peak after warmup — no decay. "
+            "Steps once per optimizer.step() so duration is consistent under --accum_steps."
+        ),
+    )
+    p.add_argument(
+        "--beta1", type=float, default=0.9,
+        help="AdamW beta1 (default 0.9).",
+    )
+    p.add_argument(
+        "--beta2", type=float, default=0.999,
+        help=(
+            "AdamW beta2 (default 0.999). "
+            "Higher than typical 0.995 for fine-tuning second-moment stability."
+        ),
+    )
+
     p.add_argument(
         "--wandb_run_name", type=str, default=None,
         help="Explicit W&B run name. If None, W&B auto-generates one.",
@@ -520,12 +562,69 @@ def _load_shard_list(args: argparse.Namespace) -> list[str]:
     return list_shards(args.shards)
 
 
+def _build_stage2_param_groups(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    lr_encoder: float,
+    lr_adapter: float,
+    lr_llama: float,
+) -> list[dict]:
+    """Three named param groups for stage-2 joint training.
+
+    Each group carries its own peak LR. A shared warmup scheduler scales all
+    three by the same factor so relative LR ratios are preserved during warmup.
+    """
+    groups = [
+        {"name": "encoder", "params": list(encoder.parameters()), "lr": lr_encoder},
+        {"name": "adapter", "params": list(adapter.parameters()), "lr": lr_adapter},
+        {"name": "llama",   "params": list(llama.parameters()),   "lr": lr_llama},
+    ]
+    for g in groups:
+        assert len(g["params"]) > 0, f"Param group '{g['name']}' is empty — check model construction."
+    return groups
+
+
+def _make_warmup_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear ramp 0 → peak over warmup_steps, then constant.
+
+    One lambda scales all param groups; per-group peak comes from each group's
+    base_lr, so a single factor is correct for all three simultaneously.
+    """
+    def lr_lambda(step: int) -> float:
+        return min(step / max(warmup_steps, 1), 1.0)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _print_stage2_startup(
+    param_groups: list[dict],
+    warmup_steps: int,
+    betas: tuple[float, float],
+) -> None:
+    """Print stage-2 optimizer config to stdout so the run is self-documenting."""
+    print("─" * 60)
+    print("Stage 2 — joint fine-tune config:")
+    for g in param_groups:
+        n = sum(p.numel() for p in g["params"])
+        print(f"  {g['name']:8s}  {n / 1e6:8.1f}M params  peak LR {g['lr']:.2e}")
+    print(f"  warmup_steps={warmup_steps}  betas={betas}  weight_decay=0.01")
+    print("─" * 60)
+
+
 def main() -> None:
     """Parse CLI arguments and run the training loop."""
     args = _parse_args()
     if args.staged_llama:
         # TODO: mirror --staged_encoder once implemented
         raise NotImplementedError("--staged_llama is not yet implemented.")
+    if args.stage == 2 and args.resume_ckpt is None and args.adapter_ckpt is None:
+        raise ValueError(
+            "--stage 2 requires --adapter_ckpt (stage-1 adapter weights) "
+            "or --resume_ckpt (mid-stage-2 resume)."
+        )
     if args.early_stop_metric is not None and args.diag_shard is None:
         raise argparse.ArgumentTypeError(
             "--early_stop_metric requires --diag_shard to be set"
@@ -564,6 +663,10 @@ def main() -> None:
         f"Staged encoder: {'ACTIVE' if _staged_encoder else 'disabled'}"
         + (f"  (threshold first_token_loss={baselines_data['first_token_loss']:.4f})" if _staged_encoder else "")
     )
+    # Stage 2 trains all modules jointly — staged encoder would conflict.
+    if args.stage == 2 and _staged_encoder:
+        print("Stage 2: --staged_encoder incompatible with all-module training — disabling.")
+        _staged_encoder = False
     # ── Model instantiation ───────────────────────────────────────────────────
     if args.stub:
         # Tiny model for pipeline validation when full 8B does not fit in VRAM/RAM.
@@ -612,20 +715,29 @@ def main() -> None:
     adapter.train()
     llama.train()
 
-    # ── Encoder freeze (must happen before optimizer construction) ────────────
-    if args.freeze_encoder or _staged_encoder:
-        encoder.requires_grad_(False)
-        print("Encoder: FROZEN" + (" (staged — will auto-thaw)" if _staged_encoder else ""))
+    # ── Encoder / Llama freeze (must happen before optimizer construction) ────
+    if args.stage == 2:
+        # All three modules train jointly. --freeze_encoder / --freeze_llama are ignored.
+        if args.freeze_encoder or args.freeze_llama:
+            print("WARNING: --freeze_encoder / --freeze_llama are ignored in --stage 2.")
+        encoder.requires_grad_(True)
+        adapter.requires_grad_(True)
+        llama.requires_grad_(True)
+        print("Encoder: trainable (stage 2)")
+        print("Llama:   trainable (stage 2)")
     else:
-        print("Encoder: trainable")
+        if args.freeze_encoder or _staged_encoder:
+            encoder.requires_grad_(False)
+            print("Encoder: FROZEN" + (" (staged — will auto-thaw)" if _staged_encoder else ""))
+        else:
+            print("Encoder: trainable")
 
-    # ── Llama freeze (must happen before optimizer construction) ──────────────
-    if args.freeze_llama:
-        for p in llama.parameters():
-            p.requires_grad_(False)
-        print("Llama: FROZEN")
-    else:
-        print("Llama: trainable")
+        if args.freeze_llama:
+            for p in llama.parameters():
+                p.requires_grad_(False)
+            print("Llama: FROZEN")
+        else:
+            print("Llama: trainable")
 
     n_enc   = sum(p.numel() for p in encoder.parameters())
     n_ada   = sum(p.numel() for p in adapter.parameters())
@@ -638,22 +750,51 @@ def main() -> None:
     )
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    # In staged mode the encoder is excluded here; added via add_param_group on thaw.
-    # Adapter is always param_groups[0] when encoder is absent (frozen or staged).
-    _param_groups = []
-    if not args.freeze_encoder and not _staged_encoder:
-        _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
-    _param_groups.append({"params": adapter.parameters(), "lr": 1e-4})
-    if not args.freeze_llama:
-        _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
     import bitsandbytes as bnb
-    optimizer = bnb.optim.AdamW8bit(_param_groups, weight_decay=0.01)
+    scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
+
+    if args.stage == 2:
+        # Three named groups, each with its own peak LR; one warmup factor scales all.
+        # Fresh optimizer — do not carry over stage-1 second-moment estimates.
+        _param_groups = _build_stage2_param_groups(
+            encoder, adapter, llama,
+            args.lr_encoder, args.lr_adapter, args.lr_llama,
+        )
+        optimizer = bnb.optim.AdamW8bit(
+            _param_groups,
+            betas=(args.beta1, args.beta2),
+            weight_decay=0.01,
+        )
+        scheduler = _make_warmup_scheduler(optimizer, args.warmup_steps)
+        _print_stage2_startup(_param_groups, args.warmup_steps, (args.beta1, args.beta2))
+    else:
+        # Stage 1: adapter-only or partial unfreeze (existing behaviour).
+        # In staged mode the encoder is excluded here; added via add_param_group on thaw.
+        # Adapter is always param_groups[0] when encoder is absent (frozen or staged).
+        _param_groups = []
+        if not args.freeze_encoder and not _staged_encoder:
+            _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
+        _param_groups.append({"params": adapter.parameters(), "lr": 1e-4})
+        if not args.freeze_llama:
+            _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
+        optimizer = bnb.optim.AdamW8bit(
+            _param_groups,
+            betas=(args.beta1, args.beta2),
+            weight_decay=0.01,
+        )
     scaler = torch.amp.GradScaler("cuda")
 
     # ── Staged encoder state ──────────────────────────────────────────────────
     _staged_thawed      = False   # becomes True when trigger fires
     _encoder_thaw_step  = 0       # global_step when encoder was thawed
     _ENCODER_WARMUP_STEPS = 100   # steps to ramp from adapter_lr/100 → adapter_lr/10
+
+    # ── Stage-2 diagnostics state ─────────────────────────────────────────────
+    _stage2_enc_grad_checked = False          # one-shot check that encoder receives gradients
+    _prev_eval_loss: float | None = None      # for unfreeze-shock detection
+    _stage2_eval_count   = 0
+    _stage2_shock_warned = False
+    _STAGE2_SHOCK_WINDOW = 5                  # warn only within the first N diag evals
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     if args.wandb:
@@ -666,14 +807,11 @@ def main() -> None:
                 "Add 'export WANDB_API_KEY=...' to ~/.bashrc and reload your shell."
             )
         # wandb.login(key=api_key, relogin=False)
-        _stage = 1 if (args.freeze_encoder and args.freeze_llama) else 2
-        # adapter LR is always in the first param group
-        _lr_for_config = _param_groups[0]["lr"]
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
             config={
-                "stage":              _stage,
+                "stage":              args.stage,
                 "effective_batch":    args.batch_size * args.accum_steps,
                 "batch_size":         args.batch_size,
                 "accum_steps":        args.accum_steps,
@@ -681,18 +819,27 @@ def main() -> None:
                 "freeze_encoder":     args.freeze_encoder,
                 "freeze_llama":       args.freeze_llama,
                 "staged_encoder":     args.staged_encoder,
-                "lr":                 _lr_for_config,
+                "lr_encoder":         args.lr_encoder,
+                "lr_adapter":         args.lr_adapter,
+                "lr_llama":           args.lr_llama,
+                "warmup_steps":       args.warmup_steps,
+                "beta1":              args.beta1,
+                "beta2":              args.beta2,
                 "grad_clip_max_norm": args.grad_clip_max_norm,
                 "instruction_mode":   args.instruction_mode,
                 "seed":               args.seed,
-                "resume_ckpt":             str(args.resume_ckpt) if args.resume_ckpt else None,
-                "adapter_ckpt":            str(args.adapter_ckpt) if args.adapter_ckpt else None,
-                "gradient_checkpointing":  args.gradient_checkpointing,
+                "resume_ckpt":            str(args.resume_ckpt) if args.resume_ckpt else None,
+                "adapter_ckpt":           str(args.adapter_ckpt) if args.adapter_ckpt else None,
+                "gradient_checkpointing": args.gradient_checkpointing,
             },
         )
 
-    _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder) else 0.0
-    _llama_frozen_val   = 1.0 if args.freeze_llama else 0.0
+    if args.stage == 2:
+        _encoder_frozen_val = 0.0   # stage 2 always unfreezes regardless of --freeze_* flags
+        _llama_frozen_val   = 0.0
+    else:
+        _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder) else 0.0
+        _llama_frozen_val   = 1.0 if args.freeze_llama else 0.0
 
     # ── Instruction mode ──────────────────────────────────────────────────────
     if args.instruction_mode == "unformatted":
@@ -790,7 +937,9 @@ def main() -> None:
         print(f"Cross-stage load from adapter checkpoint: {args.adapter_ckpt}")
         _ckpt = torch.load(args.adapter_ckpt, map_location="cpu")
         adapter.load_state_dict(_ckpt["adapter"])
-        if "optimizer_adapter" in _ckpt:
+        if args.stage != 2 and "optimizer_adapter" in _ckpt:
+            # Stage 1: restore adapter optimizer state for LR continuity.
+            # Stage 2: fresh optimizer — stage-1 second moments are stale for the new LR scale.
             _load_adapter_optimizer_state(optimizer, _ckpt["optimizer_adapter"], adapter)
         resume_epoch               = _ckpt.get("epoch", 0)
         resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
@@ -891,8 +1040,27 @@ def main() -> None:
                         args.grad_clip_max_norm,
                     )
                 diag.record_grad_norms(encoder, adapter, llama)
+
+                # One-shot sanity check on the first stage-2 step: confirm the encoder
+                # actually has gradients (requires_grad was set before optimizer build).
+                if args.stage == 2 and not _stage2_enc_grad_checked:
+                    _enc_gn = math.sqrt(sum(
+                        p.grad.norm().item() ** 2
+                        for p in encoder.parameters()
+                        if p.grad is not None
+                    ))
+                    if _enc_gn == 0.0:
+                        print("[WARN] Stage-2 step 1: encoder grad norm is ZERO — check requires_grad.")
+                    else:
+                        print(f"[info] Stage-2 step 1: encoder grad norm = {_enc_gn:.4e}  (unfreeze confirmed)")
+                    _stage2_enc_grad_checked = True
+
                 scaler.step(optimizer)
                 scaler.update()
+                if scheduler is not None:
+                    # Step once per optimizer update, not per micro-batch, so warmup
+                    # duration is identical regardless of --accum_steps.
+                    scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
@@ -915,9 +1083,9 @@ def main() -> None:
                         "optimizer":           optimizer.state_dict(),
                         "scaler":              scaler.state_dict(),
                     }
-                    if not args.freeze_encoder:
+                    if args.stage == 2 or not args.freeze_encoder:
                         _ckpt_dict["encoder"] = encoder.state_dict()
-                    if not args.freeze_llama:
+                    if args.stage == 2 or not args.freeze_llama:
                         _ckpt_dict["llama"] = llama.state_dict()
                     torch.save(_ckpt_dict, ckpt_path)
                     print(f"Checkpoint saved → {ckpt_path}")
@@ -969,6 +1137,27 @@ def main() -> None:
                     adapter.train()
                     llama.train()
                     eval_diag_metrics = diag.flush_eval(global_step)
+
+                    # Unfreeze-shock detection: a rising diag eval loss within the
+                    # first few evals is the classic sign that warmup is too short
+                    # or lr_encoder / lr_llama is too high.
+                    if args.stage == 2 and not _stage2_shock_warned:
+                        _curr_el = eval_diag_metrics.get("loss/eval_rest")
+                        if _curr_el is not None:
+                            _stage2_eval_count += 1
+                            if (
+                                _prev_eval_loss is not None
+                                and _curr_el > _prev_eval_loss
+                                and _stage2_eval_count <= _STAGE2_SHOCK_WINDOW
+                            ):
+                                print(
+                                    f"[WARN] Unfreeze shock at step {global_step}: "
+                                    f"diag eval loss {_prev_eval_loss:.4f} → {_curr_el:.4f}. "
+                                    f"Consider longer --warmup_steps or lower "
+                                    f"--lr_encoder / --lr_llama."
+                                )
+                                _stage2_shock_warned = True
+                            _prev_eval_loss = _curr_el
 
                 # ── Throughput: reset AFTER checkpoint so disk I/O folds in ──
                 t_now         = time.perf_counter()
@@ -1037,38 +1226,50 @@ def main() -> None:
                         _gap["loss/gap_rest"] = _er - _tr
                     if _tf is not None and _ef is not None:
                         _gap["loss/gap_first_token"] = _ef - _tf
-                    # In staged mode: adapter=0, llama=1(if unfrozen), encoder=last(after thaw).
-                    # In normal mode: encoder=0(if trainable), adapter=next, llama=last.
-                    # When llama is frozen it has no param group — use adapter group (idx 0).
-                    if args.freeze_llama:
-                        _llama_pg_idx = 0  # adapter group; llama has no param group
-                    elif _staged_encoder or args.freeze_encoder:
-                        _llama_pg_idx = 1
+                    # Stage 2: fixed group order (enc=0, ada=1, llm=2).
+                    # Stage 1: dynamic order depending on freeze flags.
+                    if args.stage == 2:
+                        _lr_dict = {
+                            "train/lr":         optimizer.param_groups[2]["lr"],
+                            "train/lr_encoder": optimizer.param_groups[0]["lr"],
+                            "train/lr_adapter": optimizer.param_groups[1]["lr"],
+                            "train/lr_llama":   optimizer.param_groups[2]["lr"],
+                        }
                     else:
-                        _llama_pg_idx = -1
-                    _enc_lr_log = (
-                        optimizer.param_groups[-1]["lr"] if _staged_thawed
-                        else (0.0 if (args.freeze_encoder or _staged_encoder)
-                              else optimizer.param_groups[0]["lr"])
-                    )
+                        # In staged mode: adapter=0, llama=1(if unfrozen), encoder=last(after thaw).
+                        # In normal mode: encoder=0(if trainable), adapter=next, llama=last.
+                        if args.freeze_llama:
+                            _llama_pg_idx = 0
+                        elif _staged_encoder or args.freeze_encoder:
+                            _llama_pg_idx = 1
+                        else:
+                            _llama_pg_idx = -1
+                        _enc_lr_log = (
+                            optimizer.param_groups[-1]["lr"] if _staged_thawed
+                            else (0.0 if (args.freeze_encoder or _staged_encoder)
+                                  else optimizer.param_groups[0]["lr"])
+                        )
+                        _lr_dict = {
+                            "train/lr":         optimizer.param_groups[_llama_pg_idx]["lr"],
+                            "train/lr_encoder": _enc_lr_log,
+                        }
                     wandb.log(
                         {
                             "train/loss":                            avg_loss,
                             "train/loss_ema":                        loss_ema,
-                            "train/lr":                              optimizer.param_groups[_llama_pg_idx]["lr"],
-                            "train/lr_encoder":                      _enc_lr_log,
                             "train/encoder_frozen":                  _encoder_frozen_val,
                             "train/llama_frozen":                    _llama_frozen_val,
                             "runtime/throughput_audio_sec_per_sec":  throughput,
                             "runtime/cumulative_audio_hours":         total_audio_s / 3600,
                             "runtime/wall_time_min":                  (t_now - train_start) / 60,
+                            **_lr_dict,
                             **diag_metrics,
                             **eval_diag_metrics,
                             **_gap,
                             **baselines,
                         },
                         step=global_step,
-                    ) 
+                    )
                 if args.max_steps is not None and global_step >= args.max_steps:
                     print(f"Reached --max_steps {args.max_steps}. Done.")
                     done = True
@@ -1106,9 +1307,9 @@ def main() -> None:
                             "optimizer":           optimizer.state_dict(),
                             "scaler":              scaler.state_dict(),
                         }
-                        if not args.freeze_encoder:
+                        if args.stage == 2 or not args.freeze_encoder:
                             _es_ckpt_dict["encoder"] = encoder.state_dict()
-                        if not args.freeze_llama:
+                        if args.stage == 2 or not args.freeze_llama:
                             _es_ckpt_dict["llama"] = llama.state_dict()
                         torch.save(_es_ckpt_dict, _es_ckpt_path)
                         print(f"Early-stop checkpoint saved → {_es_ckpt_path}")
@@ -1144,9 +1345,9 @@ def main() -> None:
         "optimizer":           optimizer.state_dict(),
         "scaler":              scaler.state_dict(),
     }
-    if not args.freeze_encoder:
+    if args.stage == 2 or not args.freeze_encoder:
         _final_ckpt_dict["encoder"] = encoder.state_dict()
-    if not args.freeze_llama:
+    if args.stage == 2 or not args.freeze_llama:
         _final_ckpt_dict["llama"] = llama.state_dict()
     torch.save(_final_ckpt_dict, _final_ckpt_path)
     print(f"Final checkpoint saved → {_final_ckpt_path}")
