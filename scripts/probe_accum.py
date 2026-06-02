@@ -1,44 +1,22 @@
 """Probe VRAM under gradient accumulation for stage-2 training.
 
-Why accum_steps > 1 OOMs on step ~5 even with expandable_segments + empty_cache
-────────────────────────────────────────────────────────────────────────────────
-From the step-1 probe:
-  after fwd (micro 2..4):  alloc = 66.41 GB
-  peak_so_far:             80.99 GB  (backward recomputation adds ~14.6 GB peak)
-  GPU:                     85.10 GB
-  Headroom at step 1:       4.11 GB
+Two live hypotheses for the step-5 OOM (expandable_segments already ON,
+graph retention already ruled out by the existing probe):
 
-Both expandable_segments and empty_cache address fragmentation. The OOM at step 5
-is NOT fragmentation — it is real memory growth across steps, almost certainly
-bitsandbytes 8-bit Adam initialising its optimizer state tensors (≈14.5 GB for
-7.25 B params) lazily over the first several steps. Each new param-state pair
-allocated eats into the 4.11 GB headroom until step 5 pushes the total over 85 GB.
+  (A) cuDNN/cuBLAS workspace autotuning: the Whisper conv stem re-tunes per
+      new mel-T shape and caches growing workspaces in non-PyTorch memory.
+      Signature: `external` column grows; stops growing with --cudnn_benchmark false.
 
-torch.cuda.memory_allocated() does NOT include bnb's internal cudaMalloc
-tensors. This probe reports cuda_used = total − cuda_free (which DOES include
-bnb), so you can see the step-by-step growth of the untracked component.
+  (B) bnb 8-bit Adam lazy init: some trainable params receive no gradient on
+      step 1, so their optimizer state is deferred to later steps.
+      Signature: `optstate` column grows past step 1.
 
-Fix
-───
-Cast models to bfloat16 (as find_max_batch.py does) and use bfloat16 autocast.
-This halves both param memory (29 → 14.5 GB) and grad memory (29 → 14.5 GB),
-dropping the step-1 peak to ~50 GB and leaving 35 GB of headroom for bnb states
-and activation peaks.
+Simple OOM probe (existing behaviour, no --diag flag):
+  python scripts/probe_accum.py --accum 4 --n_steps 8 [--bf16]
 
-Usage
-─────
-  # Reproduce the problem (fp32, matching current train.py):
-  python scripts/probe_accum.py --accum 4 --n_steps 8
-
-  # Test the bf16 fix (matches find_max_batch.py):
-  python scripts/probe_accum.py --accum 4 --n_steps 8 --bf16
-
-  # Sweep accum 1..4 in bf16:
-  python scripts/probe_accum.py --max_accum 4 --n_steps 5 --bf16
-
-  # Baseline check (accum=1 should always pass):
-  python scripts/probe_accum.py --accum 1 --n_steps 5
-  python scripts/probe_accum.py --accum 1 --n_steps 5 --bf16
+Diagnostic run (A vs B table, 12 steps, variable mel lengths):
+  python scripts/probe_accum.py --accum 4 --diag [--bf16]
+  python scripts/probe_accum.py --accum 4 --diag --cudnn_benchmark false [--bf16]
 """
 
 from __future__ import annotations
@@ -46,6 +24,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -57,51 +36,103 @@ from model.adapter import AudioAdapter, prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 _VOCAB_SIZE = 40148
-_AUDIO_TOKS = 375    # adapter output tokens for 30 s audio
 _INST_TOKS  = 14     # "Transcribe the following audio without formatting."
-_TRANS_TOKS = 50
+_TRANS_TOKS = 50     # representative transcript length
 _SEP_ID     = _VOCAB_SIZE - 1
 
+# GradScaler._unscale_ calls _amp_foreach_non_finite_check_and_unscale_cuda,
+# which is not implemented for BFloat16 even in PyTorch 2.8.  Use a fixed
+# manual loss scale instead: bf16 has fp32-equivalent dynamic range so it
+# cannot overflow, but its 7-bit mantissa needs amplification to prevent
+# adapter gradients from rounding away through 32 Llama layers backward.
+_BF16_GRAD_SCALE = 4096.0
+
+
+# ── Memory helpers ────────────────────────────────────────────────────────────
+
+def _opt_state_gb(optimizer: torch.optim.Optimizer) -> float:
+    """Sum of all tensor bytes in optimizer.state (bnb states, absmax codes, etc.)."""
+    total = 0
+    for param_state in optimizer.state.values():
+        for v in param_state.values():
+            if isinstance(v, torch.Tensor):
+                total += v.numel() * v.element_size()
+    return total / 1e9
+
+
+def _mem_snapshot(device: torch.device) -> dict[str, float]:
+    """Capture a point-in-time memory breakdown.
+
+    Returns:
+        alloc    — torch.cuda.memory_allocated (live tensors tracked by PyTorch)
+        resv     — torch.cuda.memory_reserved  (PyTorch pool: alloc + cached free)
+        used     — CUDA total − CUDA free       (everything: PyTorch + bnb + driver)
+        external — used − resv                  (cuDNN/cuBLAS workspaces, bnb states
+                                                 allocated outside PyTorch's pool)
+        frag     — resv − alloc                 (PyTorch cache fragmentation)
+    """
+    alloc = torch.cuda.memory_allocated(device) / 1e9
+    resv  = torch.cuda.memory_reserved(device)  / 1e9
+    free, total = torch.cuda.mem_get_info(device)
+    used = (total - free) / 1e9
+    return {
+        "alloc":    alloc,
+        "resv":     resv,
+        "used":     used,
+        "external": used - resv,
+        "frag":     resv - alloc,
+    }
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Stage-2 VRAM probe and A/B diagnostic.")
+
     mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--accum",     type=int, default=None)
+    mode.add_argument("--accum",     type=int, default=None,
+                      help="Single accum_steps value to test.")
     mode.add_argument("--max_accum", type=int, default=4,
-                      help="Sweep accum_steps 1 .. N (ignored if --accum given).")
+                      help="Sweep accum_steps 1..N (ignored if --accum given).")
+
     p.add_argument("--batch_size",   type=int, default=8)
     p.add_argument("--n_steps",      type=int, default=8,
-                   help="Optimizer steps per accum value (default 8, enough to expose "
-                        "bnb lazy-init growth).")
+                   help="Optimizer steps per run (overridden to 12 in --diag mode).")
+    p.add_argument("--seed",         type=int, default=42,
+                   help="RNG seed for reproducible mel-length sequences.")
     p.add_argument("--whisper_ckpt", type=str, default="weights/whisper_small.pt")
     p.add_argument("--llama_ckpt",   type=str,
                    default="weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/")
-    p.add_argument("--bf16", action="store_true",
-                   help="Cast models to bfloat16 and use bfloat16 autocast "
-                        "(matches find_max_batch.py — the intended fix).")
-    p.add_argument("--empty_cache", action="store_true",
+    p.add_argument("--bf16",         action="store_true",
+                   help="bf16 params + bf16 autocast + manual loss scale (no GradScaler).")
+    p.add_argument("--empty_cache",  action="store_true",
                    help="torch.cuda.empty_cache() between micro-batches.")
+    p.add_argument("--diag",         action="store_true",
+                   help="Run A/B diagnostic: per-step table, bnb lazy-init check, verdict.")
+    p.add_argument("--cudnn_benchmark", choices=["true", "false"], default="false",
+                   help="Set torch.backends.cudnn.benchmark. "
+                        "true may grow external memory via cuDNN autotuning (hypothesis A).")
+    p.add_argument("--var_seq_len",  action="store_true",
+                   help="Vary mel length per micro-batch (U[800,3000] rounded to ×8) "
+                        "to trigger cuDNN re-autotuning. Implied by --diag.")
     return p.parse_args()
 
 
-def _cuda_used_gb(device: torch.device) -> float:
-    """Total GPU memory in use by this process (torch + bnb + CUDA driver)."""
-    free, total = torch.cuda.mem_get_info(device)
-    return (total - free) / 1e9
-
+# ── Model construction ────────────────────────────────────────────────────────
 
 def _build_models(
     whisper_ckpt: str,
     llama_ckpt: str,
     device: torch.device,
     bf16: bool,
-) -> tuple[WhisperEncoder, AudioAdapter, Llama, torch.optim.Optimizer, torch.amp.GradScaler]:
-    dtype        = torch.bfloat16 if bf16 else torch.float32
-    dtype_label  = "bfloat16" if bf16 else "fp32"
-    bytes_per    = 2 if bf16 else 4
+) -> tuple[WhisperEncoder, AudioAdapter, Llama, torch.optim.Optimizer,
+           torch.amp.GradScaler | None]:
+    dtype      = torch.bfloat16 if bf16 else torch.float32
+    bytes_per  = 2 if bf16 else 4
 
-    print(f"Loading model weights (dtype={dtype_label}) …")
+    print(f"Loading model weights (dtype={'bfloat16' if bf16 else 'fp32'}) …")
     encoder = WhisperEncoder()
     encoder.load_openai_weights(whisper_ckpt)
     adapter = AudioAdapter(llama_dim=4096)
@@ -113,7 +144,9 @@ def _build_models(
     llama   = llama.to(dtype).to(device)
 
     llama.enable_gradient_checkpointing()
-    encoder.train(); adapter.train(); llama.train()
+    encoder.train()
+    adapter.train()
+    llama.train()
 
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(
@@ -124,83 +157,137 @@ def _build_models(
         ],
         betas=(0.9, 0.999), weight_decay=0.01,
     )
-    scaler = torch.amp.GradScaler("cuda")
 
-    n = (sum(p.numel() for p in encoder.parameters()) +
-         sum(p.numel() for p in adapter.parameters()) +
-         sum(p.numel() for p in llama.parameters()))
+    # bf16: GradScaler._unscale_ not implemented for BFloat16 (PyTorch 2.8).
+    # fp32: GradScaler needed to prevent fp16 autocast gradient underflow.
+    scaler = None if bf16 else torch.amp.GradScaler("cuda")
+
+    n = sum(p.numel() for p in encoder.parameters()) + \
+        sum(p.numel() for p in adapter.parameters()) + \
+        sum(p.numel() for p in llama.parameters())
     p_gb = n * bytes_per / 1e9
-    g_gb = p_gb
-    a_gb = n * 2 / 1e9   # bnb int8 states: 1 byte × 2 states
-    print(f"  params={p_gb:.1f} GB  grads={g_gb:.1f} GB  "
-          f"bnb-states≈{a_gb:.1f} GB  "
-          f"minimum_peak≈{p_gb+g_gb+a_gb:.1f} GB")
+    print(f"  params={p_gb:.1f} GB  grads≈{p_gb:.1f} GB  "
+          f"bnb-states≈{n*2/1e9:.1f} GB  "
+          f"minimum_peak (params+grads+bnb)≈{p_gb*2 + n*2/1e9:.1f} GB")
+
     return encoder, adapter, llama, optimizer, scaler
 
 
-def _make_batch(batch_size: int, device: torch.device) -> tuple:
-    mel           = torch.randn(batch_size, 80, 3000, device=device)
-    audio_lengths = torch.full((batch_size,), _AUDIO_TOKS, dtype=torch.long, device=device)
-    inst_ids      = torch.full((batch_size, _INST_TOKS),  4, dtype=torch.long, device=device)
-    inst_lens     = torch.full((batch_size,), _INST_TOKS,    dtype=torch.long, device=device)
-    trans_ids     = torch.full((batch_size, _TRANS_TOKS), 4, dtype=torch.long, device=device)
-    trans_lens    = torch.full((batch_size,), _TRANS_TOKS,   dtype=torch.long, device=device)
+# ── Batch factory ─────────────────────────────────────────────────────────────
+
+def _make_batch(
+    batch_size: int,
+    device: torch.device,
+    mel_t: int = 3000,
+) -> tuple[torch.Tensor, ...]:
+    """Fixed or variable-length batch. mel_t sets the time dimension of the mel."""
+    audio_len  = (mel_t // 2 + 3) // 4          # adapter output token count
+    mel         = torch.randn(batch_size, 80, mel_t, device=device)
+    audio_lengths = torch.full((batch_size,), audio_len, dtype=torch.long, device=device)
+    inst_ids    = torch.full((batch_size, _INST_TOKS),  4, dtype=torch.long, device=device)
+    inst_lens   = torch.full((batch_size,), _INST_TOKS,    dtype=torch.long, device=device)
+    trans_ids   = torch.full((batch_size, _TRANS_TOKS), 4, dtype=torch.long, device=device)
+    trans_lens  = torch.full((batch_size,), _TRANS_TOKS,   dtype=torch.long, device=device)
     return mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens
 
 
-def _run_accum(
-    encoder, adapter, llama, optimizer, scaler,
-    batch_size: int, accum_steps: int, n_steps: int,
-    device: torch.device, empty_cache: bool, bf16: bool,
-) -> tuple[bool, int, list[dict]]:
-    """Run n_steps optimizer steps.
+def _sample_mel_t(rng: random.Random) -> int:
+    """Sample a mel time length from a realistic distribution (1–30 s, step 8 frames)."""
+    raw = rng.randint(800, 3000)
+    return (raw // 8) * 8
 
-    Returns (success, fail_step, per_step_stats).
-    fail_step is -1 on success.  per_step_stats has one entry per completed step.
+
+# ── Optimizer step helpers ────────────────────────────────────────────────────
+
+def _optimizer_step(
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    all_params: list[torch.nn.Parameter],
+    grad_clip: float = 1.0,
+) -> None:
+    """Unscale + clip + step, handling both GradScaler (fp32) and manual scale (bf16)."""
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        # Manual unscale: bf16 cannot produce inf, so no inf/nan check needed.
+        for p in all_params:
+            if p.grad is not None:
+                p.grad.div_(_BF16_GRAD_SCALE)
+        torch.nn.utils.clip_grad_norm_(all_params, grad_clip)
+        optimizer.step()
+
+
+def _backward(
+    loss: torch.Tensor,
+    accum_steps: int,
+    scaler: torch.amp.GradScaler | None,
+) -> None:
+    if scaler is not None:
+        scaler.scale(loss / accum_steps).backward()
+    else:
+        (loss * _BF16_GRAD_SCALE / accum_steps).backward()
+
+
+# ── Simple OOM probe (existing mode) ─────────────────────────────────────────
+
+def _run_accum(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    batch_size: int,
+    accum_steps: int,
+    n_steps: int,
+    device: torch.device,
+    empty_cache: bool,
+    bf16: bool,
+    verbose_step: int = 1,
+) -> tuple[bool, int, list[dict]]:
+    """Run n_steps optimizer steps, printing detailed memory for step verbose_step.
+
+    Returns (success, fail_step, per_step_stats).  fail_step is -1 on success.
     """
     autocast_dt = torch.bfloat16 if bf16 else torch.float16
+    all_params  = [p for g in optimizer.param_groups for p in g["params"]]
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats(device)
-
     stats: list[dict] = []
+
+    def _mem() -> str:
+        a = torch.cuda.memory_allocated(device) / 1e9
+        free, tot = torch.cuda.mem_get_info(device)
+        return f"torch={a:.2f}GB  cuda_total={(tot-free)/1e9:.2f}GB"
 
     for step in range(1, n_steps + 1):
         for k in range(accum_steps):
             try:
-                mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens = (
-                    _make_batch(batch_size, device)
-                )
+                batch = _make_batch(batch_size, device)
+                mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens = batch
 
-                if step == 1:
-                    print(f"  step {step}  micro {k+1}/{accum_steps}  "
-                          f"[before fwd]  "
-                          f"torch={torch.cuda.memory_allocated(device)/1e9:.2f}GB  "
-                          f"cuda_total={_cuda_used_gb(device):.2f}GB")
+                if step == verbose_step:
+                    print(f"  step {step}  micro {k+1}/{accum_steps}  [before fwd]  {_mem()}")
 
                 with torch.amp.autocast("cuda", dtype=autocast_dt):
                     enc_out     = encoder(mel)
                     adapter_out = adapter(enc_out)
                     inputs, labels = prepare_input(
                         adapter_out, audio_lengths,
-                        inst_ids, inst_lens,
-                        trans_ids, trans_lens,
+                        inst_ids, inst_lens, trans_ids, trans_lens,
                         llama.embed_tokens, sep_token_id=_SEP_ID,
                     )
                     _, loss = llama(inputs, labels)
 
-                if step == 1:
-                    print(f"  step {step}  micro {k+1}/{accum_steps}  "
-                          f"[after  fwd]  "
-                          f"torch={torch.cuda.memory_allocated(device)/1e9:.2f}GB  "
-                          f"cuda_total={_cuda_used_gb(device):.2f}GB")
+                if step == verbose_step:
+                    print(f"  step {step}  micro {k+1}/{accum_steps}  [after  fwd]  {_mem()}")
 
-                scaler.scale(loss / accum_steps).backward()
+                _backward(loss, accum_steps, scaler)
 
-                if step == 1:
-                    print(f"  step {step}  micro {k+1}/{accum_steps}  "
-                          f"[after  bwd]  "
-                          f"torch={torch.cuda.memory_allocated(device)/1e9:.2f}GB  "
-                          f"cuda_total={_cuda_used_gb(device):.2f}GB")
+                if step == verbose_step:
+                    print(f"  step {step}  micro {k+1}/{accum_steps}  [after  bwd]  {_mem()}")
 
                 if empty_cache:
                     torch.cuda.empty_cache()
@@ -211,71 +298,266 @@ def _run_accum(
                 return False, step, stats
 
         try:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                [p for g in optimizer.param_groups for p in g["params"]], 1.0
-            )
-            scaler.step(optimizer)
-            scaler.update()
+            _optimizer_step(optimizer, scaler, all_params)
             optimizer.zero_grad(set_to_none=True)
             if empty_cache:
                 torch.cuda.empty_cache()
         except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            gc.collect()
+            torch.cuda.empty_cache(); gc.collect()
             return False, step, stats
 
         peak  = torch.cuda.max_memory_allocated(device) / 1e9
         alloc = torch.cuda.memory_allocated(device) / 1e9
-        cuda  = _cuda_used_gb(device)
+        free, tot = torch.cuda.mem_get_info(device)
+        cuda  = (tot - free) / 1e9
         torch.cuda.reset_peak_memory_stats(device)
+        stats.append({"step": step, "peak_torch": peak, "alloc": alloc,
+                      "cuda_total": cuda, "bnb_approx": cuda - alloc})
 
-        stats.append({
-            "step":  step, "peak_torch": peak,
-            "alloc": alloc, "cuda_total": cuda,
-            "bnb_approx": cuda - alloc,   # memory not tracked by torch (bnb states + driver)
-        })
-
-        if step == 1:
-            print(f"  step {step}  [after opt+zero_grad]  "
-                  f"torch={alloc:.2f}GB  cuda_total={cuda:.2f}GB  "
-                  f"untracked≈{cuda-alloc:.2f}GB  peak={peak:.2f}GB")
-        else:
-            print(f"  step {step:3d}  torch={alloc:.2f}GB  "
-                  f"cuda_total={cuda:.2f}GB  untracked≈{cuda-alloc:.2f}GB  "
-                  f"peak={peak:.2f}GB")
+        line = (f"  step {step:3d}  torch={alloc:.2f}GB  cuda_total={cuda:.2f}GB  "
+                f"untracked≈{cuda-alloc:.2f}GB  peak={peak:.2f}GB")
+        print(line)
 
     return True, -1, stats
 
 
-def main() -> None:
-    args   = _parse_args()
-    device = torch.device("cuda")
+# ── Diagnostic run (A vs B) ───────────────────────────────────────────────────
 
+def _run_diagnostic(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler | None,
+    batch_size: int,
+    accum_steps: int,
+    n_steps: int,
+    device: torch.device,
+    bf16: bool,
+    var_seq_len: bool,
+    seed: int,
+) -> None:
+    """Per-step memory table that distinguishes hypothesis A from hypothesis B.
+
+    Columns
+    ───────
+    step      optimizer step number
+    maxT      maximum mel time-dim (frames) seen across micro-batches this step
+    toks/µ    transcript tokens per micro-batch (loss denominator)
+    alloc     torch.cuda.memory_allocated  (GB)
+    resv      torch.cuda.memory_reserved   (GB)
+    used      CUDA total − CUDA free        (GB)
+    external  used − resv  (cuDNN/cuBLAS workspaces + bnb if outside PyTorch pool)
+    frag      resv − alloc (PyTorch cache: reserved but not live)
+    optstate  sum of all tensors in optimizer.state  (GB)
+    peak      torch peak this step (reset each step)
+    Δext/Δopt/Δfrg  step-over-step delta of external / optstate / frag
+    """
+    autocast_dt = torch.bfloat16 if bf16 else torch.float16
+    all_params  = [p for g in optimizer.param_groups for p in g["params"]]
+    rng         = random.Random(seed)
+
+    # Named parameters for the bnb lazy-init check
+    named_params: list[tuple[str, torch.nn.Parameter]] = (
+        list(encoder.named_parameters()) +
+        [("adapter." + n, p) for n, p in adapter.named_parameters()] +
+        [("llama." + n,   p) for n, p in llama.named_parameters()]
+    )
+
+    # ── Table header ──────────────────────────────────────────────────────────
+    hdr = (f"{'step':>4}  {'maxT':>5}  {'toks/µ':>6}  "
+           f"{'alloc':>6}  {'resv':>6}  {'used':>6}  "
+           f"{'ext':>6}  {'frag':>6}  {'opt':>6}  {'peak':>6}  "
+           f"{'Δext':>7}  {'Δopt':>7}  {'Δfrg':>7}")
+    print()
+    print(hdr)
+    print("─" * len(hdr))
+
+    prev: dict | None = None
+    rows: list[dict]  = []
+    oom_info: dict | None = None
+
+    optimizer.zero_grad(set_to_none=True)
+
+    for step in range(1, n_steps + 1):
+        max_mel_t = 0
+        torch.cuda.reset_peak_memory_stats(device)
+
+        try:
+            for k in range(accum_steps):
+                mel_t = _sample_mel_t(rng) if var_seq_len else 3000
+                max_mel_t = max(max_mel_t, mel_t)
+
+                batch = _make_batch(batch_size, device, mel_t)
+                mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens = batch
+
+                with torch.amp.autocast("cuda", dtype=autocast_dt):
+                    enc_out     = encoder(mel)
+                    adapter_out = adapter(enc_out)
+                    inputs, labels = prepare_input(
+                        adapter_out, audio_lengths,
+                        inst_ids, inst_lens, trans_ids, trans_lens,
+                        llama.embed_tokens, sep_token_id=_SEP_ID,
+                    )
+                    _, loss = llama(inputs, labels)
+
+                _backward(loss, accum_steps, scaler)
+
+        except torch.cuda.OutOfMemoryError:
+            oom_info = {"step": step, "max_mel_t": max_mel_t}
+            torch.cuda.empty_cache()
+            gc.collect()
+            print(f"\n[OOM during accumulation at step {step}, max_mel_t={max_mel_t}]")
+            try:
+                print(torch.cuda.memory_summary(device, abbreviated=True))
+            except Exception:
+                pass
+            break
+
+        try:
+            _optimizer_step(optimizer, scaler, all_params)
+        except torch.cuda.OutOfMemoryError:
+            oom_info = {"step": step, "max_mel_t": max_mel_t, "during": "opt_step"}
+            torch.cuda.empty_cache()
+            gc.collect()
+            print(f"\n[OOM during optimizer.step() at step {step}]")
+            try:
+                print(torch.cuda.memory_summary(device, abbreviated=True))
+            except Exception:
+                pass
+            break
+
+        # ── Hypothesis B: bnb lazy-init check (once, after first step) ────────
+        if step == 1:
+            no_grad = [(name, p) for name, p in named_params
+                       if p.requires_grad and p.grad is None]
+            n_state = len(optimizer.state)
+            n_total = len(all_params)
+            print(f"\n  [bnb lazy-init @ step 1]  trainable={n_total}  "
+                  f"grad=None: {len(no_grad)}  "
+                  f"bnb state entries: {n_state}/{n_total}")
+            if no_grad:
+                sample = [name for name, _ in no_grad[:5]]
+                print(f"    first no-grad params: {sample}")
+            print()
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # ── Metrics ───────────────────────────────────────────────────────────
+        snap = _mem_snapshot(device)
+        snap["optstate"] = _opt_state_gb(optimizer)
+        snap["peak"]     = torch.cuda.max_memory_allocated(device) / 1e9
+        torch.cuda.reset_peak_memory_stats(device)
+
+        d_ext = snap["external"] - prev["external"] if prev else 0.0
+        d_opt = snap["optstate"] - prev["optstate"] if prev else 0.0
+        d_frg = snap["frag"]     - prev["frag"]     if prev else 0.0
+
+        row = {**snap, "step": step, "max_mel_t": max_mel_t,
+               "d_ext": d_ext, "d_opt": d_opt, "d_frg": d_frg}
+        rows.append(row)
+        prev = snap
+
+        print(
+            f"{step:4d}  {max_mel_t:5d}  {batch_size*_TRANS_TOKS:6d}  "
+            f"{snap['alloc']:6.2f}  {snap['resv']:6.2f}  {snap['used']:6.2f}  "
+            f"{snap['external']:6.3f}  {snap['frag']:6.3f}  {snap['optstate']:6.3f}  "
+            f"{snap['peak']:6.2f}  "
+            f"{d_ext:+7.3f}  {d_opt:+7.3f}  {d_frg:+7.3f}"
+        )
+
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    if len(rows) < 2:
+        return
+
+    total_d_ext = sum(r["d_ext"] for r in rows[1:])
+    total_d_opt = sum(r["d_opt"] for r in rows[1:])
+    total_d_frg = sum(abs(r["d_frg"]) for r in rows[1:])
+
+    candidates = [
+        ("external", total_d_ext, "→ hypothesis A: cuDNN/cuBLAS workspace autotuning"),
+        ("optstate", total_d_opt, "→ hypothesis B: bnb optimizer state lazy init"),
+        ("frag",     total_d_frg, "→ allocator fragmentation"),
+    ]
+    winner = max(candidates, key=lambda x: x[1])
+
+    print()
+    print("═" * 58)
+    print("VERDICT")
+    print("═" * 58)
+    print(f"  Δexternal total: {total_d_ext:+.3f} GB   "
+          f"(cuDNN/cuBLAS workspaces outside PyTorch pool)")
+    print(f"  Δoptstate total: {total_d_opt:+.3f} GB   "
+          f"(bnb state tensors inside optimizer.state)")
+    print(f"  Δfrag     total: {total_d_frg:+.3f} GB   "
+          f"(PyTorch reserved cache oscillation)")
+    print()
+    print(f"  Dominant growth: {winner[0]}  (+{winner[1]:.3f} GB  {winner[2]})")
+    if oom_info:
+        print(f"  OOM at step {oom_info['step']}  max_mel_t={oom_info['max_mel_t']}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = _parse_args()
+
+    # Apply cudnn.benchmark before any CUDA ops.
+    cudnn_bm = args.cudnn_benchmark == "true"
+    torch.backends.cudnn.benchmark = cudnn_bm
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    device = torch.device("cuda")
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available.", file=sys.stderr)
         sys.exit(1)
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    exp_seg  = "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(not set)")
 
     print(f"GPU: {torch.cuda.get_device_name(0)}  ({total_gb:.1f} GB)")
-    print(f"dtype={'bfloat16' if args.bf16 else 'fp32 (current train.py)'}  "
-          f"batch_size={args.batch_size}  n_steps={args.n_steps}  "
-          f"empty_cache={args.empty_cache}  "
-          f"expandable_segments={'ON' if exp_seg else 'off'}")
+    print(f"PYTORCH_CUDA_ALLOC_CONF: {alloc_conf}")
+    print(f"torch.backends.cudnn.benchmark: {torch.backends.cudnn.benchmark}")
+    print(f"dtype={'bfloat16' if args.bf16 else 'fp32'}  "
+          f"batch_size={args.batch_size}  "
+          f"empty_cache={args.empty_cache}")
     print()
 
     encoder, adapter, llama, optimizer, scaler = _build_models(
         args.whisper_ckpt, args.llama_ckpt, device, args.bf16,
     )
+
+    free, tot = torch.cuda.mem_get_info(device)
     print(f"After load:  torch={torch.cuda.memory_allocated(device)/1e9:.2f}GB  "
-          f"cuda_total={_cuda_used_gb(device):.2f}GB")
+          f"cuda_total={(tot-free)/1e9:.2f}GB")
     print()
 
-    accum_values = [args.accum] if args.accum is not None else list(range(1, args.max_accum + 1))
+    # ── Diagnostic mode ───────────────────────────────────────────────────────
+    if args.diag:
+        accum = args.accum if args.accum is not None else args.max_accum
+        n_steps = 12  # web Claude's recommendation; enough to see growth pattern
+        var_seq = True  # always vary mel lengths in diagnostic mode
+        print(f"DIAGNOSTIC MODE  accum_steps={accum}  effective_batch={args.batch_size*accum}  "
+              f"n_steps={n_steps}  var_seq_len={var_seq}")
+        _run_diagnostic(
+            encoder, adapter, llama, optimizer, scaler,
+            batch_size=args.batch_size,
+            accum_steps=accum,
+            n_steps=n_steps,
+            device=device,
+            bf16=args.bf16,
+            var_seq_len=var_seq,
+            seed=args.seed,
+        )
+        return
 
-    results = []
+    # ── Simple OOM sweep ──────────────────────────────────────────────────────
+    accum_values = ([args.accum] if args.accum is not None
+                    else list(range(1, args.max_accum + 1)))
+
+    results: list[tuple[int, bool, int, list[dict]]] = []
     for accum in accum_values:
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
@@ -284,76 +566,48 @@ def main() -> None:
 
         ok, fail_step, step_stats = _run_accum(
             encoder, adapter, llama, optimizer, scaler,
-            batch_size=args.batch_size, accum_steps=accum,
-            n_steps=args.n_steps, device=device,
-            empty_cache=args.empty_cache, bf16=args.bf16,
+            batch_size=args.batch_size,
+            accum_steps=accum,
+            n_steps=args.n_steps,
+            device=device,
+            empty_cache=args.empty_cache,
+            bf16=args.bf16,
         )
 
         if ok:
             print(f"  → OK  all {args.n_steps} steps passed")
             if len(step_stats) > 1:
-                bnb_growth = step_stats[-1]["bnb_approx"] - step_stats[0]["bnb_approx"]
-                peak_growth = step_stats[-1]["peak_torch"] - step_stats[0]["peak_torch"]
-                if abs(bnb_growth) > 0.1 or abs(peak_growth) > 0.1:
-                    print(f"  untracked growth step 1→{args.n_steps}: "
-                          f"{bnb_growth:+.2f} GB  "
-                          f"peak growth: {peak_growth:+.2f} GB")
+                d_bnb  = step_stats[-1]["bnb_approx"] - step_stats[0]["bnb_approx"]
+                d_peak = step_stats[-1]["peak_torch"]  - step_stats[0]["peak_torch"]
+                if abs(d_bnb) > 0.05 or abs(d_peak) > 0.05:
+                    print(f"  untracked Δ step 1→{args.n_steps}: {d_bnb:+.2f} GB  "
+                          f"peak Δ: {d_peak:+.2f} GB")
         else:
             print(f"  → OOM at step {fail_step}")
             if step_stats:
-                bnb_s1 = step_stats[0]["bnb_approx"]
-                bnb_last = step_stats[-1]["bnb_approx"]
-                print(f"  untracked memory grew from "
-                      f"{bnb_s1:.2f} GB (step 1) → "
-                      f"{bnb_last:.2f} GB (step {len(step_stats)}) "
-                      f"[delta={bnb_last-bnb_s1:+.2f} GB]")
+                s1 = step_stats[0]["bnb_approx"]
+                sl = step_stats[-1]["bnb_approx"]
+                print(f"  untracked: {s1:.2f} GB (step 1) → "
+                      f"{sl:.2f} GB (step {len(step_stats)})  Δ={sl-s1:+.2f} GB")
         print()
         results.append((accum, ok, fail_step, step_stats))
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print("═" * 58)
+    # Summary
+    print("═" * 52)
     print(f"SUMMARY  dtype={'bfloat16' if args.bf16 else 'fp32'}")
-    print("═" * 58)
+    print("═" * 52)
     print(f"  {'accum':>6}  {'eff_bs':>7}  {'peak_step1':>12}  result")
-    print("  " + "─" * 50)
-    any_oom = False
+    print("  " + "─" * 44)
     for accum, ok, fail_step, step_stats in results:
-        eff = args.batch_size * accum
-        peak1 = f"{step_stats[0]['peak_torch']:.1f} GB" if step_stats else "—"
+        peak1  = f"{step_stats[0]['peak_torch']:.1f} GB" if step_stats else "—"
         status = "OK" if ok else f"OOM at step {fail_step}"
-        print(f"  {accum:6d}  {eff:7d}  {peak1:>12}  {status}")
-        if not ok:
-            any_oom = True
-    print()
+        print(f"  {accum:6d}  {args.batch_size*accum:7d}  {peak1:>12}  {status}")
 
+    any_oom = any(not ok for _, ok, _, _ in results)
     if any_oom and not args.bf16:
-        print("Analysis:")
-        if step_stats and len(step_stats) >= 2:
-            growth = step_stats[-1]["bnb_approx"] - step_stats[0]["bnb_approx"]
-            print(f"  Untracked memory (bnb states) grew by {growth:.2f} GB "
-                  f"over {len(step_stats)} steps.")
-            print("  This is NOT fragmentation — expandable_segments and empty_cache "
-                  "cannot help.")
         print()
-        print("Recommended fix:")
-        print("  Re-run this probe with --bf16")
-        print("  Matches find_max_batch.py: models cast to bfloat16, bfloat16 autocast.")
-        print("  Halves both param memory and grad memory, dropping the backward peak")
-        print("  from ~81 GB to ~50 GB and leaving ~35 GB of headroom for bnb states.")
-        print()
-        print("  If --bf16 passes here, the change needed in train.py is:")
-        print("    encoder/adapter/llama: .to(torch.bfloat16) before .to(device)")
-        print("    all torch.amp.autocast(..., dtype=torch.float16)")
-        print("      → torch.amp.autocast(..., dtype=torch.bfloat16)")
-
-    elif any_oom and args.bf16:
-        print("bf16 also OOMs. Reduce batch_size or increase gradient checkpointing coverage.")
-
-    elif not any_oom and args.bf16:
-        print("bf16 passes. This confirms the fix: use bfloat16 in train.py.")
-
-    elif not any_oom and not args.bf16:
-        print("fp32 passes for all tested accum values.")
+        print("Run with --bf16 to test the bfloat16 fix.")
+        print("Run with --bf16 --diag to diagnose A vs B for the bf16 path.")
 
 
 if __name__ == "__main__":
