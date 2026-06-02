@@ -913,6 +913,7 @@ def main() -> None:
     resume_micro_step_in_epoch = 0
     resume_batch_size          = args.batch_size
     _cross_stage_resume        = False
+    _same_stage_resume         = False  # True on --resume_ckpt: must fast-forward the dataloader
 
     if args.resume_ckpt:
         print(f"Resuming from checkpoint: {args.resume_ckpt}")
@@ -925,10 +926,21 @@ def main() -> None:
             llama.load_state_dict(_ckpt["llama"])
         optimizer.load_state_dict(_ckpt["optimizer"])
         scaler.load_state_dict(_ckpt["scaler"])
+        if scheduler is not None:
+            if "scheduler" in _ckpt:
+                # Normal path: checkpoint was saved after scheduler state was added.
+                scheduler.load_state_dict(_ckpt["scheduler"])
+            else:
+                # Checkpoint predates scheduler saving (e.g. the step-540 crash).
+                # Reconstruct by fast-forwarding: scheduler.step() was called once
+                # per optimizer step, so last_epoch == resume_global_step.
+                for _ in range(resume_global_step):
+                    scheduler.step()
         resume_global_step         = _ckpt["step"]
         resume_epoch               = _ckpt.get("epoch", 0)
         resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
         resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
+        _same_stage_resume         = True
         print(
             f"  Resumed at step={resume_global_step}  epoch={resume_epoch}  "
             f"micro_step_in_epoch={resume_micro_step_in_epoch}"
@@ -984,19 +996,24 @@ def main() -> None:
             instruction_variants=train_pairs,
         )
 
-        # ── Cross-stage fast-forward (first epoch only) ───────────────────────
-        if _cross_stage_resume and epoch == resume_epoch:
+        # ── Dataloader fast-forward (first epoch only) ───────────────────────
+        # Both cross-stage and same-stage resumes must skip batches already seen
+        # so the model does not train on data it processed before the checkpoint.
+        if (_cross_stage_resume or _same_stage_resume) and epoch == resume_epoch:
             n_skip = math.floor(
                 resume_micro_step_in_epoch * resume_batch_size / args.batch_size
             )
             if n_skip > 0:
+                label = "same-stage resume" if _same_stage_resume else "cross-stage resume"
                 print(
-                    f"[resume] skipping {n_skip} batches in epoch {epoch} "
-                    f"to avoid stage-1 data"
+                    f"[{label}] skipping {n_skip} batches in epoch {epoch} "
+                    f"(micro_step_in_epoch={resume_micro_step_in_epoch}, "
+                    f"saved_bs={resume_batch_size}, current_bs={args.batch_size})"
                 )
                 _exhaust_dataloader(loader, n_skip)
                 micro_step_in_epoch = n_skip
             _cross_stage_resume = False  # only fast-forward once
+            _same_stage_resume  = False
 
         for batch in loader:
             micro_step_in_epoch += 1
@@ -1083,6 +1100,8 @@ def main() -> None:
                         "optimizer":           optimizer.state_dict(),
                         "scaler":              scaler.state_dict(),
                     }
+                    if scheduler is not None:
+                        _ckpt_dict["scheduler"] = scheduler.state_dict()
                     if args.stage == 2 or not args.freeze_encoder:
                         _ckpt_dict["encoder"] = encoder.state_dict()
                     if args.stage == 2 or not args.freeze_llama:
@@ -1307,6 +1326,8 @@ def main() -> None:
                             "optimizer":           optimizer.state_dict(),
                             "scaler":              scaler.state_dict(),
                         }
+                        if scheduler is not None:
+                            _es_ckpt_dict["scheduler"] = scheduler.state_dict()
                         if args.stage == 2 or not args.freeze_encoder:
                             _es_ckpt_dict["encoder"] = encoder.state_dict()
                         if args.stage == 2 or not args.freeze_llama:
@@ -1345,6 +1366,8 @@ def main() -> None:
         "optimizer":           optimizer.state_dict(),
         "scaler":              scaler.state_dict(),
     }
+    if scheduler is not None:
+        _final_ckpt_dict["scheduler"] = scheduler.state_dict()
     if args.stage == 2 or not args.freeze_encoder:
         _final_ckpt_dict["encoder"] = encoder.state_dict()
     if args.stage == 2 or not args.freeze_llama:
