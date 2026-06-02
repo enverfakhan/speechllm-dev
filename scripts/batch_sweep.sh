@@ -31,7 +31,7 @@ done
 # ── Configurable variables ────────────────────────────────────────────────────
 GCS_BUCKET="gs://speechllm-data"
 PER_GPU_BATCH_STAGE1=64      # set from: python scripts/find_max_batch.py --stage 1
-PER_GPU_BATCH_STAGE2=32      # set from: python scripts/find_max_batch.py --stage 2
+PER_GPU_BATCH_STAGE2=8      # set from: python scripts/find_max_batch.py --stage 2
 MAX_STEPS_STAGE1=5000
 MAX_STEPS_STAGE2=10000
 BEST_STAGE1_ADAPTER_CKPT=""  # fill in between stages (e.g. checkpoints/stage1-bs0128/adapter-step5000.pt)
