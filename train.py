@@ -643,7 +643,7 @@ def main() -> None:
     _param_groups = []
     if not args.freeze_encoder and not _staged_encoder:
         _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
-    _param_groups.append({"params": adapter.parameters(), "lr": 1e-5})
+    _param_groups.append({"params": adapter.parameters(), "lr": 1e-4})
     if not args.freeze_llama:
         _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
     import bitsandbytes as bnb
