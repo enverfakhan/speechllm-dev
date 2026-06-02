@@ -189,6 +189,7 @@ for multiplier in 1 2 4 8; do
     # shellcheck disable=SC2046
     python train.py \
         --stage              2 \
+        --resume_ckpt        "checkpoints/stage2-bs0008/step_0000360.pt" \
         --shards_file        "$SHARDS_FILE" \
         --tokenizer          "$TOKENIZER" \
         --whisper_ckpt       "$WHISPER_CKPT" \
