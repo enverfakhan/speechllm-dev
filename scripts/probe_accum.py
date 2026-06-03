@@ -262,6 +262,24 @@ def _run_accum(
         free, tot = torch.cuda.mem_get_info(device)
         return f"torch={a:.2f}GB  cuda_total={(tot-free)/1e9:.2f}GB"
 
+    # creating the optimizer state graph first.
+    batch = _make_batch(batch_size, device)
+    mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens = batch
+
+    with torch.amp.autocast("cuda", dtype=autocast_dt):
+        enc_out     = encoder(mel)
+        adapter_out = adapter(enc_out)
+        inputs, labels = prepare_input(
+            adapter_out, audio_lengths,
+            inst_ids, inst_lens, trans_ids, trans_lens,
+            llama.embed_tokens, sep_token_id=_SEP_ID,
+        )
+        _, loss = llama(inputs, labels)
+    _optimizer_step(optimizer, scaler, all_params)
+    optimizer.zero_grad(set_to_none=True)
+    if empty_cache:
+        torch.cuda.empty_cache()
+        
     for step in range(1, n_steps + 1):
         for k in range(accum_steps):
             try:
