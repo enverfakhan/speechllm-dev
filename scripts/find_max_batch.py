@@ -79,9 +79,9 @@ def _build_models(stage: int) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
     llama.load_meta_weights("./weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/")
 
     device = torch.device("cuda")
-    encoder = encoder.to(torch.bfloat16).to(device)
-    adapter = adapter.to(torch.bfloat16).to(device)
-    llama   = llama.to(torch.bfloat16).to(device)
+    encoder = encoder.to(device)
+    adapter = adapter.to(device)
+    llama   = llama.to(device)
 
     if stage == 1:
         encoder.requires_grad_(False)
