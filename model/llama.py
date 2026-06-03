@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from linear_cross_entropy import linear_cross_entropy as _fused_lce
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -347,21 +349,40 @@ class Llama(nn.Module):
             else:
                 x = layer(x, cos, sin)
 
-        x      = self.norm(x)
-        logits = self.lm_head(x)   # (B, S, vocab_size)
+        x = self.norm(x)
 
-        loss = None
-        if labels is not None:
-            # Shift by one: logits[i] predicts labels[i+1]
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+        # ── Inference: materialise full logits ────────────────────────────────
+        if labels is None:
+            return self.lm_head(x), None
 
-        return logits, loss
+        # ── Training: fused projection + loss, transcript positions only ──────
+        # Causal shift: hidden[i] predicts labels[i+1].
+        shift_hidden = x[:, :-1, :].contiguous()       # (B, S-1, d_model)
+        shift_labels = labels[:, 1:].contiguous()       # (B, S-1)
+
+        flat_hidden = shift_hidden.view(-1, self.config.d_model)
+        flat_labels = shift_labels.view(-1)
+
+        valid = flat_labels != -100
+        h = flat_hidden[valid]   # (N_transcript, d_model)
+        t = flat_labels[valid]   # (N_transcript,)
+
+        # _fused_lce requires N % 512 == 0 and V % 4096 == 0.
+        N_pad = (512 - h.size(0) % 512) % 512
+        if N_pad:
+            h = F.pad(h, (0, 0, 0, N_pad))
+            t = F.pad(t, (0, N_pad), value=-100)
+
+        V_pad = (4096 - self.config.vocab_size % 4096) % 4096
+        At = self.lm_head.weight.t()        # (d_model, vocab_size)
+        if V_pad:
+            At = F.pad(At, (0, V_pad))      # (d_model, vocab_size_padded)
+
+        # N_chunk_size=5 caps the logit buffer at 5 × vocab_size rows at once,
+        # keeping the peak kernel allocation small instead of the default 4096.
+        loss, *_ = _fused_lce(h, t, At, N_chunk_size=5)
+
+        return None, loss
 
     def enable_gradient_checkpointing(self) -> None:
         """Enable activation recomputation during backward to reduce peak VRAM."""
