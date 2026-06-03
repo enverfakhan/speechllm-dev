@@ -262,25 +262,6 @@ def _run_accum(
         free, tot = torch.cuda.mem_get_info(device)
         return f"torch={a:.2f}GB  cuda_total={(tot-free)/1e9:.2f}GB"
 
-    # creating the optimizer state graph first.
-    batch = _make_batch(batch_size, device)
-    mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens = batch
-
-    with torch.amp.autocast("cuda", dtype=autocast_dt):
-        enc_out     = encoder(mel)
-        adapter_out = adapter(enc_out)
-        inputs, labels = prepare_input(
-            adapter_out, audio_lengths,
-            inst_ids, inst_lens, trans_ids, trans_lens,
-            llama.embed_tokens, sep_token_id=_SEP_ID,
-        )
-        _, loss = llama(inputs, labels)
-    _backward(loss, 1, scaler)
-    _optimizer_step(optimizer, scaler, all_params)
-    optimizer.zero_grad(set_to_none=True)
-    if empty_cache:
-        torch.cuda.empty_cache()
-
     for step in range(1, n_steps + 1):
         for k in range(accum_steps):
             try:
@@ -397,6 +378,31 @@ def _run_diagnostic(
     oom_info: dict | None = None
 
     optimizer.zero_grad(set_to_none=True)
+
+    # ── Warm-up step: force bnb state materialisation before the timed loop ───
+    # bnb AdamW8bit lazily allocates per-parameter state (exp_avg, exp_avg_sq,
+    # absmax codes) on the first optimizer.step() call for each parameter.
+    # Without this warm-up, that allocation hits mid-accumulation and the sudden
+    # ~14 GB spike pushes an otherwise-marginal run over the OOM threshold.
+    _warm_mel_t = 800  # smallest realistic length to minimise warm-up peak
+    _warm_batch = _make_batch(batch_size, device, _warm_mel_t)
+    _wmel, _walen, _wiids, _wiles, _wtids, _wtles = _warm_batch
+    with torch.amp.autocast("cuda", dtype=autocast_dt):
+        _we  = encoder(_wmel)
+        _wa  = adapter(_we)
+        _wi, _wl = prepare_input(
+            _wa, _walen, _wiids, _wiles, _wtids, _wtles,
+            llama.embed_tokens, sep_token_id=_SEP_ID,
+        )
+        _, _wloss = llama(_wi, _wl)
+    _backward(_wloss, 1, scaler)
+    _optimizer_step(optimizer, scaler, all_params)
+    optimizer.zero_grad(set_to_none=True)
+    del _warm_batch, _wmel, _walen, _wiids, _wiles, _wtids, _wtles
+    del _we, _wa, _wi, _wl, _wloss
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.reset_peak_memory_stats(device)
 
     for step in range(1, n_steps + 1):
         max_mel_t = 0
