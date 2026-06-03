@@ -378,9 +378,10 @@ class Llama(nn.Module):
         if V_pad:
             At = F.pad(At, (0, V_pad))      # (d_model, vocab_size_padded)
 
-        # N_chunk_size=5 caps the logit buffer at 5 × vocab_size rows at once,
-        # keeping the peak kernel allocation small instead of the default 4096.
-        loss, *_ = _fused_lce(h, t, At, N_chunk_size=5)
+        # N_chunk_size caps the peak logit buffer to N_chunk_size × vocab_size rows.
+        # Must be a multiple of 64 (the smallest Triton N_BLOCK_SIZE in all configs).
+        # 64 → ~10 MB peak vs the default 4096 → ~672 MB.
+        loss, *_ = _fused_lce(h, t, At, N_chunk_size=64)
 
         return None, loss
 
