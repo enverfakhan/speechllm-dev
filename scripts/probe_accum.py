@@ -262,6 +262,26 @@ def _run_accum(
         free, tot = torch.cuda.mem_get_info(device)
         return f"torch={a:.2f}GB  cuda_total={(tot-free)/1e9:.2f}GB"
 
+    # Same 4-step warm-up as _run_diagnostic: bnb materialises state on call #4.
+    for _ in range(4):
+        _wb = _make_batch(batch_size, device, 800)
+        _wm, _wal, _wii, _wil, _wti, _wtl = _wb
+        with torch.amp.autocast("cuda", dtype=autocast_dt):
+            _we = encoder(_wm)
+            _wa = adapter(_we)
+            _wins, _wlbl = prepare_input(
+                _wa, _wal, _wii, _wil, _wti, _wtl,
+                llama.embed_tokens, sep_token_id=_SEP_ID,
+            )
+            _, _wloss = llama(_wins, _wlbl)
+        _backward(_wloss, 1, scaler)
+        _optimizer_step(optimizer, scaler, all_params)
+        optimizer.zero_grad(set_to_none=True)
+        del _wb, _wm, _wal, _wii, _wil, _wti, _wtl, _we, _wa, _wins, _wlbl, _wloss
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.reset_peak_memory_stats(device)
+
     for step in range(1, n_steps + 1):
         for k in range(accum_steps):
             try:
@@ -379,30 +399,37 @@ def _run_diagnostic(
 
     optimizer.zero_grad(set_to_none=True)
 
-    # ── Warm-up step: force bnb state materialisation before the timed loop ───
-    # bnb AdamW8bit lazily allocates per-parameter state (exp_avg, exp_avg_sq,
-    # absmax codes) on the first optimizer.step() call for each parameter.
-    # Without this warm-up, that allocation hits mid-accumulation and the sudden
-    # ~14 GB spike pushes an otherwise-marginal run over the OOM threshold.
-    _warm_mel_t = 800  # smallest realistic length to minimise warm-up peak
-    _warm_batch = _make_batch(batch_size, device, _warm_mel_t)
-    _wmel, _walen, _wiids, _wiles, _wtids, _wtles = _warm_batch
-    with torch.amp.autocast("cuda", dtype=autocast_dt):
-        _we  = encoder(_wmel)
-        _wa  = adapter(_we)
-        _wi, _wl = prepare_input(
-            _wa, _walen, _wiids, _wiles, _wtids, _wtles,
-            llama.embed_tokens, sep_token_id=_SEP_ID,
-        )
-        _, _wloss = llama(_wi, _wl)
-    _backward(_wloss, 1, scaler)
-    _optimizer_step(optimizer, scaler, all_params)
-    optimizer.zero_grad(set_to_none=True)
-    del _warm_batch, _wmel, _walen, _wiids, _wiles, _wtids, _wtles
-    del _we, _wa, _wi, _wl, _wloss
+    # ── Warm-up: force bnb state materialisation before the timed loop ────────
+    # bnb AdamW8bit defers GPU state allocation until the 4th optimizer.step()
+    # call — verified empirically: steps 1–3 leave optimizer.state empty, step
+    # 4 allocates ~14.7 GB of 8-bit exp_avg/exp_avg_sq tensors for all params.
+    # With only 1 warm-up step the spike still hits at main step 3 (4th total).
+    # Running 4 warm-up steps materialises state before the timed loop starts,
+    # so the baseline is predictable and there is no mid-accumulation spike.
+    # mel_t=800 (shortest realistic length) keeps each warm-up peak ~73 GB.
+    _N_WARMUP = 4
+    for _ in range(_N_WARMUP):
+        _wb = _make_batch(batch_size, device, 800)
+        _wm, _wal, _wii, _wil, _wti, _wtl = _wb
+        with torch.amp.autocast("cuda", dtype=autocast_dt):
+            _we = encoder(_wm)
+            _wa = adapter(_we)
+            _wins, _wlbl = prepare_input(
+                _wa, _wal, _wii, _wil, _wti, _wtl,
+                llama.embed_tokens, sep_token_id=_SEP_ID,
+            )
+            _, _wloss = llama(_wins, _wlbl)
+        _backward(_wloss, 1, scaler)
+        _optimizer_step(optimizer, scaler, all_params)
+        optimizer.zero_grad(set_to_none=True)
+        del _wb, _wm, _wal, _wii, _wil, _wti, _wtl, _we, _wa, _wins, _wlbl, _wloss
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.reset_peak_memory_stats(device)
+
+    _pre_state_gb = _opt_state_gb(optimizer)
+    print(f"  [pre-warm: {_N_WARMUP} steps — bnb state = {_pre_state_gb:.3f} GB, "
+          f"entries = {len(optimizer.state)}/{len(all_params)}]")
 
     for step in range(1, n_steps + 1):
         max_mel_t = 0
