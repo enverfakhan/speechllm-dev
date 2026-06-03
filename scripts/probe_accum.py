@@ -275,11 +275,12 @@ def _run_accum(
             llama.embed_tokens, sep_token_id=_SEP_ID,
         )
         _, loss = llama(inputs, labels)
+    _backward(loss, 1, scaler)
     _optimizer_step(optimizer, scaler, all_params)
     optimizer.zero_grad(set_to_none=True)
     if empty_cache:
         torch.cuda.empty_cache()
-        
+
     for step in range(1, n_steps + 1):
         for k in range(accum_steps):
             try:
