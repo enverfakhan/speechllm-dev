@@ -26,6 +26,7 @@ Usage:
     python scripts/find_max_batch.py --stage 1 --accum 1
 """
 
+
 from __future__ import annotations
 
 import argparse
