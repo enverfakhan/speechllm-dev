@@ -227,6 +227,37 @@ def _parse_args() -> argparse.Namespace:
         help="Placeholder — raises NotImplementedError if passed.",
     )
     p.add_argument(
+        "--auto_stage", action="store_true",
+        help=(
+            "Run stage 1 and stage 2 in a single job. Starts with encoder and Llama "
+            "frozen (adapter-only). Once eval_first_token_loss from --diag_shard drops "
+            "below baselines.json first_token_loss, transitions to stage 2: discards the "
+            "stage-1 optimizer, builds a fresh 3-group AdamW with --lr_encoder / "
+            "--lr_adapter / --lr_llama, and applies linear LR warmup for --warmup_steps. "
+            "Requires --diag_shard and baselines.json with first_token_loss. "
+            "Incompatible with --stage 2, --freeze_encoder, --freeze_llama, --staged_encoder."
+        ),
+    )
+    p.add_argument(
+        "--s1_batch_size", type=int, default=None,
+        help=(
+            "Stage-1 batch size when --auto_stage is set. "
+            "Default None: uses --batch_size for both stages. "
+            "At the stage-2 transition the DataLoader is immediately rebuilt with --batch_size."
+        ),
+    )
+    p.add_argument(
+        "--s1_accum_steps", type=int, default=None,
+        help=(
+            "Stage-1 gradient accumulation steps when --auto_stage is set. "
+            "Default None: uses --accum_steps for both stages."
+        ),
+    )
+    p.add_argument(
+        "--s1_adapter_lr", type=float, default=1e-4,
+        help="Stage-1 adapter LR when --auto_stage is set (default 1e-4).",
+    )
+    p.add_argument(
         "--adapter_ckpt", type=Path, default=None,
         help=(
             "Path to a saved adapter-only checkpoint (.pt) containing at minimum "
@@ -620,6 +651,13 @@ def main() -> None:
     if args.staged_llama:
         # TODO: mirror --staged_encoder once implemented
         raise NotImplementedError("--staged_llama is not yet implemented.")
+    if args.auto_stage:
+        if args.stage == 2:
+            raise ValueError("--auto_stage is incompatible with --stage 2.")
+        if args.freeze_encoder or args.freeze_llama:
+            raise ValueError("--auto_stage is incompatible with --freeze_encoder / --freeze_llama.")
+        if args.staged_encoder:
+            raise ValueError("--auto_stage is incompatible with --staged_encoder.")
     if args.stage == 2 and args.resume_ckpt is None and args.adapter_ckpt is None:
         raise ValueError(
             "--stage 2 requires --adapter_ckpt (stage-1 adapter weights) "
@@ -629,6 +667,8 @@ def main() -> None:
         raise argparse.ArgumentTypeError(
             "--early_stop_metric requires --diag_shard to be set"
         )
+    if args.auto_stage and args.diag_shard is None:
+        raise argparse.ArgumentTypeError("--auto_stage requires --diag_shard for eval_first_token_loss monitoring.")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -650,6 +690,9 @@ def main() -> None:
     else:
         baselines_data = {}
 
+    if args.auto_stage and baselines_data.get("first_token_loss") is None:
+        raise ValueError("--auto_stage requires baselines.json with first_token_loss.")
+
     # Staged encoder: freeze encoder initially, auto-thaw when first_token_loss crossed.
     _staged_encoder = args.staged_encoder
     if _staged_encoder:
@@ -663,6 +706,13 @@ def main() -> None:
         f"Staged encoder: {'ACTIVE' if _staged_encoder else 'disabled'}"
         + (f"  (threshold first_token_loss={baselines_data['first_token_loss']:.4f})" if _staged_encoder else "")
     )
+    if args.auto_stage:
+        print(
+            f"Auto-stage: ACTIVE — stage 1 until eval_first_token_loss < "
+            f"{baselines_data['first_token_loss']:.4f}, then stage 2 "
+            f"(warmup_steps={args.warmup_steps}  lr_enc={args.lr_encoder:.1e}  "
+            f"lr_ada={args.lr_adapter:.1e}  lr_llm={args.lr_llama:.1e})."
+        )
     # Stage 2 trains all modules jointly — staged encoder would conflict.
     if args.stage == 2 and _staged_encoder:
         print("Stage 2: --staged_encoder incompatible with all-module training — disabling.")
@@ -726,16 +776,23 @@ def main() -> None:
         print("Encoder: trainable (stage 2)")
         print("Llama:   trainable (stage 2)")
     else:
-        if args.freeze_encoder or _staged_encoder:
+        if args.freeze_encoder or _staged_encoder or args.auto_stage:
             encoder.requires_grad_(False)
-            print("Encoder: FROZEN" + (" (staged — will auto-thaw)" if _staged_encoder else ""))
+            print(
+                "Encoder: FROZEN"
+                + (" (staged — will auto-thaw)" if _staged_encoder else "")
+                + (" (auto_stage — will unfreeze at stage-2 transition)" if args.auto_stage else "")
+            )
         else:
             print("Encoder: trainable")
 
-        if args.freeze_llama:
+        if args.freeze_llama or args.auto_stage:
             for p in llama.parameters():
                 p.requires_grad_(False)
-            print("Llama: FROZEN")
+            print(
+                "Llama: FROZEN"
+                + (" (auto_stage — will unfreeze at stage-2 transition)" if args.auto_stage else "")
+            )
         else:
             print("Llama: trainable")
 
@@ -748,6 +805,16 @@ def main() -> None:
         f"llama: {n_llm / 1e6:.0f}M  "
         f"total: {(n_enc + n_ada + n_llm) / 1e9:.2f}B"
     )
+
+    # ── Stage-specific runtime hyperparameters ────────────────────────────────
+    # For --auto_stage these start at stage-1 values; the transition block
+    # updates them to --batch_size / --accum_steps when stage 2 begins.
+    if args.auto_stage:
+        _batch_size  = args.s1_batch_size  if args.s1_batch_size  is not None else args.batch_size
+        _accum_steps = args.s1_accum_steps if args.s1_accum_steps is not None else args.accum_steps
+    else:
+        _batch_size  = args.batch_size
+        _accum_steps = args.accum_steps
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     import bitsandbytes as bnb
@@ -772,10 +839,10 @@ def main() -> None:
         # In staged mode the encoder is excluded here; added via add_param_group on thaw.
         # Adapter is always param_groups[0] when encoder is absent (frozen or staged).
         _param_groups = []
-        if not args.freeze_encoder and not _staged_encoder:
+        if not args.freeze_encoder and not _staged_encoder and not args.auto_stage:
             _param_groups.append({"params": encoder.parameters(), "lr": 1e-7})
-        _param_groups.append({"params": adapter.parameters(), "lr": 1e-4})
-        if not args.freeze_llama:
+        _param_groups.append({"params": adapter.parameters(), "lr": args.s1_adapter_lr})
+        if not args.freeze_llama and not args.auto_stage:
             _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
         optimizer = bnb.optim.AdamW8bit(
             _param_groups,
@@ -795,6 +862,14 @@ def main() -> None:
     _stage2_eval_count   = 0
     _stage2_shock_warned = False
     _STAGE2_SHOCK_WINDOW = 5                  # warn only within the first N diag evals
+
+    # ── Auto-stage state ──────────────────────────────────────────────────────
+    _auto_stage_active    = args.auto_stage
+    _auto_transitioned    = False   # True once stage-1 → stage-2 transition fires
+    _auto_stage2_step     = 0       # global_step when stage 2 started
+    _stage2_loader_reload = False   # triggers same-epoch DataLoader rebuild with new _batch_size
+    _stage2_reload_mse    = 0       # micro_step_in_epoch captured at transition
+    _stage2_reload_old_bs = 0       # _batch_size before the transition
 
     # ── W&B ───────────────────────────────────────────────────────────────────
     if args.wandb:
@@ -831,6 +906,7 @@ def main() -> None:
                 "resume_ckpt":            str(args.resume_ckpt) if args.resume_ckpt else None,
                 "adapter_ckpt":           str(args.adapter_ckpt) if args.adapter_ckpt else None,
                 "gradient_checkpointing": args.gradient_checkpointing,
+                "auto_stage":             args.auto_stage,
             },
         )
 
@@ -838,8 +914,8 @@ def main() -> None:
         _encoder_frozen_val = 0.0   # stage 2 always unfreezes regardless of --freeze_* flags
         _llama_frozen_val   = 0.0
     else:
-        _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder) else 0.0
-        _llama_frozen_val   = 1.0 if args.freeze_llama else 0.0
+        _encoder_frozen_val = 1.0 if (args.freeze_encoder or _staged_encoder or args.auto_stage) else 0.0
+        _llama_frozen_val   = 1.0 if (args.freeze_llama or args.auto_stage) else 0.0
 
     # ── Instruction mode ──────────────────────────────────────────────────────
     if args.instruction_mode == "unformatted":
@@ -991,24 +1067,37 @@ def main() -> None:
             epoch_shards,
             tokenizer_path=args.tokenizer,
             sep_token_id=sep_token_id,
-            batch_size=args.batch_size,
+            batch_size=_batch_size,
             num_workers=args.num_workers,
             instruction_variants=train_pairs,
         )
 
+        # ── Stage-2 batch-size reload (same epoch, new _batch_size after transition) ──
+        if _stage2_loader_reload:
+            n_skip = math.floor(_stage2_reload_mse * _stage2_reload_old_bs / _batch_size)
+            if n_skip > 0:
+                print(
+                    f"[auto-stage] Epoch {epoch}: reloading with batch_size={_batch_size}, "
+                    f"skipping {n_skip} batches "
+                    f"({_stage2_reload_mse} × {_stage2_reload_old_bs} / {_batch_size})"
+                )
+                _exhaust_dataloader(loader, n_skip)
+                micro_step_in_epoch = n_skip
+            _stage2_loader_reload = False
+
         # ── Dataloader fast-forward (first epoch only) ───────────────────────
         # Both cross-stage and same-stage resumes must skip batches already seen
         # so the model does not train on data it processed before the checkpoint.
-        if (_cross_stage_resume or _same_stage_resume) and epoch == resume_epoch:
+        elif (_cross_stage_resume or _same_stage_resume) and epoch == resume_epoch:
             n_skip = math.floor(
-                resume_micro_step_in_epoch * resume_batch_size / args.batch_size
+                resume_micro_step_in_epoch * resume_batch_size / _batch_size
             )
             if n_skip > 0:
                 label = "same-stage resume" if _same_stage_resume else "cross-stage resume"
                 print(
                     f"[{label}] skipping {n_skip} batches in epoch {epoch} "
                     f"(micro_step_in_epoch={resume_micro_step_in_epoch}, "
-                    f"saved_bs={resume_batch_size}, current_bs={args.batch_size})"
+                    f"saved_bs={resume_batch_size}, current_bs={_batch_size})"
                 )
                 _exhaust_dataloader(loader, n_skip)
                 micro_step_in_epoch = n_skip
@@ -1045,11 +1134,11 @@ def main() -> None:
                 logits, loss = llama(inputs, labels)
 
             diag.record_micro_with_logits(labels, logits, loss.detach())
-            scaler.scale(loss / args.accum_steps).backward()
+            scaler.scale(loss / _accum_steps).backward()
             accum_loss += loss.item()
             micro_step += 1
 
-            if micro_step % args.accum_steps == 0:
+            if micro_step % _accum_steps == 0:
                 scaler.unscale_(optimizer)
                 if not args.no_grad_clip:
                     torch.nn.utils.clip_grad_norm_(
@@ -1060,7 +1149,7 @@ def main() -> None:
 
                 # One-shot sanity check on the first stage-2 step: confirm the encoder
                 # actually has gradients (requires_grad was set before optimizer build).
-                if args.stage == 2 and not _stage2_enc_grad_checked:
+                if (args.stage == 2 or _auto_transitioned) and not _stage2_enc_grad_checked:
                     _enc_gn = math.sqrt(sum(
                         p.grad.norm().item() ** 2
                         for p in encoder.parameters()
@@ -1081,7 +1170,7 @@ def main() -> None:
                 optimizer.zero_grad()
                 global_step += 1
 
-                avg_loss   = accum_loss / args.accum_steps
+                avg_loss   = accum_loss / _accum_steps
                 accum_loss = 0.0
                 loss_ema   = avg_loss if loss_ema is None else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
 
@@ -1095,7 +1184,7 @@ def main() -> None:
                         "step":                global_step,
                         "epoch":               epoch,
                         "micro_step_in_epoch": micro_step_in_epoch,
-                        "batch_size":          args.batch_size,
+                        "batch_size":          _batch_size,
                         "adapter":             adapter.state_dict(),
                         "optimizer":           optimizer.state_dict(),
                         "scaler":              scaler.state_dict(),
@@ -1157,10 +1246,74 @@ def main() -> None:
                     llama.train()
                     eval_diag_metrics = diag.flush_eval(global_step)
 
+                    # ── Auto-stage: stage-1 → stage-2 transition ──────────────
+                    if _auto_stage_active and not _auto_transitioned:
+                        _ftl_eval = eval_diag_metrics.get("loss/eval_first_token")
+                        if _ftl_eval is not None and _ftl_eval < baselines_data["first_token_loss"]:
+                            _auto_transitioned = True
+                            _auto_stage2_step  = global_step
+
+                            # Save stage-1 final checkpoint before optimizer swap
+                            _s1_path = args.checkpoint_dir / f"stage1-final-step{global_step}.pt"
+                            torch.save({
+                                "step":                global_step,
+                                "epoch":               epoch,
+                                "micro_step_in_epoch": micro_step_in_epoch,
+                                "batch_size":          _batch_size,
+                                "adapter":             adapter.state_dict(),
+                                "optimizer_adapter":   optimizer.state_dict(),
+                            }, _s1_path)
+                            print(f"[auto-stage] Stage-1 final checkpoint → {_s1_path}")
+
+                            # Unfreeze encoder + Llama
+                            encoder.requires_grad_(True)
+                            llama.requires_grad_(True)
+
+                            # Discard stage-1 optimizer; create fresh stage-2 optimizer
+                            del optimizer
+                            _s2_param_groups = _build_stage2_param_groups(
+                                encoder, adapter, llama,
+                                args.lr_encoder, args.lr_adapter, args.lr_llama,
+                            )
+                            optimizer = bnb.optim.AdamW8bit(
+                                _s2_param_groups,
+                                betas=(args.beta1, args.beta2),
+                                weight_decay=0.01,
+                            )
+                            optimizer.zero_grad()
+                            scheduler = _make_warmup_scheduler(optimizer, args.warmup_steps)
+                            _print_stage2_startup(_s2_param_groups, args.warmup_steps, (args.beta1, args.beta2))
+
+                            # Reset stage-2 diagnostic flags so checks re-fire for stage 2
+                            _stage2_enc_grad_checked = False
+                            _prev_eval_loss          = None
+                            _stage2_eval_count       = 0
+                            _stage2_shock_warned     = False
+                            _encoder_frozen_val      = 0.0
+                            _llama_frozen_val        = 0.0
+
+                            print(
+                                f"[auto-stage] Transitioned to stage 2 at step {global_step}  "
+                                f"eval_first_token_loss={_ftl_eval:.4f} < "
+                                f"baseline={baselines_data['first_token_loss']:.4f}"
+                            )
+
+                            # Rebuild DataLoader this epoch with stage-2 batch size
+                            if _batch_size != args.batch_size or _accum_steps != args.accum_steps:
+                                _stage2_loader_reload = True
+                                _stage2_reload_mse    = micro_step_in_epoch
+                                _stage2_reload_old_bs = _batch_size
+                                _batch_size  = args.batch_size
+                                _accum_steps = args.accum_steps
+                                print(
+                                    f"[auto-stage] Switching to stage-2 batch_size={_batch_size} "
+                                    f"accum_steps={_accum_steps} (effective={_batch_size * _accum_steps})"
+                                )
+
                     # Unfreeze-shock detection: a rising diag eval loss within the
                     # first few evals is the classic sign that warmup is too short
                     # or lr_encoder / lr_llama is too high.
-                    if args.stage == 2 and not _stage2_shock_warned:
+                    if (args.stage == 2 or _auto_transitioned) and not _stage2_shock_warned:
                         _curr_el = eval_diag_metrics.get("loss/eval_rest")
                         if _curr_el is not None:
                             _stage2_eval_count += 1
@@ -1247,12 +1400,21 @@ def main() -> None:
                         _gap["loss/gap_first_token"] = _ef - _tf
                     # Stage 2: fixed group order (enc=0, ada=1, llm=2).
                     # Stage 1: dynamic order depending on freeze flags.
-                    if args.stage == 2:
+                    _effective_stage = 2 if (args.stage == 2 or _auto_transitioned) else 1
+                    if _effective_stage == 2:
                         _lr_dict = {
                             "train/lr":         optimizer.param_groups[2]["lr"],
                             "train/lr_encoder": optimizer.param_groups[0]["lr"],
                             "train/lr_adapter": optimizer.param_groups[1]["lr"],
                             "train/lr_llama":   optimizer.param_groups[2]["lr"],
+                        }
+                    elif args.auto_stage and not _auto_transitioned:
+                        # Stage 1 of auto_stage: only the adapter group exists.
+                        _lr_dict = {
+                            "train/lr":         optimizer.param_groups[0]["lr"],
+                            "train/lr_encoder": 0.0,
+                            "train/lr_adapter": optimizer.param_groups[0]["lr"],
+                            "train/lr_llama":   0.0,
                         }
                     else:
                         # In staged mode: adapter=0, llama=1(if unfrozen), encoder=last(after thaw).
@@ -1276,6 +1438,7 @@ def main() -> None:
                         {
                             "train/loss":                            avg_loss,
                             "train/loss_ema":                        loss_ema,
+                            "train/stage":                           _effective_stage,
                             "train/encoder_frozen":                  _encoder_frozen_val,
                             "train/llama_frozen":                    _llama_frozen_val,
                             "runtime/throughput_audio_sec_per_sec":  throughput,
@@ -1321,7 +1484,7 @@ def main() -> None:
                             "step":                global_step,
                             "epoch":               epoch,
                             "micro_step_in_epoch": micro_step_in_epoch,
-                            "batch_size":          args.batch_size,
+                            "batch_size":          _batch_size,
                             "adapter":             adapter.state_dict(),
                             "optimizer":           optimizer.state_dict(),
                             "scaler":              scaler.state_dict(),
@@ -1351,7 +1514,15 @@ def main() -> None:
                         done = True
                         break
 
-        if not done:
+                # ── Stage-2 DataLoader reload ─────────────────────────────────
+                # Break inner loop so the outer while rebuilds loader with new
+                # _batch_size. Epoch is NOT incremented (handled below).
+                if _stage2_loader_reload:
+                    break
+
+        if _stage2_loader_reload:
+            pass   # same epoch — outer while rebuilds loader with updated _batch_size
+        elif not done:
             epoch += 1
             micro_step_in_epoch = 0
 
@@ -1361,7 +1532,7 @@ def main() -> None:
         "step":                global_step,
         "epoch":               epoch,
         "micro_step_in_epoch": micro_step_in_epoch,
-        "batch_size":          args.batch_size,
+        "batch_size":          _batch_size,
         "adapter":             adapter.state_dict(),
         "optimizer":           optimizer.state_dict(),
         "scaler":              scaler.state_dict(),
