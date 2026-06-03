@@ -117,6 +117,17 @@ class Diagnostics:
         self._logit_max_sum: float = 0.0
         self._logit_max_n:   int   = 0
 
+        # Hit/miss loss decomposition (per-token, requires logits)
+        # "hit" = top-1 prediction matches label; "miss" = it doesn't
+        self._loss_first_hit_sum:  float = 0.0
+        self._loss_first_hit_n:    int   = 0
+        self._loss_first_miss_sum: float = 0.0
+        self._loss_first_miss_n:   int   = 0
+        self._loss_rest_hit_sum:   float = 0.0
+        self._loss_rest_hit_n:     int   = 0
+        self._loss_rest_miss_sum:  float = 0.0
+        self._loss_rest_miss_n:    int   = 0
+
         self._global_step: int = 0
 
         # ── Eval-pass accumulators (filled by record_eval_micro_with_logits) ──
@@ -133,6 +144,14 @@ class Diagnostics:
         self._eval_entropy_n:         int   = 0
         self._eval_logit_max_sum:     float = 0.0
         self._eval_logit_max_n:       int   = 0
+        self._eval_loss_first_hit_sum:  float = 0.0
+        self._eval_loss_first_hit_n:    int   = 0
+        self._eval_loss_first_miss_sum: float = 0.0
+        self._eval_loss_first_miss_n:   int   = 0
+        self._eval_loss_rest_hit_sum:   float = 0.0
+        self._eval_loss_rest_hit_n:     int   = 0
+        self._eval_loss_rest_miss_sum:  float = 0.0
+        self._eval_loss_rest_miss_n:    int   = 0
 
     # ── Per-micro-step call ────────────────────────────────────────────────────
 
@@ -249,6 +268,9 @@ class Diagnostics:
             reduction="none",
         ).reshape(B, L - 1)  # (B, L-1)
 
+        # Top-1 predictions for hit/miss split
+        top1_preds = shift_logits.argmax(dim=-1)  # (B, L-1)
+
         # First unmasked position per sample → "first transcript token" loss
         for i in range(B):
             row_mask = unmasked[i]                   # (L-1,) bool
@@ -256,14 +278,36 @@ class Diagnostics:
             if len(nz) == 0:
                 continue
             first_pos = int(nz[0].item())
-            self._loss_first_sum += float(per_token_loss[i, first_pos].item())
+            first_loss = float(per_token_loss[i, first_pos].item())
+            self._loss_first_sum += first_loss
             self._loss_first_n   += 1
+
+            # Hit/miss for first token
+            first_hit = (int(top1_preds[i, first_pos].item()) == int(shift_labels[i, first_pos].item()))
+            if first_hit:
+                self._loss_first_hit_sum += first_loss
+                self._loss_first_hit_n   += 1
+            else:
+                self._loss_first_miss_sum += first_loss
+                self._loss_first_miss_n   += 1
 
             rest_positions = nz[1:]
             if len(rest_positions) > 0:
                 rest_loss = per_token_loss[i, rest_positions].mean().item()
                 self._loss_rest_sum += rest_loss
                 self._loss_rest_n   += 1
+
+                # Hit/miss per rest token
+                for rp in rest_positions:
+                    rp_idx  = int(rp.item())
+                    r_loss  = float(per_token_loss[i, rp_idx].item())
+                    r_hit   = (int(top1_preds[i, rp_idx].item()) == int(shift_labels[i, rp_idx].item()))
+                    if r_hit:
+                        self._loss_rest_hit_sum += r_loss
+                        self._loss_rest_hit_n   += 1
+                    else:
+                        self._loss_rest_miss_sum += r_loss
+                        self._loss_rest_miss_n   += 1
 
             # ── Top-k first-token prediction ───────────────────────────────────
             # The logit at first_pos - 1 (the SEP before the transcript) predicts
@@ -328,19 +372,41 @@ class Diagnostics:
             reduction="none",
         ).reshape(B, L - 1)
 
+        eval_top1_preds = shift_logits.argmax(dim=-1)  # (B, L-1)
+
         for i in range(B):
             row_mask  = unmasked[i]
             nz        = row_mask.nonzero(as_tuple=False)
             if len(nz) == 0:
                 continue
-            first_pos = int(nz[0].item())
-            self._eval_loss_first_sum += float(per_token_loss[i, first_pos].item())
+            first_pos  = int(nz[0].item())
+            first_loss = float(per_token_loss[i, first_pos].item())
+            self._eval_loss_first_sum += first_loss
             self._eval_loss_first_n   += 1
+
+            first_hit = (int(eval_top1_preds[i, first_pos].item()) == int(shift_labels[i, first_pos].item()))
+            if first_hit:
+                self._eval_loss_first_hit_sum += first_loss
+                self._eval_loss_first_hit_n   += 1
+            else:
+                self._eval_loss_first_miss_sum += first_loss
+                self._eval_loss_first_miss_n   += 1
 
             rest_positions = nz[1:]
             if len(rest_positions) > 0:
                 self._eval_loss_rest_sum += per_token_loss[i, rest_positions].mean().item()
                 self._eval_loss_rest_n   += 1
+
+                for rp in rest_positions:
+                    rp_idx = int(rp.item())
+                    r_loss = float(per_token_loss[i, rp_idx].item())
+                    r_hit  = (int(eval_top1_preds[i, rp_idx].item()) == int(shift_labels[i, rp_idx].item()))
+                    if r_hit:
+                        self._eval_loss_rest_hit_sum += r_loss
+                        self._eval_loss_rest_hit_n   += 1
+                    else:
+                        self._eval_loss_rest_miss_sum += r_loss
+                        self._eval_loss_rest_miss_n   += 1
 
             if first_pos > 0:
                 pred_logit = shift_logits[i, first_pos - 1]
@@ -477,6 +543,24 @@ class Diagnostics:
             # A healthy model: loss_first > loss_rest (first token is hardest).
             # Collapse symptom: loss_first ≈ loss_rest, both very low (predicting SEP).
 
+            # Hit/miss loss: loss conditioned on whether top-1 prediction was correct
+            if self._loss_first_hit_n > 0:
+                metrics["loss/train_first_hit"] = (
+                    self._loss_first_hit_sum / self._loss_first_hit_n
+                )
+            if self._loss_first_miss_n > 0:
+                metrics["loss/train_first_miss"] = (
+                    self._loss_first_miss_sum / self._loss_first_miss_n
+                )
+            if self._loss_rest_hit_n > 0:
+                metrics["loss/train_rest_hit"] = (
+                    self._loss_rest_hit_sum / self._loss_rest_hit_n
+                )
+            if self._loss_rest_miss_n > 0:
+                metrics["loss/train_rest_miss"] = (
+                    self._loss_rest_miss_sum / self._loss_rest_miss_n
+                )
+
             # ── 3. Top-k first-token predictions ──────────────────────────────
 
             if self._first_token_votes:
@@ -566,6 +650,23 @@ class Diagnostics:
                     self._eval_loss_rest_sum / self._eval_loss_rest_n
                 )
 
+            if self._eval_loss_first_hit_n > 0:
+                metrics["loss/eval_first_hit"] = (
+                    self._eval_loss_first_hit_sum / self._eval_loss_first_hit_n
+                )
+            if self._eval_loss_first_miss_n > 0:
+                metrics["loss/eval_first_miss"] = (
+                    self._eval_loss_first_miss_sum / self._eval_loss_first_miss_n
+                )
+            if self._eval_loss_rest_hit_n > 0:
+                metrics["loss/eval_rest_hit"] = (
+                    self._eval_loss_rest_hit_sum / self._eval_loss_rest_hit_n
+                )
+            if self._eval_loss_rest_miss_n > 0:
+                metrics["loss/eval_rest_miss"] = (
+                    self._eval_loss_rest_miss_sum / self._eval_loss_rest_miss_n
+                )
+
             if self._eval_first_token_votes:
                 top   = sorted(
                     self._eval_first_token_votes.items(),
@@ -614,6 +715,14 @@ class Diagnostics:
         self._gen_entropy_n     = 0
         self._logit_max_sum     = 0.0
         self._logit_max_n       = 0
+        self._loss_first_hit_sum  = 0.0
+        self._loss_first_hit_n    = 0
+        self._loss_first_miss_sum = 0.0
+        self._loss_first_miss_n   = 0
+        self._loss_rest_hit_sum   = 0.0
+        self._loss_rest_hit_n     = 0
+        self._loss_rest_miss_sum  = 0.0
+        self._loss_rest_miss_n    = 0
 
     def _reset_eval(self) -> None:
         self._eval_transcript_tokens = 0
@@ -627,6 +736,14 @@ class Diagnostics:
         self._eval_entropy_n         = 0
         self._eval_logit_max_sum     = 0.0
         self._eval_logit_max_n       = 0
+        self._eval_loss_first_hit_sum  = 0.0
+        self._eval_loss_first_hit_n    = 0
+        self._eval_loss_first_miss_sum = 0.0
+        self._eval_loss_first_miss_n   = 0
+        self._eval_loss_rest_hit_sum   = 0.0
+        self._eval_loss_rest_hit_n     = 0
+        self._eval_loss_rest_miss_sum  = 0.0
+        self._eval_loss_rest_miss_n    = 0
 
 
 # ── Console printer ────────────────────────────────────────────────────────────
@@ -651,27 +768,35 @@ def _print_summary(
     print(sep)
 
     if mode == "train":
-        tkn       = m.get("diag/transcript_tokens_per_micro")
-        lf        = m.get("loss/train_first_token")
-        lr        = m.get("loss/train_rest")
-        ge        = m.get("grad/encoder")
-        ga        = m.get("grad/adapter")
-        gl        = m.get("grad/llama")
-        ratio     = m.get("grad/enc_llm_ratio")
-        top5      = m.get("diag/first_token_top5")
-        sep_frac  = m.get("collapse/train_sep_fraction")
-        ent       = m.get("entropy/train")
-        gen_ent   = m.get("diag/gen_entropy_fraction")
-        max_logit = m.get("diag/mean_max_logit")
+        tkn        = m.get("diag/transcript_tokens_per_micro")
+        lf         = m.get("loss/train_first_token")
+        lr         = m.get("loss/train_rest")
+        lf_hit     = m.get("loss/train_first_hit")
+        lf_miss    = m.get("loss/train_first_miss")
+        lr_hit     = m.get("loss/train_rest_hit")
+        lr_miss    = m.get("loss/train_rest_miss")
+        ge         = m.get("grad/encoder")
+        ga         = m.get("grad/adapter")
+        gl         = m.get("grad/llama")
+        ratio      = m.get("grad/enc_llm_ratio")
+        top5       = m.get("diag/first_token_top5")
+        sep_frac   = m.get("collapse/train_sep_fraction")
+        ent        = m.get("entropy/train")
+        gen_ent    = m.get("diag/gen_entropy_fraction")
+        max_logit  = m.get("diag/mean_max_logit")
     else:
-        tkn       = m.get("diag_eval/transcript_tokens_per_micro")
-        lf        = m.get("loss/eval_first_token")
-        lr        = m.get("loss/eval_rest")
+        tkn        = m.get("diag_eval/transcript_tokens_per_micro")
+        lf         = m.get("loss/eval_first_token")
+        lr         = m.get("loss/eval_rest")
+        lf_hit     = m.get("loss/eval_first_hit")
+        lf_miss    = m.get("loss/eval_first_miss")
+        lr_hit     = m.get("loss/eval_rest_hit")
+        lr_miss    = m.get("loss/eval_rest_miss")
         ge = ga = gl = ratio = gen_ent = None
-        top5      = m.get("diag_eval/first_token_top5")
-        sep_frac  = m.get("collapse/eval_sep_fraction")
-        ent       = m.get("entropy/eval")
-        max_logit = m.get("diag_eval/mean_max_logit")
+        top5       = m.get("diag_eval/first_token_top5")
+        sep_frac   = m.get("collapse/eval_sep_fraction")
+        ent        = m.get("entropy/eval")
+        max_logit  = m.get("diag_eval/mean_max_logit")
 
     if tkn is not None:
         print(f"  token budget     {tkn:.1f} transcript tokens/micro-step")
@@ -681,6 +806,15 @@ def _print_summary(
         print(f"  loss first tok   {lf:.3f}   rest {lr:.3f}   {arrow}")
     elif lf is not None:
         print(f"  loss first tok   {lf:.3f}   (rest: n/a)")
+
+    if lf_hit is not None or lf_miss is not None:
+        hit_s  = f"{lf_hit:.3f}" if lf_hit is not None else "  n/a"
+        miss_s = f"{lf_miss:.3f}" if lf_miss is not None else "  n/a"
+        print(f"  first hit/miss   hit {hit_s}   miss {miss_s}")
+    if lr_hit is not None or lr_miss is not None:
+        hit_s  = f"{lr_hit:.3f}" if lr_hit is not None else "  n/a"
+        miss_s = f"{lr_miss:.3f}" if lr_miss is not None else "  n/a"
+        print(f"  rest  hit/miss   hit {hit_s}   miss {miss_s}")
 
     if ge is not None:
         print(f"  grad norms       enc {ge:.3e}  ada {ga:.3e}  llm {gl:.3e}")
