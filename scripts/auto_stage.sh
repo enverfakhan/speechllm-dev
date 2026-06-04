@@ -74,25 +74,20 @@ echo "════════════════════════�
 
 # shellcheck disable=SC2046
 python train.py \
-    --stage 2 \
-    --adapter_ckpt       checkpoints/auto-stage/stage1-final-step1710.pt \
+    --stage 1 \
+    --freeze_encoder \
+    --freeze_llama \
     --shards_file        data/full_training_shards.txt \
     --tokenizer          data/pruned_tokenizer/ \
     --whisper_ckpt       weights/whisper_small.pt \
-    --llama_ckpt         weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/ \
-    --batch_size         8 \
-    --accum_steps        1 \
-    --lr_encoder         1e-6 \
-    --lr_adapter         5e-5 \
-    --lr_llama           1.5e-5 \
-    --warmup_steps       1000 \
-    --beta1              0.99375 \
-    --beta2              0.999 \
+    --llama_ckpt         weights/Llama3.1-8B/Llama3.1-8B/ \
+    --batch_size         64 \
+    --accum_steps        2 \
+    --max_steps          5000 \
     --wandb_project      speechllm-auto-stage \
-    --wandb_run_name     stage2-from-step1710 \
-    --checkpoint_dir     checkpoints/stage2-from-1710 \
+    --wandb_run_name     stage1-overfit-probe \
+    --checkpoint_dir     checkpoints/stage1-overfit-probe \
     --save_every         1000 \
-    --max_steps          50000 \
     --instruction_mode   unformatted \
     --log_every          90 \
     --num_workers        32 \
@@ -100,7 +95,7 @@ python train.py \
     --max_diag_batches   10 \
     --wandb \
     --gradient_checkpointing \
-    |& tee logs/stage2-from-1710.log
+    |& tee logs/stage1-overfit-probe.log
 
 echo "[auto-stage] Uploading checkpoints …"
 gsutil -m cp -r "$CHECKPOINT_DIR"/ \
