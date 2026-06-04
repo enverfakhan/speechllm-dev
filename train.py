@@ -1025,10 +1025,9 @@ def main() -> None:
         print(f"Cross-stage load from adapter checkpoint: {args.adapter_ckpt}")
         _ckpt = torch.load(args.adapter_ckpt, map_location="cpu")
         adapter.load_state_dict(_ckpt["adapter"])
-        if args.stage != 2 and "optimizer_adapter" in _ckpt:
-            # Stage 1: restore adapter optimizer state for LR continuity.
-            # Stage 2: fresh optimizer — stage-1 second moments are stale for the new LR scale.
-            _load_adapter_optimizer_state(optimizer, _ckpt["optimizer_adapter"], adapter)
+        # Optimizer state is not restored: bitsandbytes AdamW8bit moment tensors
+        # are not reliably portable via manual state-dict injection, and Adam
+        # moments re-stabilise within a few steps from a warm adapter init.
         resume_global_step         = _ckpt.get("step", 0)
         resume_epoch               = _ckpt.get("epoch", 0)
         resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
