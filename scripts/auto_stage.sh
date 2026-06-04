@@ -87,7 +87,7 @@ python train.py \
     --wandb_project      speechllm-auto-stage \
     --wandb_run_name     stage1-overfit-probe \
     --checkpoint_dir     checkpoints/stage1-overfit-probe \
-    --save_every         625 \
+    --save_every         360 \
     --instruction_mode   unformatted \
     --log_every          90 \
     --num_workers        32 \
