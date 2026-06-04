@@ -2,7 +2,7 @@
   "uniform_loss": 10.60032790493369,
   "unigram_loss": 7.130623904575242,
   "bigram_loss": 4.987206110793211,
-  "first_token_loss": 3.0,
+  "first_token_loss": 0.7,
   "first_token_loss_original": 4.886218945678192,
   "uniform_perplexity": 40147.99999999999,
   "unigram_perplexity": 1249.6563900843855,

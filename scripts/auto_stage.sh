@@ -34,6 +34,7 @@ SHARDS_FILE="data/full_training_shards.txt"
 TOKENIZER="data/pruned_tokenizer/"
 WHISPER_CKPT="weights/whisper_small.pt"
 LLAMA_CKPT="weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/"
+ADAPTER_CKPT="checkpoints/auto-stage/stage1-final-step810.pt" 
 DIAG_SHARD="data/full-eval-test-dev-clean-other.tar"
 MAX_DIAG_BATCHES=10
 INSTRUCTION_MODE="unformatted"
@@ -77,6 +78,7 @@ python train.py \
     --shards_file        "$SHARDS_FILE" \
     --tokenizer          "$TOKENIZER" \
     --whisper_ckpt       "$WHISPER_CKPT" \
+    --adapter_ckpt       "$ADAPTER_CKPT" \
     --llama_ckpt         "$LLAMA_CKPT" \
     --s1_batch_size      "$S1_BATCH_SIZE" \
     --s1_accum_steps     "$S1_ACCUM_STEPS" \

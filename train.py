@@ -1029,12 +1029,13 @@ def main() -> None:
             # Stage 1: restore adapter optimizer state for LR continuity.
             # Stage 2: fresh optimizer — stage-1 second moments are stale for the new LR scale.
             _load_adapter_optimizer_state(optimizer, _ckpt["optimizer_adapter"], adapter)
+        resume_global_step         = _ckpt.get("step", 0)
         resume_epoch               = _ckpt.get("epoch", 0)
         resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
         resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
         _cross_stage_resume        = True
         print(
-            f"  Cross-stage: epoch={resume_epoch}  "
+            f"  Cross-stage: step={resume_global_step}  epoch={resume_epoch}  "
             f"micro_step_in_epoch={resume_micro_step_in_epoch}"
         )
 
