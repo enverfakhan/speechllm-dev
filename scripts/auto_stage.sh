@@ -74,33 +74,33 @@ echo "════════════════════════�
 
 # shellcheck disable=SC2046
 python train.py \
-    --auto_stage \
-    --shards_file        "$SHARDS_FILE" \
-    --tokenizer          "$TOKENIZER" \
-    --whisper_ckpt       "$WHISPER_CKPT" \
-    --adapter_ckpt       "$ADAPTER_CKPT" \
-    --llama_ckpt         "$LLAMA_CKPT" \
-    --s1_batch_size      "$S1_BATCH_SIZE" \
-    --s1_accum_steps     "$S1_ACCUM_STEPS" \
-    --s1_adapter_lr      "$S1_ADAPTER_LR" \
-    --batch_size         "$S2_BATCH_SIZE" \
-    --accum_steps        "$S2_ACCUM_STEPS" \
-    --lr_encoder         "$LR_ENCODER" \
-    --lr_adapter         "$LR_ADAPTER" \
-    --lr_llama           "$LR_LLAMA" \
-    --warmup_steps       "$WARMUP_STEPS" \
-    --wandb_project      "$WANDB_PROJECT" \
-    --checkpoint_dir     "$CHECKPOINT_DIR" \
+    --stage 2 \
+    --adapter_ckpt       checkpoints/auto-stage/stage1-final-step1710.pt \
+    --shards_file        data/full_training_shards.txt \
+    --tokenizer          data/pruned_tokenizer/ \
+    --whisper_ckpt       weights/whisper_small.pt \
+    --llama_ckpt         weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/ \
+    --batch_size         8 \
+    --accum_steps        1 \
+    --lr_encoder         1e-6 \
+    --lr_adapter         5e-5 \
+    --lr_llama           1.5e-5 \
+    --warmup_steps       1000 \
+    --beta1              0.99375 \
+    --beta2              0.999 \
+    --wandb_project      speechllm-auto-stage \
+    --wandb_run_name     stage2-from-step1710 \
+    --checkpoint_dir     checkpoints/stage2-from-1710 \
     --save_every         1000 \
-    --max_steps          "$MAX_STEPS" \
-    --instruction_mode   "$INSTRUCTION_MODE" \
-    --log_every          "$LOG_EVERY" \
-    --num_workers        "$NUM_WORKERS" \
+    --max_steps          50000 \
+    --instruction_mode   unformatted \
+    --log_every          90 \
+    --num_workers        32 \
+    --diag_shard         data/full-eval-test-dev-clean-other.tar \
+    --max_diag_batches   10 \
     --wandb \
     --gradient_checkpointing \
-    $(_diag_args) \
-    $(_name_arg) \
-    |& tee "$LOG_FILE"
+    |& tee logs/stage2-from-1710.log
 
 echo "[auto-stage] Uploading checkpoints …"
 gsutil -m cp -r "$CHECKPOINT_DIR"/ \
