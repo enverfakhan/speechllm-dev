@@ -28,7 +28,8 @@ from pathlib import Path
 import torch
 
 from data import build_dataloader, build_eval_dataloader, list_shards, PrunedTokenizer
-from model.adapter import AudioAdapter, EvalPrefixBatch, prepare_input
+from model.adapter import AudioAdapter
+from model.sequence import EvalPrefixBatch, prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 from diagnostics import Diagnostics

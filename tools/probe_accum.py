@@ -32,7 +32,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model.adapter import AudioAdapter, prepare_input
+from model.adapter import AudioAdapter
+from model.sequence import prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
