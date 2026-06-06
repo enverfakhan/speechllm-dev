@@ -1,0 +1,65 @@
+# base.yaml — every parameter with its default value.
+# Run configs override these sparsely. Each entry in a run config's `stages:`
+# list is merged onto `stage_defaults` below.
+
+seed: 42
+
+data:
+  shards_file: null            # text file of shard paths (one per line)
+  shards: null                 # OR a brace/glob pattern; set exactly one
+  tokenizer: data/pruned_tokenizer/
+  diag_shard: null             # single .tar shard for in-loop eval
+  eval: {dev_clean: null, dev_other: null, test_clean: null, test_other: null}
+  num_workers: 4
+
+model:
+  stub: false
+  stub_dims: {n_layers: 6, d_model: 512, n_heads: 8, n_kv_heads: 2, intermediate_size: 1024}
+  whisper_ckpt: weights/whisper_small.pt
+  llama_ckpt: weights/Llama3.1-8B/
+  adapter_pca_init: null
+
+optim:
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  grad_clip: {enabled: true, max_norm: 1.0}
+
+logging:
+  wandb: false
+  project: speech-llm-dev
+  run_name: null
+
+checkpoint:
+  dir: checkpoints
+  save_every: null
+
+metrics:
+  train_periods: {grads: 1, logits: 10, loss: 1}
+  eval_every: 10
+  eval_batches: 3
+  eval_batch_size: 8
+  compute_only_on_emit: {logits: false}
+  wer:
+    enabled: false
+    period: 500
+    max_batches: 5
+    readiness_first_token_below: 3.0
+    sample_transcriptions: 20
+
+run:
+  max_steps: null
+  start_stage: 0
+  instruction_mode: unformatted
+
+stage_defaults:
+  name: stage
+  trainable: [adapter]
+  lrs: {adapter: 1.0e-4}
+  schedule: {warmup_steps: 0}
+  batch_size: 64
+  accum_steps: 1
+  instruction_mode: null       # null = inherit run.instruction_mode
+  optimizer_init: fresh
+  exit: {strategy: max_steps, threshold: null, min_steps: 0}
+
+stages: []                     # filled in by run configs
