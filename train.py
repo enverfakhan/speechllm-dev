@@ -29,10 +29,20 @@ import torch
 
 from data import build_dataloader, build_eval_dataloader, list_shards, PrunedTokenizer
 from model.adapter import AudioAdapter
-from model.sequence import EvalPrefixBatch, prepare_input
+from model.sequence import prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 from diagnostics import Diagnostics
+from utils.checkpoint import (
+    save_checkpoint, save_adapter_checkpoint,
+    load_full_checkpoint, load_adapter_checkpoint, ResumeState,
+)
+from utils.optim import (
+    build_stage2_param_groups, make_warmup_scheduler,
+    print_stage2_startup, build_adamw8bit,
+)
+from utils.generate import greedy_generate
+from utils.evaluate import evaluate_all_splits
 
 
 INSTRUCTION_VARIANTS = [
@@ -352,225 +362,6 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-@torch.no_grad()
-def _greedy_generate(
-    encoder: WhisperEncoder,
-    adapter: AudioAdapter,
-    llama: Llama,
-    mel: torch.Tensor,
-    audio_lengths: torch.Tensor,
-    instruction_ids: torch.Tensor,
-    instruction_lengths: torch.Tensor,
-    sep_token_id: int,
-    max_new_tokens: int = 448,
-) -> list[list[int]]:
-    """Greedy-decode a batch of samples in parallel using EvalPrefixBatch.
-
-    All B sequences generate simultaneously. When a sequence emits the SEP
-    token, it is marked finished and subsequent steps append a zero column to
-    maintain tensor alignment without polluting its causal attention history.
-    Generation stops once every sequence is finished or max_new_tokens is reached.
-
-    Prefix lengths differ across samples (different audio durations). EvalPrefixBatch
-    right-pads shorter prefixes with zeros and inserts each generated token at
-    gen_pos[i] rather than at the absolute end, so causal attention never sees
-    a padding zero in the history of real tokens — matching the training distribution.
-
-    Args:
-        mel:                (B, 80, T_mel)
-        audio_lengths:      (B,)
-        instruction_ids:    (B, T_inst_max)
-        instruction_lengths:(B,)
-        sep_token_id:       stop token — generation halts when this is emitted
-        max_new_tokens:     hard cap; applied per sequence
-
-    Returns:
-        list of B lists of pruned token IDs (stop token excluded)
-    """
-    B      = mel.shape[0]
-    device = mel.device
-
-    with torch.amp.autocast("cuda", dtype=torch.float16):
-        enc_out     = encoder(mel)
-        adapter_out = adapter(enc_out)
-
-    pfx = EvalPrefixBatch(
-        adapter_out, audio_lengths,
-        instruction_ids, instruction_lengths,
-        llama.embed_tokens, sep_token_id,
-    )
-
-    finished   = torch.zeros(B, dtype=torch.bool, device=device)
-    generated: list[list[int]] = [[] for _ in range(B)]
-
-    for _ in range(max_new_tokens):
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            logits, _ = llama(pfx.get_batch(), labels=None)  # (B, S, vocab)
-
-        # Read the logit at each sequence's current generation position
-        idx_t    = pfx.logit_indices                          # (B,)
-        next_ids = logits[torch.arange(B, device=device), idx_t, :].argmax(dim=-1)
-
-        for i in range(B):
-            if not finished[i]:
-                if int(next_ids[i].item()) == sep_token_id:
-                    finished[i] = True
-                else:
-                    generated[i].append(int(next_ids[i].item()))
-
-        if finished.all():
-            break
-
-        safe_ids    = next_ids.masked_fill(finished, 0)
-        next_embeds = llama.embed_tokens(safe_ids.unsqueeze(1))  # (B, 1, d)
-        pfx.append(next_embeds, finished)
-
-    return generated
-
-
-def _evaluate_all_splits(
-    encoder: WhisperEncoder,
-    adapter: AudioAdapter,
-    llama: Llama,
-    eval_loaders: dict[str, torch.utils.data.DataLoader],
-    tokenizer: PrunedTokenizer,
-    sep_token_id: int,
-    device: torch.device,
-    max_batches: int | None = None,
-    n_samples: int = 20,
-    sample_seed: int = 0,
-) -> tuple[dict[str, float], list[dict]]:
-    """Run batched greedy WER evaluation on every eval split with both instructions.
-
-    For each split, generation is run twice per batch — once with the unformatted
-    instruction and once with the formatted instruction — and WER is reported
-    separately for each. No text normalisation is applied so the scores reflect
-    whether the model actually follows the formatting instruction.
-
-    Also randomly samples up to n_samples (reference, hypothesis) pairs per split
-    per instruction type for qualitative inspection.
-
-    Args:
-        eval_loaders:  split name → DataLoader (from build_eval_dataloader)
-        tokenizer:     PrunedTokenizer for decoding generated IDs to text
-        max_batches:   cap per split (None = full eval)
-        n_samples:     number of (ref, hyp) pairs to sample per split per type
-        sample_seed:   RNG seed for reproducible sampling
-
-    Returns:
-        wer_dict:    keys like "dev-clean/unformatted" and "dev-clean/formatted"
-        sample_rows: list of dicts with keys split, type, reference, hypothesis
-    """
-    import jiwer
-
-    encoder.eval()
-    adapter.eval()
-    llama.eval()
-
-    results:     dict[str, float] = {}
-    sample_rows: list[dict]       = []
-    rng = random.Random(sample_seed)
-
-    for split_name, loader in eval_loaders.items():
-        pairs_unfmt: list[tuple[str, str]] = []   # (ref, hyp)
-        pairs_fmt:   list[tuple[str, str]] = []
-
-        for batch_idx, batch in enumerate(loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
-
-            (mel, audio_lengths,
-             unfmt_ids, unfmt_lens,
-             fmt_ids,   fmt_lens,
-             refs_unformatted, refs_formatted) = batch
-
-            mel           = mel.to(device)
-            audio_lengths = audio_lengths.to(device)
-            unfmt_ids     = unfmt_ids.to(device)
-            unfmt_lens    = unfmt_lens.to(device)
-            fmt_ids       = fmt_ids.to(device)
-            fmt_lens      = fmt_lens.to(device)
-
-            batch_hyps_unfmt = _greedy_generate(
-                encoder, adapter, llama,
-                mel, audio_lengths, unfmt_ids, unfmt_lens,
-                sep_token_id=sep_token_id,
-            )
-            batch_hyps_fmt = _greedy_generate(
-                encoder, adapter, llama,
-                mel, audio_lengths, fmt_ids, fmt_lens,
-                sep_token_id=sep_token_id,
-            )
-
-            for i in range(len(batch_hyps_unfmt)):
-                pairs_unfmt.append((refs_unformatted[i], tokenizer.decode(batch_hyps_unfmt[i])))
-                pairs_fmt.append((refs_formatted[i],     tokenizer.decode(batch_hyps_fmt[i])))
-
-        refs_unfmt = [r for r, _ in pairs_unfmt]
-        hyps_unfmt = [h for _, h in pairs_unfmt]
-        refs_fmt   = [r for r, _ in pairs_fmt]
-        hyps_fmt   = [h for _, h in pairs_fmt]
-
-        wer_unfmt = jiwer.wer(refs_unfmt, hyps_unfmt) if hyps_unfmt else float("nan")
-        wer_fmt   = jiwer.wer(refs_fmt,   hyps_fmt)   if hyps_fmt   else float("nan")
-
-        n = len(hyps_unfmt)
-        print(f"  WER {split_name}/unformatted: {wer_unfmt:.1%}  ({n} samples)")
-        print(f"  WER {split_name}/formatted:   {wer_fmt:.1%}")
-
-        results[f"{split_name}/unformatted"] = wer_unfmt
-        results[f"{split_name}/formatted"]   = wer_fmt
-
-        # Random sample for qualitative table
-        for ref, hyp in rng.sample(pairs_unfmt, min(n_samples, len(pairs_unfmt))):
-            sample_rows.append({
-                "split": split_name, "type": "unformatted",
-                "reference": ref, "hypothesis": hyp,
-            })
-        for ref, hyp in rng.sample(pairs_fmt, min(n_samples, len(pairs_fmt))):
-            sample_rows.append({
-                "split": split_name, "type": "formatted",
-                "reference": ref, "hypothesis": hyp,
-            })
-
-    encoder.train()
-    adapter.train()
-    llama.train()
-
-    return results, sample_rows
-
-
-def _load_adapter_optimizer_state(
-    optimizer: torch.optim.Optimizer,
-    saved_opt_state: dict,
-    adapter: "AudioAdapter",
-) -> None:
-    """Copy saved adapter optimizer state into the current optimizer.
-
-    Matches adapter parameters by their position within the adapter's own
-    parameter list, then inserts matching state entries into optimizer.state
-    keyed by the live parameter tensors. param_groups are left untouched.
-    """
-    adapter_ptrs = {p.data_ptr(): p for p in adapter.parameters()}
-
-    # Build a flat ordered list of live adapter params as they appear in the optimizer
-    live_adapter_params: list[torch.Tensor] = []
-    for grp in optimizer.param_groups:
-        for p in grp["params"]:
-            if p.data_ptr() in adapter_ptrs:
-                live_adapter_params.append(p)
-
-    # Build a flat ordered list of saved adapter params from saved_opt_state
-    saved_params_flat: list[int] = []
-    for grp in saved_opt_state.get("param_groups", []):
-        saved_params_flat.extend(grp["params"])
-
-    saved_state: dict = saved_opt_state.get("state", {})
-    for live_idx, (live_p, saved_idx) in enumerate(
-        zip(live_adapter_params, saved_params_flat)
-    ):
-        if saved_idx in saved_state:
-            optimizer.state[live_p] = saved_state[saved_idx]
 
 
 def _exhaust_dataloader(loader: torch.utils.data.DataLoader, n_steps: int) -> None:
@@ -593,57 +384,6 @@ def _load_shard_list(args: argparse.Namespace) -> list[str]:
         return [ln.strip() for ln in lines if ln.strip()]
     return list_shards(args.shards)
 
-
-def _build_stage2_param_groups(
-    encoder: WhisperEncoder,
-    adapter: AudioAdapter,
-    llama: Llama,
-    lr_encoder: float,
-    lr_adapter: float,
-    lr_llama: float,
-) -> list[dict]:
-    """Three named param groups for stage-2 joint training.
-
-    Each group carries its own peak LR. A shared warmup scheduler scales all
-    three by the same factor so relative LR ratios are preserved during warmup.
-    """
-    groups = [
-        {"name": "encoder", "params": list(encoder.parameters()), "lr": lr_encoder},
-        {"name": "adapter", "params": list(adapter.parameters()), "lr": lr_adapter},
-        {"name": "llama",   "params": list(llama.parameters()),   "lr": lr_llama},
-    ]
-    for g in groups:
-        assert len(g["params"]) > 0, f"Param group '{g['name']}' is empty — check model construction."
-    return groups
-
-
-def _make_warmup_scheduler(
-    optimizer: torch.optim.Optimizer,
-    warmup_steps: int,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    """Linear ramp 0 → peak over warmup_steps, then constant.
-
-    One lambda scales all param groups; per-group peak comes from each group's
-    base_lr, so a single factor is correct for all three simultaneously.
-    """
-    def lr_lambda(step: int) -> float:
-        return min(step / max(warmup_steps, 1), 1.0)
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
-def _print_stage2_startup(
-    param_groups: list[dict],
-    warmup_steps: int,
-    betas: tuple[float, float],
-) -> None:
-    """Print stage-2 optimizer config to stdout so the run is self-documenting."""
-    print("─" * 60)
-    print("Stage 2 — joint fine-tune config:")
-    for g in param_groups:
-        n = sum(p.numel() for p in g["params"])
-        print(f"  {g['name']:8s}  {n / 1e6:8.1f}M params  peak LR {g['lr']:.2e}")
-    print(f"  warmup_steps={warmup_steps}  betas={betas}  weight_decay=0.01")
-    print("─" * 60)
 
 
 def main() -> None:
@@ -818,23 +558,22 @@ def main() -> None:
         _accum_steps = args.accum_steps
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    import bitsandbytes as bnb
     scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
 
     if args.stage == 2:
         # Three named groups, each with its own peak LR; one warmup factor scales all.
         # Fresh optimizer — do not carry over stage-1 second-moment estimates.
-        _param_groups = _build_stage2_param_groups(
+        _param_groups = build_stage2_param_groups(
             encoder, adapter, llama,
             args.lr_encoder, args.lr_adapter, args.lr_llama,
         )
-        optimizer = bnb.optim.AdamW8bit(
+        optimizer = build_adamw8bit(
             _param_groups,
             betas=(args.beta1, args.beta2),
             weight_decay=0.01,
         )
-        scheduler = _make_warmup_scheduler(optimizer, args.warmup_steps)
-        _print_stage2_startup(_param_groups, args.warmup_steps, (args.beta1, args.beta2))
+        scheduler = make_warmup_scheduler(optimizer, args.warmup_steps)
+        print_stage2_startup(_param_groups, args.warmup_steps, (args.beta1, args.beta2))
     else:
         # Stage 1: adapter-only or partial unfreeze (existing behaviour).
         # In staged mode the encoder is excluded here; added via add_param_group on thaw.
@@ -845,7 +584,7 @@ def main() -> None:
         _param_groups.append({"params": adapter.parameters(), "lr": args.s1_adapter_lr})
         if not args.freeze_llama and not args.auto_stage:
             _param_groups.append({"params": llama.parameters(), "lr": 1e-5})
-        optimizer = bnb.optim.AdamW8bit(
+        optimizer = build_adamw8bit(
             _param_groups,
             betas=(args.beta1, args.beta2),
             weight_decay=0.01,
@@ -994,29 +733,15 @@ def main() -> None:
 
     if args.resume_ckpt:
         print(f"Resuming from checkpoint: {args.resume_ckpt}")
-        _ckpt = torch.load(args.resume_ckpt, map_location="cpu")
-        if "encoder" in _ckpt:
-            encoder.load_state_dict(_ckpt["encoder"])
-        if "adapter" in _ckpt:
-            adapter.load_state_dict(_ckpt["adapter"])
-        if "llama" in _ckpt:
-            llama.load_state_dict(_ckpt["llama"])
-        optimizer.load_state_dict(_ckpt["optimizer"])
-        scaler.load_state_dict(_ckpt["scaler"])
-        if scheduler is not None:
-            if "scheduler" in _ckpt:
-                # Normal path: checkpoint was saved after scheduler state was added.
-                scheduler.load_state_dict(_ckpt["scheduler"])
-            else:
-                # Checkpoint predates scheduler saving (e.g. the step-540 crash).
-                # Reconstruct by fast-forwarding: scheduler.step() was called once
-                # per optimizer step, so last_epoch == resume_global_step.
-                for _ in range(resume_global_step):
-                    scheduler.step()
-        resume_global_step         = _ckpt["step"]
-        resume_epoch               = _ckpt.get("epoch", 0)
-        resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
-        resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
+        _rs = load_full_checkpoint(
+            args.resume_ckpt,
+            encoder=encoder, adapter=adapter, llama=llama,
+            optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+        )
+        resume_global_step         = _rs.step
+        resume_epoch               = _rs.epoch
+        resume_micro_step_in_epoch = _rs.micro_step_in_epoch
+        resume_batch_size          = _rs.batch_size if _rs.batch_size is not None else args.batch_size
         _same_stage_resume         = True
         print(
             f"  Resumed at step={resume_global_step}  epoch={resume_epoch}  "
@@ -1024,15 +749,11 @@ def main() -> None:
         )
     elif args.adapter_ckpt:
         print(f"Cross-stage load from adapter checkpoint: {args.adapter_ckpt}")
-        _ckpt = torch.load(args.adapter_ckpt, map_location="cpu")
-        adapter.load_state_dict(_ckpt["adapter"])
-        # Optimizer state is not restored: bitsandbytes AdamW8bit moment tensors
-        # are not reliably portable via manual state-dict injection, and Adam
-        # moments re-stabilise within a few steps from a warm adapter init.
-        resume_global_step         = _ckpt.get("step", 0)
-        resume_epoch               = _ckpt.get("epoch", 0)
-        resume_micro_step_in_epoch = _ckpt.get("micro_step_in_epoch", 0)
-        resume_batch_size          = _ckpt.get("batch_size", args.batch_size)
+        _rs = load_adapter_checkpoint(args.adapter_ckpt, adapter=adapter)
+        resume_global_step         = _rs.step
+        resume_epoch               = _rs.epoch
+        resume_micro_step_in_epoch = _rs.micro_step_in_epoch
+        resume_batch_size          = _rs.batch_size if _rs.batch_size is not None else args.batch_size
         _cross_stage_resume        = True
         print(
             f"  Cross-stage: step={resume_global_step}  epoch={resume_epoch}  "
@@ -1181,37 +902,27 @@ def main() -> None:
                 if _save_regular or _save_staged:
                     ckpt_dir  = args.checkpoint_dir
                     ckpt_path = ckpt_dir / f"step_{global_step:07d}.pt"
-                    _ckpt_dict = {
-                        "step":                global_step,
-                        "epoch":               epoch,
-                        "micro_step_in_epoch": micro_step_in_epoch,
-                        "batch_size":          _batch_size,
-                        "adapter":             adapter.state_dict(),
-                        "optimizer":           optimizer.state_dict(),
-                        "scaler":              scaler.state_dict(),
-                    }
-                    if scheduler is not None:
-                        _ckpt_dict["scheduler"] = scheduler.state_dict()
-                    if args.stage == 2 or not args.freeze_encoder:
-                        _ckpt_dict["encoder"] = encoder.state_dict()
-                    if args.stage == 2 or not args.freeze_llama:
-                        _ckpt_dict["llama"] = llama.state_dict()
-                    torch.save(_ckpt_dict, ckpt_path)
+                    save_checkpoint(
+                        ckpt_path,
+                        step=global_step, epoch=epoch,
+                        micro_step_in_epoch=micro_step_in_epoch,
+                        batch_size=_batch_size,
+                        adapter=adapter, optimizer=optimizer, scaler=scaler,
+                        scheduler=scheduler,
+                        encoder=encoder if (args.stage == 2 or not args.freeze_encoder) else None,
+                        llama=llama     if (args.stage == 2 or not args.freeze_llama)   else None,
+                    )
                     print(f"Checkpoint saved → {ckpt_path}")
 
                     # Adapter-only file for cross-stage loading (stage 1 only)
                     if args.freeze_encoder and args.freeze_llama:
                         adapter_ckpt_path = ckpt_dir / f"adapter-step{global_step}.pt"
-                        torch.save(
-                            {
-                                "step":                global_step,
-                                "epoch":               epoch,
-                                "micro_step_in_epoch": micro_step_in_epoch,
-                                "batch_size":          args.batch_size,
-                                "adapter":             adapter.state_dict(),
-                                "optimizer_adapter":   optimizer.state_dict(),
-                            },
+                        save_adapter_checkpoint(
                             adapter_ckpt_path,
+                            step=global_step, epoch=epoch,
+                            micro_step_in_epoch=micro_step_in_epoch,
+                            batch_size=args.batch_size,
+                            adapter=adapter, optimizer=optimizer,
                         )
                         print(f"Adapter checkpoint saved → {adapter_ckpt_path}")
 
@@ -1256,14 +967,13 @@ def main() -> None:
 
                             # Save stage-1 final checkpoint before optimizer swap
                             _s1_path = args.checkpoint_dir / f"stage1-final-step{global_step}.pt"
-                            torch.save({
-                                "step":                global_step,
-                                "epoch":               epoch,
-                                "micro_step_in_epoch": micro_step_in_epoch,
-                                "batch_size":          _batch_size,
-                                "adapter":             adapter.state_dict(),
-                                "optimizer_adapter":   optimizer.state_dict(),
-                            }, _s1_path)
+                            save_adapter_checkpoint(
+                                _s1_path,
+                                step=global_step, epoch=epoch,
+                                micro_step_in_epoch=micro_step_in_epoch,
+                                batch_size=_batch_size,
+                                adapter=adapter, optimizer=optimizer,
+                            )
                             print(f"[auto-stage] Stage-1 final checkpoint → {_s1_path}")
 
                             # Unfreeze encoder + Llama
@@ -1272,18 +982,18 @@ def main() -> None:
 
                             # Discard stage-1 optimizer; create fresh stage-2 optimizer
                             del optimizer
-                            _s2_param_groups = _build_stage2_param_groups(
+                            _s2_param_groups = build_stage2_param_groups(
                                 encoder, adapter, llama,
                                 args.lr_encoder, args.lr_adapter, args.lr_llama,
                             )
-                            optimizer = bnb.optim.AdamW8bit(
+                            optimizer = build_adamw8bit(
                                 _s2_param_groups,
                                 betas=(args.beta1, args.beta2),
                                 weight_decay=0.01,
                             )
                             optimizer.zero_grad()
-                            scheduler = _make_warmup_scheduler(optimizer, args.warmup_steps)
-                            _print_stage2_startup(_s2_param_groups, args.warmup_steps, (args.beta1, args.beta2))
+                            scheduler = make_warmup_scheduler(optimizer, args.warmup_steps)
+                            print_stage2_startup(_s2_param_groups, args.warmup_steps, (args.beta1, args.beta2))
 
                             # Reset stage-2 diagnostic flags so checks re-fire for stage 2
                             _stage2_enc_grad_checked = False
@@ -1481,35 +1191,25 @@ def main() -> None:
                             })
                         _es_ckpt_dir  = args.checkpoint_dir
                         _es_ckpt_path = _es_ckpt_dir / f"checkpoint-step{global_step}-early-stop.pt"
-                        _es_ckpt_dict = {
-                            "step":                global_step,
-                            "epoch":               epoch,
-                            "micro_step_in_epoch": micro_step_in_epoch,
-                            "batch_size":          _batch_size,
-                            "adapter":             adapter.state_dict(),
-                            "optimizer":           optimizer.state_dict(),
-                            "scaler":              scaler.state_dict(),
-                        }
-                        if scheduler is not None:
-                            _es_ckpt_dict["scheduler"] = scheduler.state_dict()
-                        if args.stage == 2 or not args.freeze_encoder:
-                            _es_ckpt_dict["encoder"] = encoder.state_dict()
-                        if args.stage == 2 or not args.freeze_llama:
-                            _es_ckpt_dict["llama"] = llama.state_dict()
-                        torch.save(_es_ckpt_dict, _es_ckpt_path)
+                        save_checkpoint(
+                            _es_ckpt_path,
+                            step=global_step, epoch=epoch,
+                            micro_step_in_epoch=micro_step_in_epoch,
+                            batch_size=_batch_size,
+                            adapter=adapter, optimizer=optimizer, scaler=scaler,
+                            scheduler=scheduler,
+                            encoder=encoder if (args.stage == 2 or not args.freeze_encoder) else None,
+                            llama=llama     if (args.stage == 2 or not args.freeze_llama)   else None,
+                        )
                         print(f"Early-stop checkpoint saved → {_es_ckpt_path}")
                         if args.freeze_encoder and args.freeze_llama:
                             _es_adapter_path = _es_ckpt_dir / f"adapter-step{global_step}-early-stop.pt"
-                            torch.save(
-                                {
-                                    "step":                global_step,
-                                    "epoch":               epoch,
-                                    "micro_step_in_epoch": micro_step_in_epoch,
-                                    "batch_size":          args.batch_size,
-                                    "adapter":             adapter.state_dict(),
-                                    "optimizer_adapter":   optimizer.state_dict(),
-                                },
+                            save_adapter_checkpoint(
                                 _es_adapter_path,
+                                step=global_step, epoch=epoch,
+                                micro_step_in_epoch=micro_step_in_epoch,
+                                batch_size=args.batch_size,
+                                adapter=adapter, optimizer=optimizer,
                             )
                             print(f"Early-stop adapter checkpoint saved → {_es_adapter_path}")
                         done = True
@@ -1529,42 +1229,32 @@ def main() -> None:
 
     # ── Final checkpoint (always saved at end of training) ───────────────────
     _final_ckpt_path = args.checkpoint_dir / f"checkpoint-step{global_step}-final.pt"
-    _final_ckpt_dict = {
-        "step":                global_step,
-        "epoch":               epoch,
-        "micro_step_in_epoch": micro_step_in_epoch,
-        "batch_size":          _batch_size,
-        "adapter":             adapter.state_dict(),
-        "optimizer":           optimizer.state_dict(),
-        "scaler":              scaler.state_dict(),
-    }
-    if scheduler is not None:
-        _final_ckpt_dict["scheduler"] = scheduler.state_dict()
-    if args.stage == 2 or not args.freeze_encoder:
-        _final_ckpt_dict["encoder"] = encoder.state_dict()
-    if args.stage == 2 or not args.freeze_llama:
-        _final_ckpt_dict["llama"] = llama.state_dict()
-    torch.save(_final_ckpt_dict, _final_ckpt_path)
+    save_checkpoint(
+        _final_ckpt_path,
+        step=global_step, epoch=epoch,
+        micro_step_in_epoch=micro_step_in_epoch,
+        batch_size=_batch_size,
+        adapter=adapter, optimizer=optimizer, scaler=scaler,
+        scheduler=scheduler,
+        encoder=encoder if (args.stage == 2 or not args.freeze_encoder) else None,
+        llama=llama     if (args.stage == 2 or not args.freeze_llama)   else None,
+    )
     print(f"Final checkpoint saved → {_final_ckpt_path}")
     if args.freeze_encoder and args.freeze_llama:
         _final_adapter_path = args.checkpoint_dir / f"adapter-step{global_step}-final.pt"
-        torch.save(
-            {
-                "step":                global_step,
-                "epoch":               epoch,
-                "micro_step_in_epoch": micro_step_in_epoch,
-                "batch_size":          args.batch_size,
-                "adapter":             adapter.state_dict(),
-                "optimizer_adapter":   optimizer.state_dict(),
-            },
+        save_adapter_checkpoint(
             _final_adapter_path,
+            step=global_step, epoch=epoch,
+            micro_step_in_epoch=micro_step_in_epoch,
+            batch_size=args.batch_size,
+            adapter=adapter, optimizer=optimizer,
         )
         print(f"Final adapter checkpoint saved → {_final_adapter_path}")
 
     # ── End-of-training WER evaluation ───────────────────────────────────────
     if args.eval_at_end and eval_loaders:
         print("Running end-of-training WER evaluation …")
-        wer_results, sample_rows = _evaluate_all_splits(
+        wer_results, sample_rows = evaluate_all_splits(
             encoder, adapter, llama,
             eval_loaders, tokenizer, sep_token_id, device,
             max_batches=args.max_eval_batches,
