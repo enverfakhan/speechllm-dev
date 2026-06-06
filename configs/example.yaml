@@ -1,7 +1,7 @@
 # example.yaml — illustrative two-stage run (not a real experiment).
 data:
-  shards_file: data/subset_shards.txt
-  diag_shard: data/dev-diag.tar
+  shards_file: data_dev/dev_train_shards.txt
+  diag_shard: dev_shards/dev-diag-1183-000000.tar
 logging: {wandb: false, project: speech-llm-dev}
 checkpoint: {dir: checkpoints/example, save_every: 360}
 run: {max_steps: 5000}

@@ -61,13 +61,15 @@ class DataConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     """Model architecture and checkpoint paths."""
-    stub:             bool       = False
-    stub_dims:        dict       = field(default_factory=lambda: {
+    stub:                   bool       = False
+    stub_dims:              dict       = field(default_factory=lambda: {
         "n_layers": 6, "d_model": 512, "n_heads": 8, "n_kv_heads": 2, "intermediate_size": 1024,
     })
-    whisper_ckpt:     Path | None = Path("weights/whisper_small.pt")
-    llama_ckpt:       Path | None = Path("weights/Llama3.1-8B/")
-    adapter_pca_init: Path | None = None
+    whisper_ckpt:           Path | None = Path("weights/whisper_small.pt")
+    llama_ckpt:             Path | None = Path("weights/Llama3.1-8B/")
+    adapter_pca_init:       Path | None = None
+    gradient_checkpointing: bool        = False
+    init_from:              Path | None = None
 
 
 @dataclass(frozen=True)
@@ -197,11 +199,13 @@ def _build_data(d: dict) -> DataConfig:
 
 def _build_model(d: dict) -> ModelConfig:
     return ModelConfig(
-        stub             = bool(d.get("stub", False)),
-        stub_dims        = dict(d.get("stub_dims") or {}),
-        whisper_ckpt     = _opt_path(d.get("whisper_ckpt")),
-        llama_ckpt       = _opt_path(d.get("llama_ckpt")),
-        adapter_pca_init = _opt_path(d.get("adapter_pca_init")),
+        stub                   = bool(d.get("stub", False)),
+        stub_dims              = dict(d.get("stub_dims") or {}),
+        whisper_ckpt           = _opt_path(d.get("whisper_ckpt")),
+        llama_ckpt             = _opt_path(d.get("llama_ckpt")),
+        adapter_pca_init       = _opt_path(d.get("adapter_pca_init")),
+        gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
+        init_from              = _opt_path(d.get("init_from")),
     )
 
 
@@ -374,12 +378,21 @@ def _validate(cfg: Config) -> None:
     wer = cfg.metrics.wer
     if wer.period <= 0:
         raise ValueError(f"metrics.wer.period: must be > 0, got {wer.period}")
+    if wer.period % cfg.metrics.eval_every != 0:
+        raise ValueError(
+            f"metrics.wer.period: must be a positive multiple of metrics.eval_every "
+            f"({cfg.metrics.eval_every}), got {wer.period}"
+        )
     if wer.max_batches <= 0:
         raise ValueError(f"metrics.wer.max_batches: must be > 0, got {wer.max_batches}")
     if wer.sample_transcriptions <= 0:
         raise ValueError(
             f"metrics.wer.sample_transcriptions: must be > 0, got {wer.sample_transcriptions}"
         )
+
+    # model
+    if cfg.model.init_from is not None and not Path(cfg.model.init_from).exists():
+        raise ValueError(f"model.init_from: path does not exist: {cfg.model.init_from}")
 
     # per-stage
     for i, stage in enumerate(cfg.stages):

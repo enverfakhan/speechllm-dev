@@ -18,6 +18,8 @@ model:
   whisper_ckpt: weights/whisper_small.pt
   llama_ckpt: weights/Llama3.1-8B/
   adapter_pca_init: null
+  gradient_checkpointing: false  # enable on Llama for non-stub GCP runs
+  init_from: null                # path to checkpoint for weights-only warm-start
 
 optim:
   betas: [0.9, 0.999]

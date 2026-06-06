@@ -1,0 +1,825 @@
+"""Config-driven multi-stage training loop for speech-llm.
+
+Replaces train.py with a declarative, stage-based design driven by YAML configs.
+A single-stage stub run on the same seed and data produces identical loss
+trajectories to train.py.
+
+Usage:
+    python training.py --config configs/example.yaml [--stub] [--resume path/to/ckpt.pt]
+    python training.py --config configs/example.yaml --wandb --run-name my-run
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from data import build_dataloader, list_shards, PrunedTokenizer
+from model.adapter import AudioAdapter
+from model.llama import Llama, LlamaConfig
+from model.sequence import prepare_input
+from model.whisper_encoder import WhisperEncoder
+from metrics import MetricCollector, render
+from stages import Stage, StageContext
+from utils.checkpoint import (
+    load_full_checkpoint,
+    save_adapter_checkpoint,
+    save_checkpoint,
+)
+from utils.config import Config, load_config
+from utils.evaluate import compute_wer
+from utils.generate import greedy_generate
+
+
+# ── Constants shared with build_vocab.py / preprocess.py ─────────────────────
+
+INSTRUCTION_VARIANTS: list[str] = [
+    "Transcribe the following audio without formatting.",
+    "Transcribe the following audio with proper formatting.",
+]
+
+_INSTRUCTION_PAIRS: list[tuple[str, str]] = [
+    (INSTRUCTION_VARIANTS[0], "unformatted.txt"),
+    (INSTRUCTION_VARIANTS[1], "formatted.txt"),
+]
+
+_EMA_ALPHA = 0.98
+
+
+# ── Model construction ────────────────────────────────────────────────────────
+
+def build_models(
+    cfg: Config,
+    device: torch.device,
+) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
+    """Instantiate and initialise all three model components.
+
+    Load order:
+      1. Architecture (stub or full)
+      2. Pretrained weights (whisper + llama) if not stub
+      3. Warm-start weights from cfg.model.init_from if set (weights only, no opt state)
+    """
+    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
+        vocab_size = json.load(f)["vocab_size"]
+
+    if cfg.model.stub:
+        llama_cfg = LlamaConfig(**cfg.model.stub_dims, vocab_size=vocab_size)
+        llama_dim = cfg.model.stub_dims["d_model"]
+        print("STUB mode: tiny randomly-initialised model (no pretrained weights).")
+    else:
+        llama_cfg = LlamaConfig(vocab_size=vocab_size)
+        llama_dim = 4096
+
+    encoder = WhisperEncoder()
+    adapter = AudioAdapter(
+        llama_dim=llama_dim,
+        pca_init_path=cfg.model.adapter_pca_init,
+    )
+    llama = Llama(llama_cfg)
+
+    if not cfg.model.stub:
+        if cfg.model.whisper_ckpt is None or cfg.model.llama_ckpt is None:
+            raise ValueError(
+                "model.whisper_ckpt and model.llama_ckpt are required when model.stub is false."
+            )
+        print("Loading Whisper encoder weights …")
+        encoder.load_openai_weights(cfg.model.whisper_ckpt)
+
+        vocab_map_path = cfg.data.tokenizer / "vocab_map.json"
+        with vocab_map_path.open() as f:
+            vocab_map = json.load(f)
+        print("Loading Llama transformer weights …")
+        llama.load_meta_weights(cfg.model.llama_ckpt, vocab_map=vocab_map)
+    elif cfg.model.whisper_ckpt is not None:
+        # Stub run that still wants pretrained encoder weights (unusual but supported).
+        print("Loading Whisper encoder weights (stub mode) …")
+        encoder.load_openai_weights(cfg.model.whisper_ckpt)
+
+    # Warm-start: load saved model states on top of (or instead of) pretrained weights.
+    # Adapter is always loaded; encoder/llama only when present in the checkpoint.
+    if cfg.model.init_from is not None:
+        print(f"Warm-starting from {cfg.model.init_from} …")
+        ws = torch.load(cfg.model.init_from, map_location="cpu")
+        adapter.load_state_dict(ws["adapter"])
+        if "encoder" in ws:
+            encoder.load_state_dict(ws["encoder"])
+        if "llama" in ws:
+            llama.load_state_dict(ws["llama"])
+        print("  Warm-start complete.")
+
+    encoder = encoder.to(device)
+    adapter = adapter.to(device)
+    llama   = llama.to(device)
+
+    if cfg.model.gradient_checkpointing:
+        if cfg.model.stub:
+            print("[warn] model.gradient_checkpointing ignored in stub mode")
+        else:
+            llama.enable_gradient_checkpointing()
+            print("[info] gradient checkpointing enabled on Llama")
+
+    encoder.train()
+    adapter.train()
+    llama.train()
+
+    n_enc = sum(p.numel() for p in encoder.parameters())
+    n_ada = sum(p.numel() for p in adapter.parameters())
+    n_llm = sum(p.numel() for p in llama.parameters())
+    print(
+        f"Parameters — encoder: {n_enc / 1e6:.1f}M  "
+        f"adapter: {n_ada / 1e6:.1f}M  "
+        f"llama: {n_llm / 1e6:.0f}M  "
+        f"total: {(n_enc + n_ada + n_llm) / 1e9:.2f}B"
+    )
+    return encoder, adapter, llama
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def fast_forward(loader: torch.utils.data.DataLoader, n: int) -> None:
+    """Advance n batches from loader without processing them.
+
+    Mirrors _exhaust_dataloader in train.py: creates a separate iterator
+    that is discarded after n steps.  The caller's main iterator is unaffected,
+    but micro_step_in_epoch is updated by the caller to reflect the skip.
+    """
+    it = iter(loader)
+    for _ in range(n):
+        try:
+            next(it)
+        except StopIteration:
+            break
+
+
+def run_eval_pass(
+    encoder:      WhisperEncoder,
+    adapter:      AudioAdapter,
+    llama:        Llama,
+    diag_loader:  torch.utils.data.DataLoader,
+    diag_iter:    Any,
+    metrics:      MetricCollector,
+    sep_token_id: int,
+    device:       torch.device,
+    n_batches:    int,
+    global_step:  int,
+) -> tuple[dict, list, Any]:
+    """Run n_batches of teacher-forced eval on the diag shard.
+
+    Returns (eval_metrics, retained_batches, updated_diag_iter).
+    Retained batches are 6-tuples of device tensors, reused by maybe_run_wer.
+    """
+    encoder.eval()
+    adapter.eval()
+    llama.eval()
+
+    retained: list[tuple] = []
+
+    for _ in range(n_batches):
+        try:
+            batch = next(diag_iter)
+        except StopIteration:
+            diag_iter = iter(diag_loader)
+            batch = next(diag_iter)
+
+        (d_mel, d_audio_len,
+         d_inst_ids, d_inst_lens,
+         d_trans_ids, d_trans_lens) = [t.to(device) for t in batch]
+
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+            d_enc  = encoder(d_mel)
+            d_ada  = adapter(d_enc)
+            d_inp, d_lbl = prepare_input(
+                d_ada, d_audio_len,
+                d_inst_ids, d_inst_lens,
+                d_trans_ids, d_trans_lens,
+                llama.embed_tokens, sep_token_id,
+            )
+            d_logits, d_loss = llama(d_inp, d_lbl)
+
+        metrics.observe("eval", global_step, logits=d_logits, labels=d_lbl, loss=d_loss.detach())
+        retained.append((d_mel, d_audio_len, d_inst_ids, d_inst_lens, d_trans_ids, d_trans_lens))
+
+    encoder.train()
+    adapter.train()
+    llama.train()
+
+    eval_metrics = metrics.flush("eval", global_step)
+    return eval_metrics, retained, diag_iter
+
+
+def maybe_run_wer(
+    cfg:          Config,
+    eval_metrics: dict,
+    global_step:  int,
+    eval_subset:  list[tuple],
+    encoder:      WhisperEncoder,
+    adapter:      AudioAdapter,
+    llama:        Llama,
+    tokenizer:    PrunedTokenizer,
+    sep_token_id: int,
+    device:       torch.device,
+    use_wandb:    bool,
+) -> dict:
+    """Optionally run greedy WER decode on retained eval batches.
+
+    Returns {} when conditions are not met, {"wer/diag": float, ...} otherwise.
+    Readiness gate: only run when eval_first_token is below the configured threshold.
+    """
+    wer_cfg = cfg.metrics.wer
+    if not wer_cfg.enabled:
+        return {}
+    if global_step % wer_cfg.period != 0:
+        return {}
+    ftl = eval_metrics.get("loss/eval_first_token")
+    if ftl is None or ftl >= wer_cfg.readiness_first_token_below:
+        return {}
+
+    encoder.eval()
+    adapter.eval()
+    llama.eval()
+
+    all_refs: list[str] = []
+    all_hyps: list[str] = []
+    sample_pairs: list[tuple[str, str]] = []
+
+    for batch in eval_subset[: wer_cfg.max_batches]:
+        (mel, audio_lengths, inst_ids, inst_lens, trans_ids, trans_lens) = batch
+
+        gen_ids = greedy_generate(
+            encoder, adapter, llama,
+            mel, audio_lengths, inst_ids, inst_lens,
+            sep_token_id,
+        )
+        for i in range(len(gen_ids)):
+            hyp = tokenizer.decode(gen_ids[i])
+            ref = tokenizer.decode(trans_ids[i, : int(trans_lens[i].item())].tolist())
+            all_refs.append(ref)
+            all_hyps.append(hyp)
+            sample_pairs.append((ref, hyp))
+
+    encoder.train()
+    adapter.train()
+    llama.train()
+
+    wer_val = compute_wer(all_refs, all_hyps)
+    print(f"  WER/diag step {global_step}: {wer_val:.1%}  ({len(all_hyps)} samples)")
+
+    n_show = min(wer_cfg.sample_transcriptions, len(sample_pairs))
+    for ref, hyp in sample_pairs[:n_show]:
+        print(f"    REF: {ref[:80]}")
+        print(f"    HYP: {hyp[:80]}")
+
+    out: dict = {"wer/diag": wer_val}
+
+    if use_wandb:
+        import wandb
+        rows = sample_pairs[: wer_cfg.sample_transcriptions]
+        tbl  = wandb.Table(columns=["step", "reference", "hypothesis"])
+        for ref, hyp in rows:
+            tbl.add_data(global_step, ref, hyp)
+        out["wer/diag_transcriptions"] = tbl
+
+    return out
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> None:
+    """Load config and run the multi-stage training loop."""
+    cfg = load_config(argv=argv)
+
+    random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── Pruned vocab ──────────────────────────────────────────────────────────
+    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
+        _pc         = json.load(f)
+    sep_token_id = _pc["sep_token_id"]
+    print(f"Pruned vocab: {_pc['vocab_size']} tokens  SEP id: {sep_token_id}")
+
+    # ── Baselines (for W&B reference lines) ───────────────────────────────────
+    baseline_path = Path("baselines.json")
+    baselines_data: dict = json.loads(baseline_path.read_text()) if baseline_path.exists() else {}
+
+    # ── Models ────────────────────────────────────────────────────────────────
+    encoder, adapter, llama = build_models(cfg, device)
+
+    # ── Persistent scaler (shared across all stages) ──────────────────────────
+    scaler = torch.amp.GradScaler("cuda")
+
+    # ── Tokenizer + MetricCollector ───────────────────────────────────────────
+    tokenizer = PrunedTokenizer(cfg.data.tokenizer)
+    metrics   = MetricCollector(
+        tokenizer    = tokenizer,
+        sep_token_id = sep_token_id,
+        log_every    = cfg.metrics.eval_every,
+        top_k        = 5,
+    )
+
+    # ── Shard list ────────────────────────────────────────────────────────────
+    if cfg.data.shards_file is not None:
+        lines     = cfg.data.shards_file.read_text().splitlines()
+        all_shards = [ln.strip() for ln in lines if ln.strip()]
+    else:
+        all_shards = list_shards(cfg.data.shards)
+    if not all_shards:
+        raise FileNotFoundError("No shards found; check data.shards_file or data.shards.")
+    print(f"Training on {len(all_shards)} shards.")
+
+    # ── Instruction pairs for StageContext ────────────────────────────────────
+    run_mode = cfg.run.instruction_mode
+    if run_mode == "unformatted":
+        diag_instruction_pairs = [_INSTRUCTION_PAIRS[0]]
+    elif run_mode == "formatted":
+        diag_instruction_pairs = [_INSTRUCTION_PAIRS[1]]
+    else:
+        diag_instruction_pairs = list(_INSTRUCTION_PAIRS)
+
+    # ── Diagnostic shard dataloader ───────────────────────────────────────────
+    _diag_loader: torch.utils.data.DataLoader | None = None
+    _diag_iter:   Any                                = None
+
+    if cfg.data.diag_shard is not None:
+        if not cfg.data.diag_shard.exists():
+            raise FileNotFoundError(f"data.diag_shard not found: {cfg.data.diag_shard}")
+        _diag_loader = build_dataloader(
+            [str(cfg.data.diag_shard)],
+            tokenizer_path        = cfg.data.tokenizer,
+            sep_token_id          = sep_token_id,
+            batch_size            = cfg.metrics.eval_batch_size,
+            num_workers           = 0,
+            instruction_variants  = diag_instruction_pairs,
+            shuffle_buffer        = 100,
+            partial               = True,
+        )
+        _diag_iter = iter(_diag_loader)
+        print(f"Diagnostic shard: {cfg.data.diag_shard}")
+
+    # ── StageContext + Stage objects ──────────────────────────────────────────
+    ctx = StageContext(
+        shards               = all_shards,
+        tokenizer_path       = cfg.data.tokenizer,
+        sep_token_id         = sep_token_id,
+        num_workers          = cfg.data.num_workers,
+        seed                 = cfg.seed,
+        instruction_pairs    = list(_INSTRUCTION_PAIRS),
+        run_instruction_mode = cfg.run.instruction_mode,
+        betas                = cfg.optim.betas,
+        weight_decay         = cfg.optim.weight_decay,
+        shuffle_buffer       = 1000,
+    )
+    stages = [Stage(sc, ctx) for sc in cfg.stages]
+
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    use_wandb = cfg.logging.wandb
+    if use_wandb:
+        import os
+        import wandb as _wandb
+        api_key = os.environ.get("WANDB_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "WANDB_API_KEY is not set. "
+                "Add 'export WANDB_API_KEY=...' to ~/.bashrc and reload your shell."
+            )
+        _wandb.init(
+            project = cfg.logging.project,
+            name    = cfg.logging.run_name,
+            config  = {
+                "seed":                    cfg.seed,
+                "n_stages":                len(cfg.stages),
+                "instruction_mode":        cfg.run.instruction_mode,
+                "stub":                    cfg.model.stub,
+                "gradient_checkpointing":  cfg.model.gradient_checkpointing,
+                "resume":                  str(cfg.resume) if cfg.resume else None,
+                "init_from":               str(cfg.model.init_from) if cfg.model.init_from else None,
+            },
+        )
+
+    # ── Checkpoint directory ──────────────────────────────────────────────────
+    ckpt_dir = cfg.checkpoint.dir
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Loop state ────────────────────────────────────────────────────────────
+    global_step         = 0
+    epoch               = 0
+    step_in_stage       = 0
+    _resume_consumed    = False   # True once cfg.resume has been loaded and applied
+    prev_opt: torch.optim.Optimizer | None = None
+
+    train_start = time.perf_counter()
+
+    # ── Stage loop ────────────────────────────────────────────────────────────
+    stage_idx = cfg.run.start_stage
+    optimizer: torch.optim.Optimizer | None = None
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+
+    while stage_idx < len(stages):
+        stage     = stages[stage_idx]
+        stage_cfg = cfg.stages[stage_idx]
+
+        optimizer, scheduler = stage.setup(encoder, adapter, llama, prev_opt)
+
+        # ── Resume: load checkpoint into this stage's optimizer ───────────────
+        resuming_here = (
+            cfg.resume is not None
+            and stage_idx == cfg.run.start_stage
+            and not _resume_consumed
+        )
+        resume_mse: int = 0
+        resume_bs:  int = stage_cfg.batch_size
+
+        if resuming_here:
+            print(f"Resuming from checkpoint: {cfg.resume}")
+            rs = load_full_checkpoint(
+                cfg.resume,
+                encoder   = encoder,
+                adapter   = adapter,
+                llama     = llama,
+                optimizer = optimizer,
+                scaler    = scaler,
+                scheduler = scheduler,
+            )
+            global_step    = rs.step
+            epoch          = rs.epoch
+            step_in_stage  = rs.step_in_stage
+            resume_mse     = rs.micro_step_in_epoch
+            resume_bs      = rs.batch_size if rs.batch_size is not None else stage_cfg.batch_size
+            _resume_consumed = True
+            print(
+                f"  Resumed: step={global_step}  epoch={epoch}  "
+                f"step_in_stage={step_in_stage}  micro_step_in_epoch={resume_mse}"
+            )
+        else:
+            step_in_stage = 0
+
+        # ── Per-stage loop state ──────────────────────────────────────────────
+        optimizer.zero_grad()
+        accum_loss  = 0.0
+        loss_ema: float | None = None
+        micro_acc   = 0   # global micro-batch counter for accum detection (never resets)
+        advanced    = False
+
+        step_start   = time.perf_counter()
+        step_audio_s = 0.0
+        total_audio_s = 0.0
+
+        max_steps = cfg.run.max_steps
+
+        # ── Epoch loop ────────────────────────────────────────────────────────
+        while not advanced and (max_steps is None or global_step < max_steps):
+            micro_step_in_epoch = 0
+            loader = stage.make_loader(epoch)
+
+            # Fast-forward on resume (first epoch of this stage only)
+            if resuming_here and epoch == rs.epoch:
+                n_skip = math.floor(resume_mse * resume_bs / stage_cfg.batch_size)
+                if n_skip > 0:
+                    print(
+                        f"[resume] Skipping {n_skip} batches in epoch {epoch} "
+                        f"(saved_mse={resume_mse}, saved_bs={resume_bs}, "
+                        f"current_bs={stage_cfg.batch_size})"
+                    )
+                    fast_forward(loader, n_skip)
+                    micro_step_in_epoch = n_skip
+                resuming_here = False  # only fast-forward once
+
+            # ── Batch loop ────────────────────────────────────────────────────
+            for batch in loader:
+                micro_step_in_epoch += 1
+
+                (mel, audio_lengths,
+                 instruction_ids, instruction_lengths,
+                 transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
+
+                # audio_lengths[i] = adapter tokens; each = 8 mel frames @ 10 ms
+                step_audio_s += audio_lengths.sum().item() * 8 * 0.01
+
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    enc_out     = encoder(mel)
+                    adapter_out = adapter(enc_out)
+                    inputs, labels = prepare_input(
+                        adapter_out,
+                        audio_lengths,
+                        instruction_ids,
+                        instruction_lengths,
+                        transcript_ids,
+                        transcript_lengths,
+                        llama.embed_tokens,
+                        sep_token_id,
+                    )
+                    logits, loss = llama(inputs, labels)
+
+                metrics.observe("train", global_step, logits=logits, labels=labels)
+                scaler.scale(loss / stage.accum_steps).backward()
+                accum_loss += loss.item()
+                micro_acc  += 1
+
+                if micro_acc % stage.accum_steps != 0:
+                    continue  # accumulate more micro-steps before stepping
+
+                # ── Optimizer step ────────────────────────────────────────────
+                scaler.unscale_(optimizer)
+                if cfg.optim.grad_clip.enabled:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for g in optimizer.param_groups for p in g["params"]],
+                        cfg.optim.grad_clip.max_norm,
+                    )
+                # Observe gradients (after unscale, before step)
+                metrics.observe(
+                    "train", global_step,
+                    encoder = encoder,
+                    adapter = adapter,
+                    llama   = llama,
+                )
+
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                global_step   += 1
+                step_in_stage += 1
+
+                avg_loss   = accum_loss / stage.accum_steps
+                accum_loss = 0.0
+                loss_ema   = (
+                    avg_loss if loss_ema is None
+                    else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
+                )
+
+                # ── Periodic checkpoint ───────────────────────────────────────
+                if cfg.checkpoint.save_every and global_step % cfg.checkpoint.save_every == 0:
+                    _save_checkpoint(
+                        ckpt_dir, stage, stage_cfg, stage_idx,
+                        global_step, epoch, micro_step_in_epoch, step_in_stage,
+                        encoder, adapter, llama, optimizer, scaler, scheduler,
+                    )
+
+                # ── Eval pass ─────────────────────────────────────────────────
+                eval_metrics: dict = {}
+                eval_subset:  list = []
+                wer_metrics:  dict = {}
+
+                if _diag_loader is not None and global_step % cfg.metrics.eval_every == 0:
+                    eval_metrics, eval_subset, _diag_iter = run_eval_pass(
+                        encoder, adapter, llama,
+                        _diag_loader, _diag_iter,
+                        metrics, sep_token_id, device,
+                        cfg.metrics.eval_batches,
+                        global_step,
+                    )
+                    wer_metrics = maybe_run_wer(
+                        cfg, eval_metrics, global_step, eval_subset,
+                        encoder, adapter, llama, tokenizer,
+                        sep_token_id, device, use_wandb,
+                    )
+
+                # ── Train metrics flush ───────────────────────────────────────
+                train_metrics = metrics.flush("train", global_step)
+
+                # ── Throughput (reset after checkpoint I/O folds in) ──────────
+                t_now          = time.perf_counter()
+                elapsed        = max(t_now - step_start, 1e-9)
+                throughput     = step_audio_s / elapsed
+                total_audio_s += step_audio_s
+                step_audio_s   = 0.0
+                step_start     = t_now
+
+                # ── Console output ────────────────────────────────────────────
+                print(
+                    f"step {global_step:6d}  loss {avg_loss:.4f}"
+                    f"  ema {loss_ema:.4f}"
+                    f"  {throughput:.2f}× realtime"
+                    f"  stage={stage.name}"
+                )
+                if train_metrics:
+                    render(train_metrics, "train", global_step)
+                if eval_metrics:
+                    render(eval_metrics, "eval", global_step)
+
+                # ── W&B ───────────────────────────────────────────────────────
+                if use_wandb:
+                    _log_wandb(
+                        global_step, stage_idx, stage, stage_cfg,
+                        avg_loss, loss_ema,
+                        optimizer, throughput, total_audio_s, t_now, train_start,
+                        train_metrics, eval_metrics, wer_metrics,
+                        baselines_data,
+                    )
+
+                # ── Stage advance check ───────────────────────────────────────
+                if stage.should_advance(eval_metrics, step_in_stage):
+                    print(
+                        f"[stage] '{stage.name}' advance criterion met "
+                        f"at step {global_step} (step_in_stage={step_in_stage})."
+                    )
+                    advanced = True
+
+                # ── Global exit check ─────────────────────────────────────────
+                if (max_steps is not None and global_step >= max_steps) or advanced:
+                    break
+
+            # end batch loop
+
+            if advanced:
+                # Stage handoff: save full checkpoint + adapter sidecar
+                _save_checkpoint(
+                    ckpt_dir, stage, stage_cfg, stage_idx,
+                    global_step, epoch, micro_step_in_epoch, step_in_stage,
+                    encoder, adapter, llama, optimizer, scaler, scheduler,
+                    suffix="stage-handoff",
+                )
+                epoch = 0   # next stage starts from a fresh epoch
+                break       # exit epoch loop; outer while increments stage_idx
+
+            epoch += 1
+        # end epoch loop
+
+        prev_opt  = optimizer
+        stage_idx += 1
+    # end stage loop
+
+    # ── Final checkpoint ──────────────────────────────────────────────────────
+    _final = ckpt_dir / f"final-step{global_step}.pt"
+    save_checkpoint(
+        _final,
+        step                = global_step,
+        epoch               = epoch,
+        micro_step_in_epoch = 0,
+        step_in_stage       = step_in_stage,
+        stage_index         = stage_idx,
+        batch_size          = cfg.stages[-1].batch_size,
+        adapter             = adapter,
+        optimizer           = optimizer,
+        scaler              = scaler,
+        scheduler           = scheduler,
+        encoder             = encoder,
+        llama               = llama,
+    )
+    print(f"Final checkpoint saved → {_final}")
+
+    _final_ada = ckpt_dir / f"final-adapter-step{global_step}.pt"
+    save_adapter_checkpoint(
+        _final_ada,
+        step                = global_step,
+        epoch               = epoch,
+        micro_step_in_epoch = 0,
+        step_in_stage       = step_in_stage,
+        stage_index         = stage_idx,
+        batch_size          = cfg.stages[-1].batch_size,
+        adapter             = adapter,
+        optimizer           = optimizer,
+    )
+    print(f"Final adapter checkpoint saved → {_final_ada}")
+
+    if use_wandb:
+        import wandb as _wandb
+        _wandb.finish()
+
+
+# ── Save helper ───────────────────────────────────────────────────────────────
+
+def _save_checkpoint(
+    ckpt_dir:     Path,
+    stage:        Stage,
+    stage_cfg:    Any,
+    stage_idx:    int,
+    global_step:  int,
+    epoch:        int,
+    micro_step_in_epoch: int,
+    step_in_stage: int,
+    encoder:      nn.Module,
+    adapter:      nn.Module,
+    llama:        nn.Module,
+    optimizer:    torch.optim.Optimizer,
+    scaler:       torch.amp.GradScaler,
+    scheduler:    torch.optim.lr_scheduler.LRScheduler,
+    suffix:       str = "",
+) -> None:
+    """Save full checkpoint + optional adapter sidecar for adapter-only stages."""
+    name = f"step{global_step:07d}"
+    if suffix:
+        name += f"-{suffix}"
+    ckpt_path = ckpt_dir / f"{name}.pt"
+    save_checkpoint(
+        ckpt_path,
+        step                = global_step,
+        epoch               = epoch,
+        micro_step_in_epoch = micro_step_in_epoch,
+        step_in_stage       = step_in_stage,
+        stage_index         = stage_idx,
+        batch_size          = stage_cfg.batch_size,
+        adapter             = adapter,
+        optimizer           = optimizer,
+        scaler              = scaler,
+        scheduler           = scheduler,
+        encoder             = encoder,
+        llama               = llama,
+    )
+    print(f"Checkpoint saved → {ckpt_path}")
+
+    # Adapter sidecar for cross-stage loading: always at stage handoff,
+    # only for adapter-only stages during periodic saves
+    is_adapter_only = set(stage_cfg.trainable) == {"adapter"}
+    if suffix == "stage-handoff" or is_adapter_only:
+        ada_path = ckpt_dir / f"{name}-adapter.pt"
+        save_adapter_checkpoint(
+            ada_path,
+            step                = global_step,
+            epoch               = epoch,
+            micro_step_in_epoch = micro_step_in_epoch,
+            step_in_stage       = step_in_stage,
+            stage_index         = stage_idx,
+            batch_size          = stage_cfg.batch_size,
+            adapter             = adapter,
+            optimizer           = optimizer,
+        )
+        print(f"Adapter checkpoint saved → {ada_path}")
+
+
+# ── W&B logging helper ────────────────────────────────────────────────────────
+
+def _log_wandb(
+    global_step:   int,
+    stage_idx:     int,
+    stage:         Stage,
+    stage_cfg:     Any,
+    avg_loss:      float,
+    loss_ema:      float,
+    optimizer:     torch.optim.Optimizer,
+    throughput:    float,
+    total_audio_s: float,
+    t_now:         float,
+    train_start:   float,
+    train_metrics: dict,
+    eval_metrics:  dict,
+    wer_metrics:   dict,
+    baselines_data: dict,
+) -> None:
+    import wandb as _wandb
+
+    # Per-group LR using group["name"] — no positional index assumptions
+    lr_dict = {
+        f"train/lr_{g['name']}": g["lr"]
+        for g in optimizer.param_groups
+    }
+
+    # Per-module trainable flags
+    trainable_set = set(stage_cfg.trainable)
+    trainable_flags = {
+        "train/encoder_trainable": float("encoder" in trainable_set),
+        "train/adapter_trainable": float("adapter" in trainable_set),
+        "train/llama_trainable":   float("llama"   in trainable_set),
+    }
+
+    # Train/eval gap metrics
+    gap: dict = {}
+    _tr = train_metrics.get("loss/train_rest")
+    _er = eval_metrics.get("loss/eval_rest")
+    _tf = train_metrics.get("loss/train_first_token")
+    _ef = eval_metrics.get("loss/eval_first_token")
+    if _tr is not None and _er is not None:
+        gap["loss/gap_rest"] = _er - _tr
+    if _tf is not None and _ef is not None:
+        gap["loss/gap_first_token"] = _ef - _tf
+
+    # Numeric baseline values only (skip string notes and keys starting with "_")
+    baseline_payload = {
+        f"baseline/{k}": v
+        for k, v in baselines_data.items()
+        if isinstance(v, (int, float)) and not k.startswith("_")
+    }
+
+    payload = {
+        "train/loss":       avg_loss,
+        "train/loss_ema":   loss_ema,
+        "train/stage_index": stage_idx,
+        "train/stage_name":  stage.name,
+        **trainable_flags,
+        **lr_dict,
+        "runtime/throughput_audio_sec_per_sec": throughput,
+        "runtime/cumulative_audio_hours":       total_audio_s / 3600,
+        "runtime/wall_time_min":               (t_now - train_start) / 60,
+        **train_metrics,
+        **eval_metrics,
+        **wer_metrics,
+        **gap,
+        **baseline_payload,
+    }
+
+    _wandb.log(payload, step=global_step)
+
+
+if __name__ == "__main__":
+    main(argv=sys.argv[1:])

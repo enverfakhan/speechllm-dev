@@ -32,6 +32,8 @@ class ResumeState(NamedTuple):
     epoch:                int
     micro_step_in_epoch:  int
     batch_size:           int | None   # None when not recorded in the checkpoint
+    step_in_stage:        int = 0      # stage-local step; defaults to global step for old checkpoints
+    stage_index:          int = 0
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -49,6 +51,8 @@ def save_checkpoint(
     scheduler:            torch.optim.lr_scheduler.LRScheduler | None = None,
     encoder:              nn.Module | None = None,
     llama:                nn.Module | None = None,
+    step_in_stage:        int = 0,
+    stage_index:          int = 0,
 ) -> None:
     """Save a full training checkpoint.
 
@@ -66,6 +70,8 @@ def save_checkpoint(
         "epoch":               epoch,
         "micro_step_in_epoch": micro_step_in_epoch,
         "batch_size":          batch_size,
+        "step_in_stage":       step_in_stage,
+        "stage_index":         stage_index,
         "adapter":             adapter.state_dict(),
         "optimizer":           optimizer.state_dict(),
         "scaler":              scaler.state_dict(),
@@ -88,6 +94,8 @@ def save_adapter_checkpoint(
     batch_size:          int,
     adapter:             nn.Module,
     optimizer:           torch.optim.Optimizer,
+    step_in_stage:       int = 0,
+    stage_index:         int = 0,
 ) -> None:
     """Save an adapter-only checkpoint for cross-stage loading.
 
@@ -109,6 +117,8 @@ def save_adapter_checkpoint(
             "epoch":               epoch,
             "micro_step_in_epoch": micro_step_in_epoch,
             "batch_size":          batch_size,
+            "step_in_stage":       step_in_stage,
+            "stage_index":         stage_index,
             "adapter":             adapter.state_dict(),
             "optimizer_adapter":   optimizer.state_dict(),
         },
@@ -172,6 +182,8 @@ def load_full_checkpoint(
         epoch               = ckpt.get("epoch", 0),
         micro_step_in_epoch = ckpt.get("micro_step_in_epoch", 0),
         batch_size          = ckpt.get("batch_size"),   # None when absent
+        step_in_stage       = ckpt.get("step_in_stage", ckpt["step"]),  # old ckpts: use global step
+        stage_index         = ckpt.get("stage_index", 0),
     )
 
 
@@ -188,11 +200,14 @@ def load_adapter_checkpoint(
     """
     ckpt = torch.load(path, map_location="cpu")
     adapter.load_state_dict(ckpt["adapter"])
+    step = ckpt.get("step", 0)
     return ResumeState(
-        step                = ckpt.get("step", 0),
+        step                = step,
         epoch               = ckpt.get("epoch", 0),
         micro_step_in_epoch = ckpt.get("micro_step_in_epoch", 0),
         batch_size          = ckpt.get("batch_size"),
+        step_in_stage       = ckpt.get("step_in_stage", step),
+        stage_index         = ckpt.get("stage_index", 0),
     )
 
 
