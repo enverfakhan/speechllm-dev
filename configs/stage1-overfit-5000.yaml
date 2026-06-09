@@ -35,7 +35,7 @@ metrics:
   eval_batch_size: 96   # conservative for 8B model on 12 GB VRAM
   wer:
     enabled:               false   # in-loop WER; unused by run_wer.py
-    max_batches:           9999    # effectively unlimited — run through full shard
+    max_batches:           40    # effectively unlimited — run through full shard
     sample_transcriptions: 3000    # largest set has 2,932 samples
 
 run:
