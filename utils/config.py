@@ -528,6 +528,8 @@ def load_config(
 
 if __name__ == "__main__":
     import sys
+    import tempfile
+    import textwrap
     from dataclasses import replace  # noqa: F811
 
     _EXAMPLE = _PROJECT_ROOT / "configs" / "example.yaml"
@@ -545,14 +547,16 @@ if __name__ == "__main__":
                     f"ValueError {str(exc)!r} does not contain {fragment!r}"
                 ) from exc
 
-    # ── 1. load example.yaml ──────────────────────────────────────────────────
+    # ── 1. load example.yaml — structural assertions ──────────────────────────
+    # Only asserts architectural/stable values (stage names, strategies, etc.).
+    # Env-specific path fields (shards_file, diag_shard) are tested via a
+    # controlled temp fixture in test 1b so this test survives config updates.
     cfg = load_config(_EXAMPLE)
 
-    # run-level overrides beat base
+    # stable run-level overrides from example.yaml
     assert cfg.checkpoint.dir == Path("checkpoints/example"), cfg.checkpoint.dir
     assert cfg.checkpoint.save_every == 360, cfg.checkpoint.save_every
     assert cfg.run.max_steps == 5000, cfg.run.max_steps
-    assert cfg.data.shards_file == Path("data/subset_shards.txt"), cfg.data.shards_file
 
     # stage[0]: accum_steps from run config; optimizer_init defaults to "fresh"
     s0 = cfg.stages[0]
@@ -571,6 +575,29 @@ if __name__ == "__main__":
     assert s1.schedule.warmup_steps == 1000, s1.schedule.warmup_steps
 
     print("[OK] load example.yaml")
+
+    # ── 1b. minimal temp config — run-level data path override beats base ─────
+    # Uses a stable in-memory YAML so this test never breaks because a real run
+    # config changes its local shards_file path.
+    _MERGE_YAML = textwrap.dedent("""\
+        data:
+          shards_file: my_shards.txt
+        checkpoint: {dir: checkpoints/test-run, save_every: 42}
+        run: {max_steps: 99}
+        stages:
+          - {name: one_stage, trainable: [adapter], lrs: {adapter: 1.0e-4},
+             exit: {strategy: max_steps}}
+    """)
+    with tempfile.TemporaryDirectory() as _td:
+        _tmp = Path(_td) / "merge.yaml"
+        _tmp.write_text(_MERGE_YAML)
+        cfg_m = load_config(_tmp)
+    assert cfg_m.data.shards_file    == Path("my_shards.txt"),       cfg_m.data.shards_file
+    assert cfg_m.checkpoint.dir      == Path("checkpoints/test-run"), cfg_m.checkpoint.dir
+    assert cfg_m.checkpoint.save_every == 42,                          cfg_m.checkpoint.save_every
+    assert cfg_m.run.max_steps       == 99,                            cfg_m.run.max_steps
+
+    print("[OK] run-level overrides beat base")
 
     # ── 2. CLI overrides ──────────────────────────────────────────────────────
     cfg2 = load_config(argv=[

@@ -228,8 +228,11 @@ if __name__ == "__main__":
         raw = torch.load(full_path, map_location="cpu")
         assert set(raw.keys()) == {
             "step", "epoch", "micro_step_in_epoch", "batch_size",
+            "step_in_stage", "stage_index",
             "adapter", "optimizer", "scaler", "encoder", "llama",
         }, f"Unexpected full-ckpt keys: {set(raw.keys())}"
+        assert raw["step_in_stage"] == 0, "step_in_stage default not stored"
+        assert raw["stage_index"]   == 0, "stage_index default not stored"
 
         enc2 = nn.Linear(4, 4)
         ada2 = nn.Linear(4, 4)
@@ -246,7 +249,8 @@ if __name__ == "__main__":
             encoder=enc2, adapter=ada2, llama=llm2,
             optimizer=opt2, scaler=scl2,
         )
-        assert rs == ResumeState(42, 3, 17, 8), f"ResumeState mismatch: {rs}"
+        assert rs == ResumeState(step=42, epoch=3, micro_step_in_epoch=17, batch_size=8,
+                                 step_in_stage=0, stage_index=0), f"ResumeState mismatch: {rs}"
         # Weights loaded correctly
         assert torch.allclose(enc.weight.data, enc2.weight.data), "encoder weight mismatch"
         assert torch.allclose(ada.weight.data, ada2.weight.data), "adapter weight mismatch"
@@ -281,7 +285,8 @@ if __name__ == "__main__":
             slim_path,
             adapter=ada3b, optimizer=opt3b, scaler=scl3b,
         )
-        assert rs2 == ResumeState(7, 0, 5, 4), f"ResumeState mismatch: {rs2}"
+        assert rs2 == ResumeState(step=7, epoch=0, micro_step_in_epoch=5, batch_size=4,
+                                  step_in_stage=0, stage_index=0), f"ResumeState mismatch: {rs2}"
         print("  [OK] full checkpoint without optional modules")
 
         # ── 3. batch_size absent → ResumeState.batch_size is None ────────────
@@ -299,7 +304,26 @@ if __name__ == "__main__":
         assert effective_bs == 99
         print("  [OK] missing batch_size → None sentinel, caller default applied")
 
-        # ── 4. Scheduler present/absent paths ────────────────────────────────
+        # ── 4. Old-format checkpoint: step_in_stage / stage_index absent → defaults ──
+        # Simulates a checkpoint written before these fields were added (pre-Prompt-6).
+        old_path = td / "old_fmt.pt"
+        d_old = torch.load(slim_path, map_location="cpu")
+        del d_old["step_in_stage"]
+        del d_old["stage_index"]
+        torch.save(d_old, old_path)
+
+        ada_old = nn.Linear(4, 4)
+        opt_old = torch.optim.SGD(ada_old.parameters(), lr=1e-4)
+        scl_old = torch.amp.GradScaler("cpu")
+        rs_old = load_full_checkpoint(old_path, adapter=ada_old, optimizer=opt_old, scaler=scl_old)
+        # step_in_stage falls back to the global step value; stage_index falls back to 0
+        assert rs_old.step_in_stage == rs_old.step, (
+            f"expected step_in_stage={rs_old.step}, got {rs_old.step_in_stage}"
+        )
+        assert rs_old.stage_index == 0, f"expected stage_index=0, got {rs_old.stage_index}"
+        print("  [OK] old-format checkpoint: step_in_stage→step, stage_index→0")
+
+        # ── 5. Scheduler present/absent paths ────────────────────────────────
         ada6 = nn.Linear(4, 4)
         opt6 = torch.optim.SGD(ada6.parameters(), lr=1e-3)
         scl6 = torch.amp.GradScaler("cpu")
