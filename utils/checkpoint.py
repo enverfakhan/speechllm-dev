@@ -127,6 +127,36 @@ def save_adapter_checkpoint(
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
+def load_weights(
+    path: Path | str,
+    *,
+    encoder: nn.Module | None = None,
+    adapter: nn.Module | None = None,
+    llama:   nn.Module | None = None,
+) -> list[str]:
+    """Load model weights from a checkpoint file; ignore all non-weight keys.
+
+    Only loads state_dicts for the three model modules (encoder, adapter, llama).
+    Optimizer, scaler, scheduler, step, epoch, etc. are silently skipped.
+
+    Args:
+        path:    checkpoint file path
+        encoder: WhisperEncoder module, or None to skip
+        adapter: AudioAdapter module, or None to skip
+        llama:   Llama module, or None to skip
+
+    Returns:
+        list of module names that were actually loaded, in encoder→adapter→llama order
+    """
+    ckpt = torch.load(path, map_location="cpu")
+    loaded: list[str] = []
+    for key, module in [("encoder", encoder), ("adapter", adapter), ("llama", llama)]:
+        if module is not None and key in ckpt:
+            module.load_state_dict(ckpt[key])
+            loaded.append(key)
+    return loaded
+
+
 def load_full_checkpoint(
     path: Path | str,
     *,
@@ -351,6 +381,43 @@ if __name__ == "__main__":
         # scheduler last_epoch should be restored (5 steps)
         assert sched7.last_epoch == 5, f"scheduler.last_epoch={sched7.last_epoch}"
         print("  [OK] scheduler round-trip")
+
+        # ── 6. load_weights: weights-only overlay ────────────────────────────
+        # Save a checkpoint that has encoder + adapter but NOT llama.
+        ada_lw = nn.Linear(4, 4)
+        enc_lw = nn.Linear(4, 4)
+        lw_path = td / "load_weights.pt"
+        torch.save(
+            {
+                "step": 99, "epoch": 1, "micro_step_in_epoch": 7, "batch_size": 4,
+                "step_in_stage": 10, "stage_index": 0,
+                "adapter":  ada_lw.state_dict(),
+                "encoder":  enc_lw.state_dict(),
+                "optimizer": {},  # non-weight keys should be ignored
+                "scaler":    {},
+            },
+            lw_path,
+        )
+
+        # Target modules with fresh (different) random weights.
+        ada_t  = nn.Linear(4, 4)
+        enc_t  = nn.Linear(4, 4)
+        llm_t  = nn.Linear(4, 4)
+        llm_orig = llm_t.weight.data.clone()
+
+        loaded_lw = load_weights(lw_path, encoder=enc_t, adapter=ada_t, llama=llm_t)
+        assert loaded_lw == ["encoder", "adapter"], f"Expected ['encoder','adapter'], got {loaded_lw}"
+        assert torch.allclose(enc_t.weight.data, enc_lw.weight.data),  "encoder weight mismatch"
+        assert torch.allclose(ada_t.weight.data, ada_lw.weight.data),  "adapter weight mismatch"
+        assert torch.allclose(llm_t.weight.data, llm_orig), "llama should be untouched"
+        print("  [OK] load_weights: encoder+adapter loaded, llama untouched")
+
+        # Only the adapter module provided — encoder/llama keys in ckpt are ignored.
+        ada_t2 = nn.Linear(4, 4)
+        loaded_lw2 = load_weights(lw_path, adapter=ada_t2)
+        assert loaded_lw2 == ["adapter"], f"Expected ['adapter'], got {loaded_lw2}"
+        assert torch.allclose(ada_t2.weight.data, ada_lw.weight.data), "adapter weight mismatch"
+        print("  [OK] load_weights: only provided modules considered")
 
     print("\nPASSED")
     sys.exit(0)

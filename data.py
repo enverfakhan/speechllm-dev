@@ -50,6 +50,12 @@ import torch.utils.data
 import webdataset as wds
 
 
+INSTRUCTION_VARIANTS: list[str] = [
+    "Transcribe the following audio without formatting.",
+    "Transcribe the following audio with proper formatting.",
+]
+
+
 class PrunedTokenizer:
     """Loads a HuggingFace tokenizer and remaps IDs to the pruned vocabulary space.
 

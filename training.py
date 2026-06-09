@@ -22,9 +22,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from data import build_dataloader, list_shards, PrunedTokenizer
+from build import build_models
+from data import build_dataloader, list_shards, PrunedTokenizer, INSTRUCTION_VARIANTS
 from model.adapter import AudioAdapter
-from model.llama import Llama, LlamaConfig
+from model.llama import Llama
 from model.sequence import prepare_input
 from model.whisper_encoder import WhisperEncoder
 from metrics import MetricCollector, render
@@ -39,12 +40,7 @@ from utils.evaluate import compute_wer
 from utils.generate import greedy_generate
 
 
-# ── Constants shared with build_vocab.py / preprocess.py ─────────────────────
-
-INSTRUCTION_VARIANTS: list[str] = [
-    "Transcribe the following audio without formatting.",
-    "Transcribe the following audio with proper formatting.",
-]
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 _INSTRUCTION_PAIRS: list[tuple[str, str]] = [
     (INSTRUCTION_VARIANTS[0], "unformatted.txt"),
@@ -52,94 +48,6 @@ _INSTRUCTION_PAIRS: list[tuple[str, str]] = [
 ]
 
 _EMA_ALPHA = 0.98
-
-
-# ── Model construction ────────────────────────────────────────────────────────
-
-def build_models(
-    cfg: Config,
-    device: torch.device,
-) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
-    """Instantiate and initialise all three model components.
-
-    Load order:
-      1. Architecture (stub or full)
-      2. Pretrained weights (whisper + llama) if not stub
-      3. Warm-start weights from cfg.model.init_from if set (weights only, no opt state)
-    """
-    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
-        vocab_size = json.load(f)["vocab_size"]
-
-    if cfg.model.stub:
-        llama_cfg = LlamaConfig(**cfg.model.stub_dims, vocab_size=vocab_size)
-        llama_dim = cfg.model.stub_dims["d_model"]
-        print("STUB mode: tiny randomly-initialised model (no pretrained weights).")
-    else:
-        llama_cfg = LlamaConfig(vocab_size=vocab_size)
-        llama_dim = 4096
-
-    encoder = WhisperEncoder()
-    adapter = AudioAdapter(
-        llama_dim=llama_dim,
-        pca_init_path=cfg.model.adapter_pca_init,
-    )
-    llama = Llama(llama_cfg)
-
-    if not cfg.model.stub:
-        if cfg.model.whisper_ckpt is None or cfg.model.llama_ckpt is None:
-            raise ValueError(
-                "model.whisper_ckpt and model.llama_ckpt are required when model.stub is false."
-            )
-        print("Loading Whisper encoder weights …")
-        encoder.load_openai_weights(cfg.model.whisper_ckpt)
-
-        vocab_map_path = cfg.data.tokenizer / "vocab_map.json"
-        with vocab_map_path.open() as f:
-            vocab_map = json.load(f)
-        print("Loading Llama transformer weights …")
-        llama.load_meta_weights(cfg.model.llama_ckpt, vocab_map=vocab_map)
-    elif cfg.model.whisper_ckpt is not None:
-        # Stub run that still wants pretrained encoder weights (unusual but supported).
-        print("Loading Whisper encoder weights (stub mode) …")
-        encoder.load_openai_weights(cfg.model.whisper_ckpt)
-
-    # Warm-start: load saved model states on top of (or instead of) pretrained weights.
-    # Adapter is always loaded; encoder/llama only when present in the checkpoint.
-    if cfg.model.init_from is not None:
-        print(f"Warm-starting from {cfg.model.init_from} …")
-        ws = torch.load(cfg.model.init_from, map_location="cpu")
-        adapter.load_state_dict(ws["adapter"])
-        if "encoder" in ws:
-            encoder.load_state_dict(ws["encoder"])
-        if "llama" in ws:
-            llama.load_state_dict(ws["llama"])
-        print("  Warm-start complete.")
-
-    encoder = encoder.to(device)
-    adapter = adapter.to(device)
-    llama   = llama.to(device)
-
-    if cfg.model.gradient_checkpointing:
-        if cfg.model.stub:
-            print("[warn] model.gradient_checkpointing ignored in stub mode")
-        else:
-            llama.enable_gradient_checkpointing()
-            print("[info] gradient checkpointing enabled on Llama")
-
-    encoder.train()
-    adapter.train()
-    llama.train()
-
-    n_enc = sum(p.numel() for p in encoder.parameters())
-    n_ada = sum(p.numel() for p in adapter.parameters())
-    n_llm = sum(p.numel() for p in llama.parameters())
-    print(
-        f"Parameters — encoder: {n_enc / 1e6:.1f}M  "
-        f"adapter: {n_ada / 1e6:.1f}M  "
-        f"llama: {n_llm / 1e6:.0f}M  "
-        f"total: {(n_enc + n_ada + n_llm) / 1e9:.2f}B"
-    )
-    return encoder, adapter, llama
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
