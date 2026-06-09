@@ -36,7 +36,7 @@ metrics:
   wer:
     enabled:               false   # in-loop WER; unused by run_wer.py
     max_batches:           9999    # effectively unlimited — run through full shard
-    sample_transcriptions: 20
+    sample_transcriptions: 3000
 
 run:
   max_steps:        5000

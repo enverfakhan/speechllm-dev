@@ -79,6 +79,11 @@ def evaluate_all_splits(
     for split_name, loader in eval_loaders.items():
         pairs_unfmt: list[tuple[str, str]] = []   # (ref, hyp)
         pairs_fmt:   list[tuple[str, str]] = []
+        # Per-sample fingerprint: audio_length prepended to the unformatted
+        # reference text. The audio_length disambiguates the rare case of two
+        # utterances sharing identical transcript text. Used to detect when
+        # WebDataset loops back to already-processed samples.
+        seen_ids: set[str] = set()
 
         for batch_idx, batch in enumerate(loader):
             if max_batches is not None and batch_idx >= max_batches:
@@ -88,6 +93,22 @@ def evaluate_all_splits(
              unfmt_ids, unfmt_lens,
              fmt_ids,   fmt_lens,
              refs_unformatted, refs_formatted) = batch
+
+            # Build fingerprints before any .to(device) call.
+            B = audio_lengths.shape[0]
+            batch_ids = [
+                str(int(audio_lengths[i].item())) + refs_unformatted[i]
+                for i in range(B)
+            ]
+            new_mask    = [bid not in seen_ids for bid in batch_ids]
+            seen_ids.update(batch_ids)
+            reached_loop = not all(new_mask)
+
+            if not any(new_mask):
+                # Every sample in this batch already seen — dataset has fully looped.
+                print(f"  [{split_name}] loop detected at batch {batch_idx} "
+                      f"— {len(seen_ids)} unique samples evaluated")
+                break
 
             mel           = mel.to(device)
             audio_lengths = audio_lengths.to(device)
@@ -100,10 +121,11 @@ def evaluate_all_splits(
                     mel, audio_lengths, unfmt_ids, unfmt_lens,
                     sep_token_id=sep_token_id,
                 )
-                for i in range(len(batch_hyps_unfmt)):
-                    pairs_unfmt.append(
-                        (refs_unformatted[i], tokenizer.decode(batch_hyps_unfmt[i]))
-                    )
+                for i, hyp_ids in enumerate(batch_hyps_unfmt):
+                    if new_mask[i]:
+                        pairs_unfmt.append(
+                            (refs_unformatted[i], tokenizer.decode(hyp_ids))
+                        )
 
             if run_fmt:
                 fmt_ids  = fmt_ids.to(device)
@@ -113,10 +135,18 @@ def evaluate_all_splits(
                     mel, audio_lengths, fmt_ids, fmt_lens,
                     sep_token_id=sep_token_id,
                 )
-                for i in range(len(batch_hyps_fmt)):
-                    pairs_fmt.append(
-                        (refs_formatted[i], tokenizer.decode(batch_hyps_fmt[i]))
-                    )
+                for i, hyp_ids in enumerate(batch_hyps_fmt):
+                    if new_mask[i]:
+                        pairs_fmt.append(
+                            (refs_formatted[i], tokenizer.decode(hyp_ids))
+                        )
+
+            if reached_loop:
+                # Partial loop: some new samples collected, rest discarded.
+                n_new = sum(new_mask)
+                print(f"  [{split_name}] partial loop at batch {batch_idx} "
+                      f"— kept {n_new}/{B} new samples, stopping")
+                break
 
         if run_unfmt:
             refs_u = [r for r, _ in pairs_unfmt]
