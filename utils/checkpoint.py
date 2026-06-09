@@ -9,12 +9,11 @@ Full checkpoint  (used for same-stage resume)
           encoder?    (present when encoder is not permanently frozen)
           llama?      (present when Llama is not permanently frozen)
 
-Adapter-only checkpoint  (used for cross-stage loading)
+Adapter-only checkpoint  (saved at stage boundaries for archival)
     keys: step, epoch, micro_step_in_epoch, batch_size,
           adapter, optimizer_adapter
 
 The caller decides which optional modules to include by passing them (or None).
-This keeps the format decision in train.py where the freeze/stage flags live.
 """
 
 from __future__ import annotations
@@ -187,29 +186,6 @@ def load_full_checkpoint(
     )
 
 
-def load_adapter_checkpoint(
-    path: Path | str,
-    *,
-    adapter: nn.Module,
-) -> ResumeState:
-    """Load adapter weights from an adapter-only checkpoint (cross-stage loading).
-
-    Optimizer state is NOT restored: bitsandbytes AdamW8bit moment tensors are
-    not reliably portable via manual state-dict injection, and Adam moments
-    re-stabilise within a few steps from a warm adapter init.
-    """
-    ckpt = torch.load(path, map_location="cpu")
-    adapter.load_state_dict(ckpt["adapter"])
-    step = ckpt.get("step", 0)
-    return ResumeState(
-        step                = step,
-        epoch               = ckpt.get("epoch", 0),
-        micro_step_in_epoch = ckpt.get("micro_step_in_epoch", 0),
-        batch_size          = ckpt.get("batch_size"),
-        step_in_stage       = ckpt.get("step_in_stage", step),
-        stage_index         = ckpt.get("stage_index", 0),
-    )
-
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
@@ -323,27 +299,7 @@ if __name__ == "__main__":
         assert effective_bs == 99
         print("  [OK] missing batch_size → None sentinel, caller default applied")
 
-        # ── 4. Adapter-only checkpoint round-trip ─────────────────────────────
-        adapter_path = td / "adapter.pt"
-        save_adapter_checkpoint(
-            adapter_path,
-            step=100, epoch=2, micro_step_in_epoch=33, batch_size=16,
-            adapter=ada, optimizer=opt,
-        )
-        raw3 = torch.load(adapter_path, map_location="cpu")
-        assert set(raw3.keys()) == {
-            "step", "epoch", "micro_step_in_epoch", "batch_size",
-            "adapter", "optimizer_adapter",
-        }, f"Unexpected adapter-ckpt keys: {set(raw3.keys())}"
-        assert "optimizer" not in raw3, "'optimizer' key must not be present (only 'optimizer_adapter')"
-
-        ada5 = nn.Linear(4, 4)
-        rs4 = load_adapter_checkpoint(adapter_path, adapter=ada5)
-        assert rs4 == ResumeState(100, 2, 33, 16), f"ResumeState mismatch: {rs4}"
-        assert torch.allclose(ada.weight.data, ada5.weight.data), "adapter weight mismatch"
-        print("  [OK] adapter-only checkpoint round-trip")
-
-        # ── 5. Scheduler present/absent paths ────────────────────────────────
+        # ── 4. Scheduler present/absent paths ────────────────────────────────
         ada6 = nn.Linear(4, 4)
         opt6 = torch.optim.SGD(ada6.parameters(), lr=1e-3)
         scl6 = torch.amp.GradScaler("cpu")

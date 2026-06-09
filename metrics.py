@@ -6,7 +6,7 @@ Metric objects are tagged with an *input family* — the type of data they consu
   "logits"     — (logits, labels) from a teacher-forced forward pass
   "loss"       — scalar loss only (no-logits fallback; currently no metrics use it)
   "grads"      — model modules read after backward; train phase only
-  "generation" — autoregressive decode outputs; eval phase only; scaffold here
+  "generation" — autoregressive decode outputs; train phase only (GenEntropyMetric)
 
 Each metric declares:
   name               list[str]   wandb keys it emits
@@ -472,41 +472,6 @@ class GenEntropyMetric(_Metric):
         self._n   = 0
 
 
-class GenerationWERMetric(_Metric):
-    """Scaffold for WER evaluation via autoregressive decode.
-
-    TODO: implement WER scoring in a later step. The decode loop will be
-    shared with tools/run_wer.py. Gate actual decode behind should_run()
-    to avoid running every eval pass.
-
-    Gen-entropy computation (diagnostics.record_generation_entropy equivalent)
-    is available in GenEntropyMetric above — kept separate so it can be used
-    independently without triggering a full decode.
-    """
-
-    input_family         = "generation"
-    phases               = {"eval"}
-    emit_period          = 1
-    compute_only_on_emit = False
-    name:                list[str] = []   # populated when WER keys are defined
-
-    def should_run(self, eval_metrics: dict, step: int) -> bool:
-        """Return True when a decode pass should be triggered this eval.
-
-        Placeholder: always False until WER scoring is implemented.
-        """
-        return False
-
-    def update(self, **kwargs) -> None:
-        pass
-
-    def compute(self) -> dict[str, float | str]:
-        return {}
-
-    def reset(self) -> None:
-        pass
-
-
 # ── Collector ─────────────────────────────────────────────────────────────────
 
 class MetricCollector:
@@ -562,8 +527,6 @@ class MetricCollector:
             FirstTokenVotesMetric("eval",  1, top_k, tokenizer, sep_token_id),
             EntropyMetric("eval",         1),
             MaxLogitMetric("eval",        1),
-            # ── generation WER: scaffold only ─────────────────────────────────
-            GenerationWERMetric(),
         ]
 
     def observe(
