@@ -73,6 +73,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override cfg.metrics.wer.sample_transcriptions.",
     )
     parser.add_argument(
+        "--formats", nargs="+", choices=["unformatted", "formatted"],
+        default=None, metavar="FORMAT",
+        help="Instruction variant(s) to evaluate: 'unformatted', 'formatted', or both "
+             "(default: both).  Pass a single value to halve generation time.",
+    )
+    parser.add_argument(
         "--wandb", action=argparse.BooleanOptionalAction, default=False,
         help="Log WER-vs-step to W&B (requires WANDB_API_KEY env var).",
     )
@@ -233,6 +239,7 @@ def main(argv: list[str] | None = None) -> None:
             max_batches  = max_batches,
             n_samples    = n_samples,
             sample_seed  = step,
+            formats      = args.formats,
         )
 
         # Accumulate rows
