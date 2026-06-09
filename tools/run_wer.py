@@ -83,6 +83,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Log WER-vs-step to W&B (requires WANDB_API_KEY env var).",
     )
     parser.add_argument(
+        "--progress-interval", type=float, default=30.0, dest="progress_interval",
+        metavar="SECONDS",
+        help="Print a progress line every N seconds per split (default: 30). "
+             "Pass 0 to disable.",
+    )
+    parser.add_argument(
         "--device", type=str, default=None,
         help="Torch device string (default: cuda if available, else cpu).",
     )
@@ -198,10 +204,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     print(f"Evaluating {len(checkpoints)} checkpoint(s).")
 
+    # ── Output directory (mirrors --output location) ─────────────────────────
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    progress_interval = args.progress_interval if args.progress_interval > 0 else None
+
     # ── Checkpoint sweep ──────────────────────────────────────────────────────
     seen_key_sets: set[frozenset[str]] = set()
-    all_rows:    list[dict] = []
-    all_samples: list[dict] = []
+    all_rows: list[dict] = []
 
     for ckpt_idx, ckpt_path in enumerate(checkpoints):
         if not ckpt_path.exists():
@@ -227,23 +236,38 @@ def main(argv: list[str] | None = None) -> None:
             )
         seen_key_sets.add(key_set)
 
-        # Ensure eval mode (evaluate_all_splits also sets it, but be explicit)
         encoder.eval()
         adapter.eval()
         llama.eval()
 
-        # Run WER evaluation
-        wer_results, sample_rows = evaluate_all_splits(
-            encoder, adapter, llama,
-            eval_loaders, tokenizer, sep_token_id, device,
-            max_batches  = max_batches,
-            n_samples    = n_samples,
-            sample_seed  = step,
-            formats      = args.formats,
-        )
+        # Evaluate one split at a time so we can flush the sample file immediately.
+        ckpt_wer_results: dict[str, float] = {}
+        ckpt_sample_rows: list[dict] = []
 
-        # Accumulate rows
-        for key, wer_val in wer_results.items():
+        for split_name, loader in eval_loaders.items():
+            split_wer, split_samples = evaluate_all_splits(
+                encoder, adapter, llama,
+                {split_name: loader},
+                tokenizer, sep_token_id, device,
+                max_batches       = max_batches,
+                n_samples         = n_samples,
+                sample_seed       = step,
+                formats           = args.formats,
+                progress_interval = progress_interval,
+            )
+            ckpt_wer_results.update(split_wer)
+
+            # Write sample file for this (step, split) immediately.
+            sample_path = args.output.parent / f"{step:07d}_{split_name}.jsonl"
+            with sample_path.open("w") as f:
+                for sr in split_samples:
+                    f.write(json.dumps({"checkpoint": str(ckpt_path), "step": step, **sr}) + "\n")
+            print(f"  samples → {sample_path.name}")
+
+            ckpt_sample_rows.extend(split_samples)
+
+        # Accumulate summary rows
+        for key, wer_val in ckpt_wer_results.items():
             split, fmt = key.rsplit("/", 1)
             all_rows.append({
                 "checkpoint": str(ckpt_path),
@@ -254,24 +278,17 @@ def main(argv: list[str] | None = None) -> None:
                 "n_samples":  n_samples,
             })
 
-        for sr in sample_rows:
-            all_samples.append({
-                "checkpoint": str(ckpt_path),
-                "step":       step,
-                **sr,
-            })
-
         # W&B per-step logging
         if use_wandb:
             import wandb as _wandb
             wandb_payload: dict = {}
-            for key, wer_val in wer_results.items():
+            for key, wer_val in ckpt_wer_results.items():
                 split, fmt = key.rsplit("/", 1)
                 wandb_payload[f"wer/{split}/{fmt}"] = wer_val
 
             trans_rows = [
                 (sr["split"], sr["type"], sr["reference"], sr["hypothesis"])
-                for sr in sample_rows
+                for sr in ckpt_sample_rows
             ]
             if trans_rows:
                 tbl = _wandb.Table(columns=["split", "type", "reference", "hypothesis"])
@@ -304,13 +321,6 @@ def main(argv: list[str] | None = None) -> None:
                 writer.writeheader()
                 writer.writerows(all_rows)
     print(f"\nWER summary → {args.output}")
-
-    # ── Write sample transcriptions ───────────────────────────────────────────
-    samples_path = args.output.parent / (args.output.stem + "_samples.jsonl")
-    with samples_path.open("w") as f:
-        for sr in all_samples:
-            f.write(json.dumps(sr) + "\n")
-    print(f"Sample transcriptions → {samples_path}")
 
     if use_wandb:
         import wandb as _wandb

@@ -7,6 +7,7 @@ and will be reused by tools/run_wer.py in a later step.
 from __future__ import annotations
 
 import random
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,10 +39,11 @@ def evaluate_all_splits(
     tokenizer:    "PrunedTokenizer",
     sep_token_id: int,
     device:       torch.device,
-    max_batches:  int | None = None,
-    n_samples:    int = 20,
-    sample_seed:  int = 0,
-    formats:      list[str] | None = None,
+    max_batches:       int | None = None,
+    n_samples:         int = 20,
+    sample_seed:       int = 0,
+    formats:           list[str] | None = None,
+    progress_interval: float | None = None,
 ) -> tuple[dict[str, float], list[dict]]:
     """Run batched greedy WER evaluation on every eval split.
 
@@ -53,13 +55,14 @@ def evaluate_all_splits(
     split per format for qualitative inspection.
 
     Args:
-        eval_loaders:  split name → DataLoader (from build_eval_dataloader)
-        tokenizer:     PrunedTokenizer for decoding generated IDs to text
-        max_batches:   cap per split (None = full eval)
-        n_samples:     number of (ref, hyp) pairs to sample per split per format
-        sample_seed:   RNG seed for reproducible sampling
-        formats:       which instruction variants to run; None (default) runs both.
-                       Pass ["unformatted"] or ["formatted"] to restrict.
+        eval_loaders:      split name → DataLoader (from build_eval_dataloader)
+        tokenizer:         PrunedTokenizer for decoding generated IDs to text
+        max_batches:       cap per split (None = full eval)
+        n_samples:         number of (ref, hyp) pairs to sample per split per format
+        sample_seed:       RNG seed for reproducible sampling
+        formats:           which instruction variants to run; None (default) runs both.
+                           Pass ["unformatted"] or ["formatted"] to restrict.
+        progress_interval: print a progress line every this many seconds; None = silent.
 
     Returns:
         wer_dict:    keys like "dev-clean/unformatted" and/or "dev-clean/formatted"
@@ -79,6 +82,9 @@ def evaluate_all_splits(
     for split_name, loader in eval_loaders.items():
         pairs_unfmt: list[tuple[str, str]] = []   # (ref, hyp)
         pairs_fmt:   list[tuple[str, str]] = []
+        n_processed   = 0
+        t_split_start = time.perf_counter()
+        t_last_print  = t_split_start
         # Per-sample fingerprint: audio_length prepended to the unformatted
         # reference text. The audio_length disambiguates the rare case of two
         # utterances sharing identical transcript text. Used to detect when
@@ -141,9 +147,23 @@ def evaluate_all_splits(
                             (refs_formatted[i], tokenizer.decode(hyp_ids))
                         )
 
+            n_new       = sum(new_mask)
+            n_processed += n_new
+
+            if progress_interval is not None:
+                t_now = time.perf_counter()
+                if t_now - t_last_print >= progress_interval:
+                    elapsed = t_now - t_split_start
+                    rate    = n_processed / elapsed if elapsed > 0 else 0.0
+                    mins, secs = divmod(int(elapsed), 60)
+                    elapsed_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+                    print(f"  [{split_name}] batch {batch_idx + 1}  "
+                          f"{n_processed:,} samples  "
+                          f"{rate:.1f} samples/s  "
+                          f"{elapsed_str} elapsed")
+                    t_last_print = t_now
+
             if reached_loop:
-                # Partial loop: some new samples collected, rest discarded.
-                n_new = sum(new_mask)
                 print(f"  [{split_name}] partial loop at batch {batch_idx} "
                       f"— kept {n_new}/{B} new samples, stopping")
                 break
