@@ -22,10 +22,10 @@ data:
   shards_file: data/full_training_shards.txt
   tokenizer:   data/pruned_tokenizer/
   eval:
-    dev_clean:  data/eval_shards/dev-clean-000000.tar
-    # dev_other:  data/eval_shards/dev-other-000000.tar
-    # test_clean: data/eval_shards/test-clean-000000.tar
-    # test_other: data/eval_shards/test-other-000000.tar
+    dev_clean:  data/eval_subset_shards/dev-clean-480.tar
+    # dev_other:  data/eval_subset_shards/dev-other-480.tar
+    # test_clean: data/eval_subset_shards/test-clean-480.tar
+    # test_other: data/eval_subset_shards/test-other-480.tar
 
 logging:
   wandb:    false
