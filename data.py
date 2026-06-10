@@ -41,6 +41,7 @@ import json
 import math
 import random
 import re
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -249,6 +250,51 @@ def build_dataloader(
     )
 
 
+def _eval_collate_batch(samples: list[tuple]) -> tuple:
+    """Collate a list of eval samples into a single 8-tuple batch.
+
+    Each sample is (mel_arr, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt) where
+    mel_arr is a float32 np.ndarray of shape (80, T).  Used by both
+    build_eval_dataloader and build_sorted_eval_dataloader so the two produce
+    identical tensor layouts.
+
+    Returns:
+        (mel, audio_lengths, unfmt_ids, unfmt_lens,
+         fmt_ids, fmt_lens, refs_unfmt, refs_fmt)
+    """
+    mels, unfmt_lists, fmt_lists, refs_unfmt, refs_fmt = zip(*samples)
+    B = len(mels)
+
+    T_list = [m.shape[1] for m in mels]
+    T_max  = math.ceil(max(T_list) / 8) * 8
+    mel_batch = torch.zeros(B, 80, T_max, dtype=torch.float32)
+    for i, m in enumerate(mels):
+        mel_batch[i, :, : m.shape[1]] = torch.from_numpy(m)
+
+    audio_lengths = torch.tensor(
+        [(T // 2 + 3) // 4 for T in T_list], dtype=torch.long
+    )
+
+    def _pad_ids(id_lists: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+        I_max   = max(len(ids) for ids in id_lists)
+        out     = torch.zeros(B, I_max, dtype=torch.long)
+        lengths = torch.zeros(B, dtype=torch.long)
+        for i, ids in enumerate(id_lists):
+            out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            lengths[i]         = len(ids)
+        return out, lengths
+
+    unfmt_ids, unfmt_lens = _pad_ids(unfmt_lists)
+    fmt_ids,   fmt_lens   = _pad_ids(fmt_lists)
+
+    return (
+        mel_batch, audio_lengths,
+        unfmt_ids, unfmt_lens,
+        fmt_ids,   fmt_lens,
+        list(refs_unfmt), list(refs_fmt),
+    )
+
+
 def build_eval_dataloader(
     shard_path: str | Path,
     tokenizer_path: Path,
@@ -282,48 +328,15 @@ def build_eval_dataloader(
     ids_fmt   = tokenizer.encode(instruction_variants[1])
 
     def _eval_process(sample: dict[str, Any]) -> tuple:
-        mel          = np.load(io.BytesIO(sample["mel.npy"])).astype(np.float32)
-        ref_unfmt    = sample["unformatted.txt"].decode("utf-8")
-        ref_fmt      = sample["formatted.txt"].decode("utf-8")
+        mel       = np.load(io.BytesIO(sample["mel.npy"])).astype(np.float32)
+        ref_unfmt = sample["unformatted.txt"].decode("utf-8")
+        ref_fmt   = sample["formatted.txt"].decode("utf-8")
         return (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt)
-
-    def _eval_collate(samples: list[tuple]) -> tuple:
-        mels, unfmt_lists, fmt_lists, refs_unfmt, refs_fmt = zip(*samples)
-        B = len(mels)
-
-        T_list = [m.shape[1] for m in mels]
-        T_max  = math.ceil(max(T_list) / 8) * 8
-        mel_batch = torch.zeros(B, 80, T_max, dtype=torch.float32)
-        for i, m in enumerate(mels):
-            mel_batch[i, :, : m.shape[1]] = torch.from_numpy(m)
-
-        audio_lengths = torch.tensor(
-            [(T // 2 + 3) // 4 for T in T_list], dtype=torch.long
-        )
-
-        def _pad_ids(id_lists: tuple) -> tuple[torch.Tensor, torch.Tensor]:
-            I_max   = max(len(ids) for ids in id_lists)
-            out     = torch.zeros(B, I_max, dtype=torch.long)
-            lengths = torch.zeros(B, dtype=torch.long)
-            for i, ids in enumerate(id_lists):
-                out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-                lengths[i]         = len(ids)
-            return out, lengths
-
-        unfmt_ids, unfmt_lens = _pad_ids(unfmt_lists)
-        fmt_ids,   fmt_lens   = _pad_ids(fmt_lists)
-
-        return (
-            mel_batch, audio_lengths,
-            unfmt_ids, unfmt_lens,
-            fmt_ids,   fmt_lens,
-            list(refs_unfmt), list(refs_fmt),
-        )
 
     dataset = (
         wds.WebDataset(str(shard_path), shardshuffle=False, nodesplitter=wds.split_by_node)
         .map(_eval_process)
-        .batched(batch_size, collation_fn=_eval_collate, partial=True)
+        .batched(batch_size, collation_fn=_eval_collate_batch, partial=True)
     )
 
     return torch.utils.data.DataLoader(
@@ -332,3 +345,184 @@ def build_eval_dataloader(
         num_workers=num_workers,
         pin_memory=True,
     )
+
+
+def build_sorted_eval_dataloader(
+    shard_path: str | Path,
+    tokenizer_path: Path,
+    instruction_variants: list[str],
+    batch_size: int = 8,
+) -> list[tuple]:
+    """Build a finite, length-sorted list of eval batches from a single .tar shard.
+
+    Reads the shard fully via stdlib tarfile (deterministic, finite — NOT
+    webdataset, which can loop), sorts samples ascending by audio_length, then
+    chunks into contiguous batches of batch_size including the final partial batch.
+
+    Args:
+        shard_path:           path to a single .tar shard
+        tokenizer_path:       path to pruned tokenizer directory
+        instruction_variants: [unformatted_instruction, formatted_instruction]
+        batch_size:           samples per batch; final partial batch is included
+
+    Returns:
+        List of 8-tuples in the same format as build_eval_dataloader:
+            (mel, audio_lengths,
+             unformatted_ids, unformatted_lens,
+             formatted_ids,   formatted_lens,
+             refs_unformatted: list[str], refs_formatted: list[str])
+        Batches are sorted ascending by audio_length; CPU tensors.
+    """
+    tokenizer = PrunedTokenizer(tokenizer_path)
+    ids_unfmt = tokenizer.encode(instruction_variants[0])
+    ids_fmt   = tokenizer.encode(instruction_variants[1])
+
+    # Read every member of the shard and group by key (split on first ".").
+    groups: dict[str, dict[str, bytes]] = {}
+    with tarfile.open(Path(shard_path), "r") as tf:
+        for member in tf.getmembers():
+            dot = member.name.find(".")
+            if dot < 0:
+                continue
+            key = member.name[:dot]
+            ext = member.name[dot + 1:]
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                continue
+            groups.setdefault(key, {})[ext] = fobj.read()
+
+    _REQUIRED = {"mel.npy", "unformatted.txt", "formatted.txt"}
+    complete = {k: v for k, v in groups.items() if _REQUIRED <= set(v.keys())}
+
+    # Decode mel arrays and compute audio_lengths; sort ascending.
+    raw: list[tuple[int, Any, str, str]] = []  # (audio_len, mel_arr, ref_unfmt, ref_fmt)
+    for members in complete.values():
+        mel = np.load(io.BytesIO(members["mel.npy"])).astype(np.float32)
+        T   = mel.shape[1]
+        raw.append(
+            ((T // 2 + 3) // 4, mel,
+             members["unformatted.txt"].decode("utf-8"),
+             members["formatted.txt"].decode("utf-8")),
+        )
+    raw.sort(key=lambda x: x[0])
+
+    # Chunk into contiguous batches and collate each one.
+    batches: list[tuple] = []
+    for start in range(0, len(raw), batch_size):
+        chunk = raw[start : start + batch_size]
+        samples = [
+            (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt)
+            for (_, mel, ref_unfmt, ref_fmt) in chunk
+        ]
+        batches.append(_eval_collate_batch(samples))
+
+    return batches
+
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    import tempfile
+
+    _p = argparse.ArgumentParser()
+    _p.add_argument("--self-test", action="store_true")
+    _args = _p.parse_args()
+
+    if not _args.self_test:
+        _p.print_help()
+        sys.exit(0)
+
+    # ── build_sorted_eval_dataloader self-test ────────────────────────────────
+    with tempfile.TemporaryDirectory() as _tmp:
+        import tarfile as _tf_mod
+        _tmp_dir = Path(_tmp)
+        _shard   = _tmp_dir / "test.tar"
+
+        # Fake tokenizer dir with minimal vocab_map.json + pruned_config.json
+        _tok_dir = _tmp_dir / "tokenizer"
+        _tok_dir.mkdir()
+        # We only need instruction IDs to be non-empty lists — mock PrunedTokenizer.
+        _IDS_UNFMT = [1, 2, 3]
+        _IDS_FMT   = [4, 5, 6, 7]
+        _VARIANTS  = ["unfmt instruction", "fmt instruction"]
+
+        # Write synthetic shard: 11 samples with varying mel lengths.
+        _MEL_LENGTHS = [40, 120, 80, 200, 160, 60, 100, 180, 140, 220, 240]
+        with _tf_mod.open(_shard, "w") as _tar:
+            for _i, _T in enumerate(_MEL_LENGTHS):
+                _key = f"sample-{_i:04d}"
+                _mel = np.zeros((80, _T), dtype=np.float16)
+                _buf = io.BytesIO()
+                np.save(_buf, _mel)
+                _mel_bytes = _buf.getvalue()
+                for _name, _data in [
+                    (f"{_key}.mel.npy",         _mel_bytes),
+                    (f"{_key}.unformatted.txt",  f"unfmt {_i}".encode()),
+                    (f"{_key}.formatted.txt",    f"fmt {_i}".encode()),
+                ]:
+                    _info = _tf_mod.TarInfo(name=_name)
+                    _info.size = len(_data)
+                    _tar.addfile(_info, io.BytesIO(_data))
+
+        # Patch PrunedTokenizer to avoid needing a real tokenizer on disk.
+        class _MockTokenizer:
+            def encode(self, text: str) -> list[int]:
+                return _IDS_UNFMT if "unfmt" in text else _IDS_FMT
+
+        # When running as __main__, build_sorted_eval_dataloader looks up
+        # PrunedTokenizer in __main__'s globals, so patch there directly.
+        _orig_cls = globals()["PrunedTokenizer"]
+        globals()["PrunedTokenizer"] = type(
+            "_PatchedTokenizer", (_MockTokenizer,), {"__init__": lambda self, p: None}
+        )
+
+        try:
+            batches = build_sorted_eval_dataloader(
+                _shard, _tok_dir, _VARIANTS, batch_size=4
+            )
+
+            # Should have ceil(11/4) = 3 batches
+            assert len(batches) == 3, f"Expected 3 batches, got {len(batches)}"
+
+            # Collect all audio_lengths in order to verify ascending sort.
+            all_lengths: list[int] = []
+            for _b in batches:
+                all_lengths.extend(_b[1].tolist())
+            assert all_lengths == sorted(all_lengths), (
+                f"Batches not sorted ascending: {all_lengths}"
+            )
+
+            # All 11 samples covered; no duplicates.
+            assert len(all_lengths) == 11, f"Expected 11 samples total, got {len(all_lengths)}"
+
+            # Final batch has 3 samples (11 % 4 == 3), not 4.
+            assert batches[-1][0].shape[0] == 3, (
+                f"Last batch should be partial (3), got {batches[-1][0].shape[0]}"
+            )
+
+            # Check 8-tuple structure.
+            for _b in batches:
+                _mel, _al, _ui, _ul, _fi, _fl, _ru, _rf = _b
+                _B = _mel.shape[0]
+                assert _mel.shape[1] == 80,               "mel dim 1 should be 80"
+                assert _al.shape == (_B,),                "audio_lengths shape"
+                assert _ui.shape[0] == _B,                "unfmt_ids batch dim"
+                assert _fi.shape[0] == _B,                "fmt_ids batch dim"
+                assert _ul.shape == (_B,),                "unfmt_lens shape"
+                assert _fl.shape == (_B,),                "fmt_lens shape"
+                assert len(_ru) == _B,                    "refs_unfmt length"
+                assert len(_rf) == _B,                    "refs_fmt length"
+
+            # Reference strings match what was written.
+            _all_unfmt = []
+            _all_fmt   = []
+            for _b in batches:
+                _all_unfmt.extend(_b[6])
+                _all_fmt.extend(_b[7])
+            assert all(_s.startswith("unfmt ") for _s in _all_unfmt), "unfmt refs wrong"
+            assert all(_s.startswith("fmt ")   for _s in _all_fmt),   "fmt refs wrong"
+
+        finally:
+            globals()["PrunedTokenizer"] = _orig_cls
+
+    print("PASSED")

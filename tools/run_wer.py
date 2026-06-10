@@ -35,7 +35,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build import build_models
-from data import INSTRUCTION_VARIANTS, PrunedTokenizer, build_eval_dataloader
+from data import INSTRUCTION_VARIANTS, PrunedTokenizer, build_sorted_eval_dataloader
 from utils.checkpoint import load_weights
 from utils.config import load_config
 from utils.evaluate import evaluate_all_splits
@@ -148,14 +148,14 @@ def main(argv: list[str] | None = None) -> None:
         ("test-other", eval_cfg.test_other),
     ]
 
-    eval_loaders: dict[str, torch.utils.data.DataLoader] = {}
+    eval_loaders: dict[str, list[tuple]] = {}
     for split_name, shard_path in eval_shard_map:
         if shard_path is None:
             continue
         if not Path(shard_path).exists():
             print(f"[warn] eval shard for {split_name} not found: {shard_path} — skipping")
             continue
-        eval_loaders[split_name] = build_eval_dataloader(
+        eval_loaders[split_name] = build_sorted_eval_dataloader(
             shard_path,
             tokenizer_path        = cfg.data.tokenizer,
             instruction_variants  = INSTRUCTION_VARIANTS,

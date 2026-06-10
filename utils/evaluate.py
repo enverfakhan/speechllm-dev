@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -35,7 +35,7 @@ def evaluate_all_splits(
     encoder:      "WhisperEncoder",
     adapter:      "AudioAdapter",
     llama:        "Llama",
-    eval_loaders: dict[str, torch.utils.data.DataLoader],
+    eval_loaders: dict[str, Any],
     tokenizer:    "PrunedTokenizer",
     sep_token_id: int,
     device:       torch.device,
@@ -47,6 +47,9 @@ def evaluate_all_splits(
 ) -> tuple[dict[str, float], list[dict]]:
     """Run batched greedy WER evaluation on every eval split.
 
+    Assumes a finite, single-pass loader — use build_sorted_eval_dataloader
+    from data.py, which reads via tarfile and never loops.
+
     For each split, generation is run once per requested format and WER is
     reported separately for each.  No text normalisation is applied so the
     scores reflect whether the model actually follows the formatting instruction.
@@ -55,7 +58,8 @@ def evaluate_all_splits(
     split per format for qualitative inspection.
 
     Args:
-        eval_loaders:      split name → DataLoader (from build_eval_dataloader)
+        eval_loaders:      split name → finite iterable of 8-tuples
+                           (from build_sorted_eval_dataloader)
         tokenizer:         PrunedTokenizer for decoding generated IDs to text
         max_batches:       cap per split (None = full eval)
         n_samples:         number of (ref, hyp) pairs to sample per split per format
@@ -85,11 +89,6 @@ def evaluate_all_splits(
         n_processed   = 0
         t_split_start = time.perf_counter()
         t_last_print  = t_split_start
-        # Per-sample fingerprint: audio_length prepended to the unformatted
-        # reference text. The audio_length disambiguates the rare case of two
-        # utterances sharing identical transcript text. Used to detect when
-        # WebDataset loops back to already-processed samples.
-        seen_ids: set[str] = set()
 
         for batch_idx, batch in enumerate(loader):
             if max_batches is not None and batch_idx >= max_batches:
@@ -100,24 +99,9 @@ def evaluate_all_splits(
              fmt_ids,   fmt_lens,
              refs_unformatted, refs_formatted) = batch
 
-            # Build fingerprints before any .to(device) call.
-            B = audio_lengths.shape[0]
-            batch_ids = [
-                str(int(audio_lengths[i].item())) + refs_unformatted[i]
-                for i in range(B)
-            ]
-            new_mask    = [bid not in seen_ids for bid in batch_ids]
-            seen_ids.update(batch_ids)
-            reached_loop = not all(new_mask)
-
-            if not any(new_mask):
-                # Every sample in this batch already seen — dataset has fully looped.
-                print(f"  [{split_name}] loop detected at batch {batch_idx} "
-                      f"— {len(seen_ids)} unique samples evaluated")
-                break
-
             mel           = mel.to(device)
             audio_lengths = audio_lengths.to(device)
+            B = audio_lengths.shape[0]
 
             if run_unfmt:
                 unfmt_ids  = unfmt_ids.to(device)
@@ -128,10 +112,9 @@ def evaluate_all_splits(
                     sep_token_id=sep_token_id,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_unfmt):
-                    if new_mask[i]:
-                        pairs_unfmt.append(
-                            (refs_unformatted[i], tokenizer.decode(hyp_ids))
-                        )
+                    pairs_unfmt.append(
+                        (refs_unformatted[i], tokenizer.decode(hyp_ids))
+                    )
 
             if run_fmt:
                 fmt_ids  = fmt_ids.to(device)
@@ -142,13 +125,11 @@ def evaluate_all_splits(
                     sep_token_id=sep_token_id,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_fmt):
-                    if new_mask[i]:
-                        pairs_fmt.append(
-                            (refs_formatted[i], tokenizer.decode(hyp_ids))
-                        )
+                    pairs_fmt.append(
+                        (refs_formatted[i], tokenizer.decode(hyp_ids))
+                    )
 
-            n_new       = sum(new_mask)
-            n_processed += n_new
+            n_processed += B
 
             if progress_interval is not None:
                 t_now = time.perf_counter()
@@ -162,11 +143,6 @@ def evaluate_all_splits(
                           f"{rate:.1f} samples/s  "
                           f"{elapsed_str} elapsed")
                     t_last_print = t_now
-
-            if reached_loop:
-                print(f"  [{split_name}] partial loop at batch {batch_idx} "
-                      f"— kept {n_new}/{B} new samples, stopping")
-                break
 
         if run_unfmt:
             refs_u = [r for r, _ in pairs_unfmt]
