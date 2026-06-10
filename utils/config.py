@@ -376,13 +376,14 @@ def _validate(cfg: Config) -> None:
                 f"metrics.compute_only_on_emit: key {k!r} not in {_VALID_METRIC_FAMILIES}"
             )
     wer = cfg.metrics.wer
-    if wer.period <= 0:
-        raise ValueError(f"metrics.wer.period: must be > 0, got {wer.period}")
-    if wer.period % cfg.metrics.eval_every != 0:
-        raise ValueError(
-            f"metrics.wer.period: must be a positive multiple of metrics.eval_every "
-            f"({cfg.metrics.eval_every}), got {wer.period}"
-        )
+    if wer.enabled:
+        if wer.period <= 0:
+            raise ValueError(f"metrics.wer.period: must be > 0, got {wer.period}")
+        if wer.period % cfg.metrics.eval_every != 0:
+            raise ValueError(
+                f"metrics.wer.period: must be a positive multiple of metrics.eval_every "
+                f"({cfg.metrics.eval_every}), got {wer.period}"
+            )
     if wer.max_batches <= 0:
         raise ValueError(f"metrics.wer.max_batches: must be > 0, got {wer.max_batches}")
     if wer.sample_transcriptions <= 0:
