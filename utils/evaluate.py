@@ -103,6 +103,14 @@ def evaluate_all_splits(
             audio_lengths = audio_lengths.to(device)
             B = audio_lengths.shape[0]
 
+            # Cap generation at the longest reference in this batch (in tokens) + 10
+            # so a single runaway sample can't stall the whole eval run.
+            all_refs = (
+                (refs_unformatted if run_unfmt else []) +
+                (refs_formatted   if run_fmt   else [])
+            )
+            max_new_tokens = max(len(tokenizer.encode(r)) for r in all_refs) + 10
+
             if run_unfmt:
                 unfmt_ids  = unfmt_ids.to(device)
                 unfmt_lens = unfmt_lens.to(device)
@@ -110,6 +118,7 @@ def evaluate_all_splits(
                     encoder, adapter, llama,
                     mel, audio_lengths, unfmt_ids, unfmt_lens,
                     sep_token_id=sep_token_id,
+                    max_new_tokens=max_new_tokens,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_unfmt):
                     pairs_unfmt.append(
@@ -123,6 +132,7 @@ def evaluate_all_splits(
                     encoder, adapter, llama,
                     mel, audio_lengths, fmt_ids, fmt_lens,
                     sep_token_id=sep_token_id,
+                    max_new_tokens=max_new_tokens,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_fmt):
                     pairs_fmt.append(
