@@ -18,7 +18,7 @@ model:
   whisper_ckpt: weights/whisper_small.pt
   llama_ckpt: weights/Llama3.1-8B/
   adapter_pca_init: null
-  gradient_checkpointing: false  # enable on Llama for non-stub GCP runs
+  gradient_checkpointing: true   # recompute activations during backward to reduce peak VRAM
   init_from: null                # path to checkpoint for weights-only warm-start
 
 optim:
