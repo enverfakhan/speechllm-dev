@@ -1,0 +1,37 @@
+# both_formats_from_baseline.yaml
+# Continues the unformatted baseline (step 4680) with BOTH formats to step 20000.
+# LAUNCH WITH --resume so it restores adapter weights + optimizer + scaler and
+# continues the step counter from 4680:
+#   python training.py --config configs/both_formats_from_baseline.yaml \
+#       --resume checkpoints/<baseline-run>/step_0004680.pt
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: both-formats-from-baseline-4680
+checkpoint:
+  dir:        checkpoints/both-formats-from-baseline-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        adapter_both
+    trainable:   [adapter]
+    lrs:         {adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: never}

@@ -1,29 +1,35 @@
-"""Binary search for the maximum micro-batch size under gradient accumulation.
+"""Binary search for the maximum batch size that fits in VRAM.
 
-Stage 1: adapter only (encoder + Llama frozen, excluded from optimizer).
-Stage 2: encoder + adapter + Llama, all trainable.
+Eval mode (--eval):
+  No optimizer, no gradients, no gradient checkpointing.
+  Models run in .eval() under torch.no_grad() + bfloat16 autocast.
+  Use this to find the largest batch size for inference / evaluation.
 
-Both stages use:
-  - Full Llama 3.1 8B dims (d_model=4096, 32 layers, GQA 32/8 heads)
-  - Flash Attention via F.scaled_dot_product_attention
-  - torch.utils.checkpoint for gradient checkpointing
-  - torch.autocast(bfloat16)
-  - 8-bit AdamW (bitsandbytes)
+Training modes (--stage 1 or 2):
+  Stage 1: adapter only (encoder + Llama frozen, excluded from optimizer).
+  Stage 2: encoder + adapter + Llama, all trainable.
 
-For each accum_steps value the script finds the largest micro-batch size that
-fits in VRAM when running accum_steps forward+backward passes before a single
-optimizer step. The result table lets you pick the (micro_batch, accum) pair
-that maximises GPU utilisation at your target effective batch size.
+  Both training stages use:
+    - Full Llama 3.1 8B dims (d_model=4096, 32 layers, GQA 32/8 heads)
+    - Flash Attention via F.scaled_dot_product_attention
+    - torch.utils.checkpoint for gradient checkpointing
+    - torch.autocast(bfloat16)
+    - 8-bit AdamW (bitsandbytes)
 
-Stage 2 note: bitsandbytes AdamW8bit defers GPU state allocation until the 4th
-optimizer.step() call. Without a warm-up this creates a surprise ~14 GB spike
-mid-accumulation that would make the binary search unreliable. The script runs
-4 warm-up steps at batch=1 before searching to pre-materialise the state.
+  For each accum_steps value the script finds the largest micro-batch size that
+  fits in VRAM when running accum_steps forward+backward passes before a single
+  optimizer step.
+
+  Stage 2 note: bitsandbytes AdamW8bit defers GPU state allocation until the 4th
+  optimizer.step() call. Without a warm-up this creates a surprise ~14 GB spike
+  mid-accumulation that would make the binary search unreliable. The script runs
+  4 warm-up steps at batch=1 before searching to pre-materialise the state.
 
 Usage:
-    python scripts/find_max_batch.py --stage 2
-    python scripts/find_max_batch.py --stage 2 --accum 1 4 8
-    python scripts/find_max_batch.py --stage 1 --accum 1
+    python tools/find_max_batch.py --eval
+    python tools/find_max_batch.py --stage 2
+    python tools/find_max_batch.py --stage 2 --accum 1 4 8
+    python tools/find_max_batch.py --stage 1 --accum 1
 """
 
 
@@ -38,7 +44,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model.adapter import AudioAdapter, prepare_input
+from model.adapter import AudioAdapter
+from model.sequence import prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
@@ -58,12 +65,15 @@ _TOTAL_VRAM_GB = (
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Binary-search max micro-batch size for each accum_steps value."
+        description="Binary-search max batch size for eval or training stages."
     )
-    p.add_argument("--stage", type=int, choices=[1, 2], required=True,
-                   help="Training stage: 1=adapter only, 2=all params trainable.")
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--eval", action="store_true",
+                      help="Eval mode: no optimizer, no gradients, no grad checkpointing.")
+    mode.add_argument("--stage", type=int, choices=[1, 2],
+                      help="Training stage: 1=adapter only, 2=all params trainable.")
     p.add_argument("--accum", type=int, nargs="+", default=[1, 2, 4, 8],
-                   help="Gradient accumulation steps to probe (default: 1 2 4 8).")
+                   help="Gradient accumulation steps to probe (training only, default: 1 2 4 8).")
     p.add_argument("--min_batch", type=int, default=1)
     p.add_argument("--max_batch", type=int, default=128)
     return p.parse_args()
@@ -71,7 +81,10 @@ def _parse_args() -> argparse.Namespace:
 
 # ── Model / optimizer construction ───────────────────────────────────────────
 
-def _build_models(stage: int) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
+def _build_models(
+    stage: int | None,
+    for_eval: bool = False,
+) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
     llama_cfg = LlamaConfig(vocab_size=_VOCAB_SIZE)
     encoder   = WhisperEncoder()
     encoder.load_openai_weights("./weights/whisper_small.pt")
@@ -83,6 +96,12 @@ def _build_models(stage: int) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
     encoder = encoder.to(device)
     adapter = adapter.to(device)
     llama   = llama.to(device)
+
+    if for_eval:
+        encoder.eval()
+        adapter.eval()
+        llama.eval()
+        return encoder, adapter, llama
 
     if stage == 1:
         encoder.requires_grad_(False)
@@ -212,6 +231,48 @@ def _try_batch(
         gc.collect()
 
 
+# ── Eval probe ───────────────────────────────────────────────────────────────
+
+def _try_batch_eval(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    batch_size: int,
+) -> tuple[bool, float]:
+    """Forward-only pass under torch.no_grad(). No optimizer, no backward.
+
+    Returns (success, peak_vram_gb).
+    """
+    device = torch.device("cuda")
+    torch.cuda.reset_peak_memory_stats(device)
+
+    try:
+        mel       = torch.randn(batch_size, 80, 3000, device=device, dtype=torch.bfloat16)
+        a_lens    = torch.full((batch_size,), _AUDIO_TOKS, dtype=torch.long, device=device)
+        inst_ids  = torch.randint(0, _VOCAB_SIZE, (batch_size, _INST_TOKS), device=device)
+        inst_lens = torch.full((batch_size,), _INST_TOKS, dtype=torch.long, device=device)
+        tr_ids    = torch.randint(0, _VOCAB_SIZE, (batch_size, _TRANS_TOKS), device=device)
+        tr_lens   = torch.full((batch_size,), _TRANS_TOKS, dtype=torch.long, device=device)
+
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            enc_out = encoder(mel)
+            adp_out = adapter(enc_out)
+            inputs, labels = prepare_input(
+                adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
+                llama.embed_tokens, sep_token_id=_VOCAB_SIZE - 1,
+            )
+            _, loss = llama(inputs, labels)
+
+        peak = torch.cuda.max_memory_allocated(device) / 1e9
+        return True, peak
+
+    except torch.cuda.OutOfMemoryError:
+        return False, 0.0
+    finally:
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
 # ── Binary search ─────────────────────────────────────────────────────────────
 
 def _search(
@@ -252,6 +313,41 @@ def _search(
     return best, best_peak
 
 
+# ── Eval binary search ────────────────────────────────────────────────────────
+
+def _search_eval(
+    encoder: WhisperEncoder,
+    adapter: AudioAdapter,
+    llama: Llama,
+    min_batch: int,
+    max_batch: int,
+) -> tuple[int, float]:
+    """Binary search for max eval batch size. Returns (max_batch_size, peak_vram_gb)."""
+    ok, peak = _try_batch_eval(encoder, adapter, llama, 1)
+    util = peak / _TOTAL_VRAM_GB * 100
+    if ok:
+        print(f"  batch={1:4d}  ✓ OK   peak={peak:.1f}GB  util={util:.0f}%")
+        best, best_peak = 1, peak
+    else:
+        print(f"  batch={1:4d}  ✗ OOM")
+        return 0, 0.0
+
+    lo, hi = max(2, min_batch), max_batch
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        ok, peak = _try_batch_eval(encoder, adapter, llama, mid)
+        util = peak / _TOTAL_VRAM_GB * 100
+        if ok:
+            print(f"  batch={mid:4d}  ✓ OK   peak={peak:.1f}GB  util={util:.0f}%")
+            best, best_peak = mid, peak
+            lo = mid + 1
+        else:
+            print(f"  batch={mid:4d}  ✗ OOM")
+            hi = mid - 1
+
+    return best, best_peak
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -263,11 +359,35 @@ def main() -> None:
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Total VRAM: {_TOTAL_VRAM_GB:.1f} GB")
+
+    # ── Eval path ─────────────────────────────────────────────────────────────
+    if args.eval:
+        print("Mode: eval (no optimizer, no gradients, no grad checkpointing)")
+        print()
+        encoder, adapter, llama = _build_models(stage=None, for_eval=True)
+        best, best_peak = _search_eval(
+            encoder, adapter, llama,
+            min_batch=args.min_batch,
+            max_batch=args.max_batch,
+        )
+        util = best_peak / _TOTAL_VRAM_GB * 100 if best > 0 else 0.0
+        print()
+        print("═" * 50)
+        print("SUMMARY  eval (forward-only, bfloat16)")
+        print("═" * 50)
+        if best > 0:
+            print(f"  max batch size : {best}")
+            print(f"  peak VRAM      : {best_peak:.1f} GB  ({util:.0f}% of {_TOTAL_VRAM_GB:.1f} GB)")
+        else:
+            print("  OOM at batch=1 — cannot fit even a single sample.")
+        return
+
+    # ── Training path ─────────────────────────────────────────────────────────
     print(f"Stage {args.stage}: {'adapter only' if args.stage == 1 else 'all params trainable'}")
     print(f"Probing accum_steps: {args.accum}")
     print()
 
-    encoder, adapter, llama = _build_models(args.stage)
+    encoder, adapter, llama = _build_models(args.stage, for_eval=False)
     optimizer = _build_optimizer(args.stage, encoder, adapter, llama)
 
     if args.stage == 2:

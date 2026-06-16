@@ -1,0 +1,15 @@
+# example.yaml — illustrative two-stage run (not a real experiment).
+data:
+  shards_file: data_dev/dev_train_shards.txt
+  diag_shard: dev_shards/dev-diag-1183-000000.tar
+logging: {wandb: false, project: speech-llm-dev}
+checkpoint: {dir: checkpoints/example, save_every: 360}
+run: {max_steps: 5000}
+stages:
+  - {name: adapter_only, trainable: [adapter], lrs: {adapter: 1.0e-4},
+     batch_size: 64, accum_steps: 2,
+     exit: {strategy: first_token_below, threshold: 0.7, min_steps: 500}}
+  - {name: full_finetune, trainable: [encoder, adapter, llama],
+     lrs: {encoder: 1.0e-6, adapter: 5.0e-5, llama: 1.5e-5},
+     schedule: {warmup_steps: 1000}, batch_size: 8, accum_steps: 1,
+     optimizer_init: fresh, exit: {strategy: max_steps}}

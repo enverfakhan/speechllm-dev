@@ -1,0 +1,51 @@
+# stage1-overfit-5000.yaml
+# Post-hoc WER config for the adapter-only stage-1 overfit probe run
+# (trained via data_dev/auto_stage_copy.sh, checkpoint_dir: checkpoints/stage1-overfit-probe).
+#
+# The checkpoint contains only the adapter state_dict (encoder + Llama were frozen).
+# run_wer.py loads pretrained Whisper + Llama weights first, then overlays the adapter.
+#
+# Usage:
+#   python tools/run_wer.py \
+#       --config  configs/stage1-overfit-5000.yaml \
+#       --checkpoints checkpoints/stage1-overfit-probe/step_0004680.pt \
+#       --output  results/stage1-0004680-wer.csv
+
+model:
+  stub: false
+  whisper_ckpt: weights/whisper_small.pt
+  llama_ckpt:   weights/Llama3.1-8B/Llama3.1-8B/
+  gradient_checkpointing: false   # not needed for inference
+
+data:
+  # run_wer.py does not consume training shards; field required by config validator
+  shards_file: data/full_training_shards.txt
+  tokenizer:   data/pruned_tokenizer/
+  eval:
+    dev_clean:  data/eval_subset_shards/dev-clean-480.tar
+    # dev_other:  data/eval_subset_shards/dev-other-480.tar
+    # test_clean: data/eval_subset_shards/test-clean-480.tar
+    # test_other: data/eval_subset_shards/test-other-480.tar
+
+logging:
+  wandb:    false
+  project:  speechllm-auto-stage
+
+metrics:
+  eval_batch_size: 96   # conservative for 8B model on 12 GB VRAM
+  wer:
+    enabled:               false   # in-loop WER; unused by run_wer.py
+    max_batches:           40    # effectively unlimited — run through full shard
+    sample_transcriptions: 3000    # largest set has 2,932 samples
+
+run:
+  max_steps:        5000
+  instruction_mode: unformatted   # matches training; run_wer.py evaluates both formats
+
+stages:
+  - name:        adapter_only
+    trainable:   [adapter]
+    lrs:         {adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps}

@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import torch
 
-from model.adapter import AudioAdapter, prepare_input
+from model.adapter import AudioAdapter
+from model.sequence import prepare_input
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
@@ -107,9 +108,10 @@ def main() -> None:
 
     assert loss is not None, "loss is None — check that labels were passed correctly"
 
-    # L_max = max(375+1+20+1+25, 250+1+15+1+30) = max(422, 297) = 422
+    # L_max = max(375+1+20+1+25+1, 250+1+15+1+30+1) = max(423, 298) = 423
+    # The +1 at the end is the trailing SEP (EOS target) appended by prepare_input.
     L_max = max(
-        int(audio_lengths[i]) + 1 + int(inst_lengths[i]) + 1 + int(trans_lengths[i])
+        int(audio_lengths[i]) + 1 + int(inst_lengths[i]) + 1 + int(trans_lengths[i]) + 1
         for i in range(B)
     )
     assert inputs.shape == (B, L_max, llama_cfg.d_model), \

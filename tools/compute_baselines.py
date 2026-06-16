@@ -26,10 +26,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import webdataset as wds
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data import PrunedTokenizer
 
