@@ -157,8 +157,18 @@ def load_weights(
     return loaded
 
 
-def load_full_checkpoint(
-    path: Path | str,
+def read_checkpoint(path: Path | str) -> dict:
+    """Read a checkpoint file into a raw dict, without applying it to any module.
+
+    Lets a caller inspect checkpoint metadata (e.g. stage_index) before
+    deciding which modules/optimizer/scheduler to construct and pass to
+    apply_full_checkpoint — avoiding a second torch.load of a large file.
+    """
+    return torch.load(path, map_location="cpu")
+
+
+def apply_full_checkpoint(
+    ckpt: dict,
     *,
     encoder:   nn.Module | None                              = None,
     adapter:   nn.Module,
@@ -167,7 +177,7 @@ def load_full_checkpoint(
     scaler:    torch.amp.GradScaler,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None  = None,
 ) -> ResumeState:
-    """Load a full checkpoint for same-stage resume.
+    """Apply an already-loaded full checkpoint dict for same-stage resume.
 
     encoder and llama are loaded when both passed AND present in the file.
     Passing None for either skips the corresponding load without error.
@@ -180,11 +190,10 @@ def load_full_checkpoint(
 
     Returns a ResumeState with batch_size=None when the key is absent from
     the checkpoint (old format).  The caller should apply its own default:
-        rs = load_full_checkpoint(...)
+        ckpt = read_checkpoint(path)
+        rs = apply_full_checkpoint(ckpt, ...)
         batch_size = rs.batch_size if rs.batch_size is not None else args.batch_size
     """
-    ckpt = torch.load(path, map_location="cpu")
-
     if encoder is not None and "encoder" in ckpt:
         encoder.load_state_dict(ckpt["encoder"])
     adapter.load_state_dict(ckpt["adapter"])
@@ -213,6 +222,28 @@ def load_full_checkpoint(
         batch_size          = ckpt.get("batch_size"),   # None when absent
         step_in_stage       = ckpt.get("step_in_stage", ckpt["step"]),  # old ckpts: use global step
         stage_index         = ckpt.get("stage_index", 0),
+    )
+
+
+def load_full_checkpoint(
+    path: Path | str,
+    *,
+    encoder:   nn.Module | None                              = None,
+    adapter:   nn.Module,
+    llama:     nn.Module | None                              = None,
+    optimizer: torch.optim.Optimizer,
+    scaler:    torch.amp.GradScaler,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None  = None,
+) -> ResumeState:
+    """Load a full checkpoint for same-stage resume.
+
+    Thin wrapper: read_checkpoint(path) then apply_full_checkpoint(...).
+    See apply_full_checkpoint for behavior notes.
+    """
+    return apply_full_checkpoint(
+        read_checkpoint(path),
+        encoder=encoder, adapter=adapter, llama=llama,
+        optimizer=optimizer, scaler=scaler, scheduler=scheduler,
     )
 
 

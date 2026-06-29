@@ -10,7 +10,7 @@ Usage pattern (in training.py):
     stage = Stage(cfg.stages[idx], ctx)
     optimizer, scheduler = stage.setup(encoder, adapter, llama)
     for epoch in itertools.count():
-        loader = stage.make_loader(epoch)
+        loader = stage.make_loader(epoch, stage_idx=idx)
         for batch in loader:
             ...  # forward, backward, scaler.step, scheduler.step
             if stage.should_advance(metrics, step_in_stage):
@@ -143,6 +143,16 @@ class Stage:
         """Gradient accumulation steps for this stage."""
         return self._config.accum_steps
 
+    @property
+    def batch_size(self) -> int:
+        """Batch size for this stage."""
+        return self._config.batch_size
+
+    @property
+    def trainable(self) -> list[str]:
+        """Modules trainable in this stage."""
+        return list(self._config.trainable)
+
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(
@@ -240,15 +250,20 @@ class Stage:
 
     # ── DataLoader ────────────────────────────────────────────────────────────
 
-    def make_loader(self, epoch: int) -> torch.utils.data.DataLoader:
+    def make_loader(self, epoch: int, stage_idx: int) -> torch.utils.data.DataLoader:
         """Build a DataLoader for this stage at a given epoch.
 
         Reproduces the canonical per-epoch shuffle:
             epoch_shards = list(ctx.shards)
-            random.Random(ctx.seed + epoch).shuffle(epoch_shards)
+            random.Random(ctx.seed + stage_idx * 10000 + epoch).shuffle(epoch_shards)
+
+        For stage_idx == 0 this reduces to ctx.seed + epoch, preserving the
+        existing single-stage behavior.  The stage_idx term decorrelates each
+        stage's first pass so stage N never opens with stage 0's ordering.
 
         Args:
-            epoch: 0-based epoch index; controls the shard shuffle seed
+            epoch:     0-based epoch index; controls the shard shuffle seed
+            stage_idx: 0-based stage index; decorrelates per-stage shuffles
 
         Returns:
             DataLoader yielding 6-tuples:
@@ -257,7 +272,7 @@ class Stage:
         """
         ctx = self._ctx
         epoch_shards = list(ctx.shards)
-        random.Random(ctx.seed + epoch).shuffle(epoch_shards)
+        random.Random(ctx.seed + stage_idx * 10000 + epoch).shuffle(epoch_shards)
 
         return data.build_dataloader(
             epoch_shards,
@@ -474,7 +489,7 @@ if __name__ == "__main__":
 
     with mock.patch.object(data, "build_dataloader", side_effect=_mock_build_dataloader):
         stage0_loader = Stage(s0_cfg, ctx)
-        stage0_loader.make_loader(epoch=3)
+        stage0_loader.make_loader(epoch=3, stage_idx=0)
 
     # batch_size matches stage config.
     assert captured["batch_size"] == s0_cfg.batch_size, (
@@ -486,9 +501,9 @@ if __name__ == "__main__":
         f"wrong instruction_variants: {captured['instruction_variants']}"
     )
 
-    # Shards are shuffled with seed+epoch.
+    # Shards are shuffled with seed + stage_idx*10000 + epoch (stage_idx=0 reduces to seed+epoch).
     expected_shards = list(ctx.shards)
-    random.Random(ctx.seed + 3).shuffle(expected_shards)
+    random.Random(ctx.seed + 0 * 10000 + 3).shuffle(expected_shards)
     assert captured["shards"] == expected_shards, (
         f"shard order mismatch\n  got:      {captured['shards']}\n"
         f"  expected: {expected_shards}"

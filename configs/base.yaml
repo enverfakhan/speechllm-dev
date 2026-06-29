@@ -50,7 +50,6 @@ metrics:
 
 run:
   max_steps: null
-  start_stage: 0
   instruction_mode: unformatted
 
 stage_defaults:

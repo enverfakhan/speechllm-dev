@@ -12,10 +12,10 @@ Usage:
 from __future__ import annotations
 
 import json
-import math
 import random
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,9 @@ from model.whisper_encoder import WhisperEncoder
 from metrics import MetricCollector, render
 from stages import Stage, StageContext
 from utils.checkpoint import (
-    load_full_checkpoint,
+    apply_full_checkpoint,
+    read_checkpoint,
+    ResumeState,
     save_adapter_checkpoint,
     save_checkpoint,
 )
@@ -50,22 +52,33 @@ _INSTRUCTION_PAIRS: list[tuple[str, str]] = [
 _EMA_ALPHA = 0.98
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Run state ─────────────────────────────────────────────────────────────────
 
-def fast_forward(loader: torch.utils.data.DataLoader, n: int) -> None:
-    """Advance n batches from loader without processing them.
+@dataclass
+class RunState:
+    """Mutable counters threaded through the stage loop.
 
-    Mirrors _exhaust_dataloader in train.py: creates a separate iterator
-    that is discarded after n steps.  The caller's main iterator is unaffected,
-    but micro_step_in_epoch is updated by the caller to reflect the skip.
+    global_step persists across stage boundaries; step_in_stage and epoch
+    are reset at the start of each new (non-resumed) stage.
     """
-    it = iter(loader)
-    for _ in range(n):
-        try:
-            next(it)
-        except StopIteration:
-            break
+    global_step:   int = 0   # run-global, persists across stages
+    step_in_stage: int = 0   # per-stage
+    epoch:         int = 0   # per-stage
 
+    @classmethod
+    def fresh(cls) -> "RunState":
+        return cls()
+
+    @classmethod
+    def from_resume(cls, rs: "ResumeState") -> "RunState":
+        return cls(global_step=rs.step, step_in_stage=rs.step_in_stage, epoch=rs.epoch)
+
+    def enter_new_stage(self) -> None:
+        self.epoch = 0
+        self.step_in_stage = 0
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def run_eval_pass(
     encoder:      WhisperEncoder,
@@ -198,6 +211,208 @@ def maybe_run_wer(
     return out
 
 
+# ── Per-stage loop ────────────────────────────────────────────────────────────
+
+def run_stage(
+    encoder:      WhisperEncoder,
+    adapter:      AudioAdapter,
+    llama:        Llama,
+    optimizer:    torch.optim.Optimizer,
+    scheduler:    torch.optim.lr_scheduler.LRScheduler,
+    scaler:       torch.amp.GradScaler,
+    metrics:      MetricCollector,
+    tokenizer:    PrunedTokenizer,
+    diag_loader:  torch.utils.data.DataLoader | None,
+    diag_iter:    Any,
+    stage:        Stage,
+    stage_idx:    int,
+    run:          RunState,
+    cfg:          Config,
+    device:       torch.device,
+    sep_token_id: int,
+    use_wandb:    bool,
+    ckpt_dir:     Path,
+    baselines_data: dict,
+    train_start:  float,
+) -> bool:
+    """Run one stage to completion (or until the global step cap is hit).
+
+    Returns True iff training should stop entirely (cfg.run.max_steps reached);
+    False means this stage advanced and the caller should move to the next one.
+    """
+    optimizer.zero_grad()
+    accum_loss  = 0.0
+    loss_ema: float | None = None
+    micro_acc   = 0   # accum-boundary counter; never reset across epochs in this stage
+    advanced    = False
+
+    step_start    = time.perf_counter()
+    step_audio_s  = 0.0
+    total_audio_s = 0.0
+
+    max_steps = cfg.run.max_steps
+
+    # ── Epoch loop ────────────────────────────────────────────────────────────
+    while not advanced and (max_steps is None or run.global_step < max_steps):
+        micro_step_in_epoch = 0
+        loader = stage.make_loader(run.epoch, stage_idx)
+
+        # ── Batch loop ────────────────────────────────────────────────────────
+        for batch in loader:
+            micro_step_in_epoch += 1
+
+            (mel, audio_lengths,
+             instruction_ids, instruction_lengths,
+             transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
+
+            # audio_lengths[i] = adapter tokens; each = 8 mel frames @ 10 ms
+            step_audio_s += audio_lengths.sum().item() * 8 * 0.01
+
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                enc_out     = encoder(mel)
+                adapter_out = adapter(enc_out)
+                inputs, labels = prepare_input(
+                    adapter_out,
+                    audio_lengths,
+                    instruction_ids,
+                    instruction_lengths,
+                    transcript_ids,
+                    transcript_lengths,
+                    llama.embed_tokens,
+                    sep_token_id,
+                )
+                logits, loss = llama(inputs, labels)
+
+            metrics.observe("train", run.global_step, logits=logits, labels=labels)
+            scaler.scale(loss / stage.accum_steps).backward()
+            accum_loss += loss.item()
+            micro_acc  += 1
+
+            if micro_acc % stage.accum_steps != 0:
+                continue  # accumulate more micro-steps before stepping
+
+            # ── Optimizer step ────────────────────────────────────────────────
+            scaler.unscale_(optimizer)
+            if cfg.optim.grad_clip.enabled:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for g in optimizer.param_groups for p in g["params"]],
+                    cfg.optim.grad_clip.max_norm,
+                )
+            # Observe gradients (after unscale, before step)
+            metrics.observe(
+                "train", run.global_step,
+                encoder = encoder,
+                adapter = adapter,
+                llama   = llama,
+            )
+
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            run.global_step   += 1
+            run.step_in_stage += 1
+
+            avg_loss   = accum_loss / stage.accum_steps
+            accum_loss = 0.0
+            loss_ema   = (
+                avg_loss if loss_ema is None
+                else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
+            )
+
+            # ── Periodic checkpoint ───────────────────────────────────────────
+            if cfg.checkpoint.save_every and run.global_step % cfg.checkpoint.save_every == 0:
+                _save_checkpoint(
+                    ckpt_dir, stage, stage_idx,
+                    run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
+                    encoder, adapter, llama, optimizer, scaler, scheduler,
+                )
+
+            # ── Eval pass ─────────────────────────────────────────────────────
+            eval_metrics: dict = {}
+            eval_subset:  list = []
+            wer_metrics:  dict = {}
+
+            if diag_loader is not None and run.global_step % cfg.metrics.eval_every == 0:
+                eval_metrics, eval_subset, diag_iter = run_eval_pass(
+                    encoder, adapter, llama,
+                    diag_loader, diag_iter,
+                    metrics, sep_token_id, device,
+                    cfg.metrics.eval_batches,
+                    run.global_step,
+                )
+                wer_metrics = maybe_run_wer(
+                    cfg, eval_metrics, run.global_step, eval_subset,
+                    encoder, adapter, llama, tokenizer,
+                    sep_token_id, device, use_wandb,
+                )
+
+            # ── Train metrics flush ───────────────────────────────────────────
+            train_metrics = metrics.flush("train", run.global_step)
+
+            # ── Throughput (reset after checkpoint I/O folds in) ──────────────
+            t_now          = time.perf_counter()
+            elapsed        = max(t_now - step_start, 1e-9)
+            throughput     = step_audio_s / elapsed
+            total_audio_s += step_audio_s
+            step_audio_s   = 0.0
+            step_start     = t_now
+
+            # ── Console output ────────────────────────────────────────────────
+            print(
+                f"step {run.global_step:6d}  loss {avg_loss:.4f}"
+                f"  ema {loss_ema:.4f}"
+                f"  {throughput:.2f}× realtime"
+                f"  stage={stage.name}"
+                f"  epoch={run.epoch}"
+            )
+            if train_metrics:
+                render(train_metrics, "train", run.global_step)
+            if eval_metrics:
+                render(eval_metrics, "eval", run.global_step)
+
+            # ── W&B ───────────────────────────────────────────────────────────
+            if use_wandb:
+                _log_wandb(
+                    run.global_step, stage_idx, stage, run.epoch,
+                    avg_loss, loss_ema,
+                    optimizer, throughput, total_audio_s, t_now, train_start,
+                    train_metrics, eval_metrics, wer_metrics,
+                    baselines_data,
+                )
+
+            # ── Stage advance check ───────────────────────────────────────────
+            if stage.should_advance(eval_metrics, run.step_in_stage):
+                print(
+                    f"[stage] '{stage.name}' advance criterion met "
+                    f"at step {run.global_step} (step_in_stage={run.step_in_stage})."
+                )
+                advanced = True
+
+            # ── Global exit check ──────────────────────────────────────────────
+            if (max_steps is not None and run.global_step >= max_steps) or advanced:
+                break
+
+        # end batch loop
+
+        if advanced:
+            # Stage handoff: save full checkpoint + adapter sidecar
+            _save_checkpoint(
+                ckpt_dir, stage, stage_idx,
+                run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
+                encoder, adapter, llama, optimizer, scaler, scheduler,
+                suffix="stage-handoff",
+            )
+            run.epoch = 0
+            break
+
+        run.epoch += 1
+    # end epoch loop
+
+    return not advanced
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> None:
@@ -318,256 +533,64 @@ def main(argv: list[str] | None = None) -> None:
     ckpt_dir = cfg.checkpoint.dir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Loop state ────────────────────────────────────────────────────────────
-    global_step         = 0
-    epoch               = 0
-    step_in_stage       = 0
-    _resume_consumed    = False   # True once cfg.resume has been loaded and applied
-    prev_opt: torch.optim.Optimizer | None = None
-
     train_start = time.perf_counter()
 
     # ── Stage loop ────────────────────────────────────────────────────────────
-    stage_idx = cfg.run.start_stage
-    optimizer: torch.optim.Optimizer | None = None
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
-
-    while stage_idx < len(stages):
-        stage     = stages[stage_idx]
-        stage_cfg = cfg.stages[stage_idx]
-
-        optimizer, scheduler = stage.setup(encoder, adapter, llama, prev_opt)
-
-        # ── Resume: load checkpoint into this stage's optimizer ───────────────
-        resuming_here = (
-            cfg.resume is not None
-            and stage_idx == cfg.run.start_stage
-            and not _resume_consumed
-        )
-        resume_mse: int = 0
-        resume_bs:  int = stage_cfg.batch_size
-
-        if resuming_here:
-            print(f"Resuming from checkpoint: {cfg.resume}")
-            rs = load_full_checkpoint(
-                cfg.resume,
-                encoder   = encoder,
-                adapter   = adapter,
-                llama     = llama,
-                optimizer = optimizer,
-                scaler    = scaler,
-                scheduler = scheduler,
+    run = RunState.fresh()
+    start_stage = 0
+    ckpt: dict | None = None
+    if cfg.resume is not None:
+        ckpt = read_checkpoint(cfg.resume)
+        start_stage = ckpt["stage_index"]
+        if not (0 <= start_stage < len(stages)):
+            raise ValueError(
+                f"resume checkpoint stage_index={start_stage} out of range "
+                f"for {len(stages)} stages"
             )
-            global_step    = rs.step
-            epoch          = rs.epoch
-            step_in_stage  = rs.step_in_stage
-            resume_mse     = rs.micro_step_in_epoch
-            resume_bs      = rs.batch_size if rs.batch_size is not None else stage_cfg.batch_size
-            _resume_consumed = True
+        print(f"Resuming from {cfg.resume}: stage_index={start_stage}")
+
+    for stage_idx in range(start_stage, len(stages)):
+        stage = stages[stage_idx]
+        optimizer, scheduler = stage.setup(encoder, adapter, llama)
+
+        if stage_idx == start_stage and ckpt is not None:
+            rs = apply_full_checkpoint(
+                ckpt, encoder=encoder, adapter=adapter, llama=llama,
+                optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+            )
+            run = RunState.from_resume(rs)
+            del ckpt  # free the CPU-side checkpoint dict
+            ckpt = None
             print(
-                f"  Resumed: step={global_step}  epoch={epoch}  "
-                f"step_in_stage={step_in_stage}  micro_step_in_epoch={resume_mse}"
+                f"  Restored: global_step={run.global_step} "
+                f"step_in_stage={run.step_in_stage} epoch={run.epoch}"
             )
         else:
-            step_in_stage = 0
+            run.enter_new_stage()
 
-        # ── Per-stage loop state ──────────────────────────────────────────────
-        optimizer.zero_grad()
-        accum_loss  = 0.0
-        loss_ema: float | None = None
-        micro_acc   = 0   # global micro-batch counter for accum detection (never resets)
-        advanced    = False
-
-        step_start   = time.perf_counter()
-        step_audio_s = 0.0
-        total_audio_s = 0.0
-
-        max_steps = cfg.run.max_steps
-
-        # ── Epoch loop ────────────────────────────────────────────────────────
-        while not advanced and (max_steps is None or global_step < max_steps):
-            micro_step_in_epoch = 0
-            loader = stage.make_loader(epoch)
-
-            # Fast-forward on resume (first epoch of this stage only)
-            if resuming_here and epoch == rs.epoch:
-                n_skip = math.floor(resume_mse * resume_bs / stage_cfg.batch_size)
-                if n_skip > 0:
-                    print(
-                        f"[resume] Skipping {n_skip} batches in epoch {epoch} "
-                        f"(saved_mse={resume_mse}, saved_bs={resume_bs}, "
-                        f"current_bs={stage_cfg.batch_size})"
-                    )
-                    fast_forward(loader, n_skip)
-                    micro_step_in_epoch = n_skip
-                resuming_here = False  # only fast-forward once
-
-            # ── Batch loop ────────────────────────────────────────────────────
-            for batch in loader:
-                micro_step_in_epoch += 1
-
-                (mel, audio_lengths,
-                 instruction_ids, instruction_lengths,
-                 transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
-
-                # audio_lengths[i] = adapter tokens; each = 8 mel frames @ 10 ms
-                step_audio_s += audio_lengths.sum().item() * 8 * 0.01
-
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    enc_out     = encoder(mel)
-                    adapter_out = adapter(enc_out)
-                    inputs, labels = prepare_input(
-                        adapter_out,
-                        audio_lengths,
-                        instruction_ids,
-                        instruction_lengths,
-                        transcript_ids,
-                        transcript_lengths,
-                        llama.embed_tokens,
-                        sep_token_id,
-                    )
-                    logits, loss = llama(inputs, labels)
-
-                metrics.observe("train", global_step, logits=logits, labels=labels)
-                scaler.scale(loss / stage.accum_steps).backward()
-                accum_loss += loss.item()
-                micro_acc  += 1
-
-                if micro_acc % stage.accum_steps != 0:
-                    continue  # accumulate more micro-steps before stepping
-
-                # ── Optimizer step ────────────────────────────────────────────
-                scaler.unscale_(optimizer)
-                if cfg.optim.grad_clip.enabled:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for g in optimizer.param_groups for p in g["params"]],
-                        cfg.optim.grad_clip.max_norm,
-                    )
-                # Observe gradients (after unscale, before step)
-                metrics.observe(
-                    "train", global_step,
-                    encoder = encoder,
-                    adapter = adapter,
-                    llama   = llama,
-                )
-
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                global_step   += 1
-                step_in_stage += 1
-
-                avg_loss   = accum_loss / stage.accum_steps
-                accum_loss = 0.0
-                loss_ema   = (
-                    avg_loss if loss_ema is None
-                    else _EMA_ALPHA * loss_ema + (1 - _EMA_ALPHA) * avg_loss
-                )
-
-                # ── Periodic checkpoint ───────────────────────────────────────
-                if cfg.checkpoint.save_every and global_step % cfg.checkpoint.save_every == 0:
-                    _save_checkpoint(
-                        ckpt_dir, stage, stage_cfg, stage_idx,
-                        global_step, epoch, micro_step_in_epoch, step_in_stage,
-                        encoder, adapter, llama, optimizer, scaler, scheduler,
-                    )
-
-                # ── Eval pass ─────────────────────────────────────────────────
-                eval_metrics: dict = {}
-                eval_subset:  list = []
-                wer_metrics:  dict = {}
-
-                if _diag_loader is not None and global_step % cfg.metrics.eval_every == 0:
-                    eval_metrics, eval_subset, _diag_iter = run_eval_pass(
-                        encoder, adapter, llama,
-                        _diag_loader, _diag_iter,
-                        metrics, sep_token_id, device,
-                        cfg.metrics.eval_batches,
-                        global_step,
-                    )
-                    wer_metrics = maybe_run_wer(
-                        cfg, eval_metrics, global_step, eval_subset,
-                        encoder, adapter, llama, tokenizer,
-                        sep_token_id, device, use_wandb,
-                    )
-
-                # ── Train metrics flush ───────────────────────────────────────
-                train_metrics = metrics.flush("train", global_step)
-
-                # ── Throughput (reset after checkpoint I/O folds in) ──────────
-                t_now          = time.perf_counter()
-                elapsed        = max(t_now - step_start, 1e-9)
-                throughput     = step_audio_s / elapsed
-                total_audio_s += step_audio_s
-                step_audio_s   = 0.0
-                step_start     = t_now
-
-                # ── Console output ────────────────────────────────────────────
-                print(
-                    f"step {global_step:6d}  loss {avg_loss:.4f}"
-                    f"  ema {loss_ema:.4f}"
-                    f"  {throughput:.2f}× realtime"
-                    f"  stage={stage.name}"
-                )
-                if train_metrics:
-                    render(train_metrics, "train", global_step)
-                if eval_metrics:
-                    render(eval_metrics, "eval", global_step)
-
-                # ── W&B ───────────────────────────────────────────────────────
-                if use_wandb:
-                    _log_wandb(
-                        global_step, stage_idx, stage, stage_cfg,
-                        avg_loss, loss_ema,
-                        optimizer, throughput, total_audio_s, t_now, train_start,
-                        train_metrics, eval_metrics, wer_metrics,
-                        baselines_data,
-                    )
-
-                # ── Stage advance check ───────────────────────────────────────
-                if stage.should_advance(eval_metrics, step_in_stage):
-                    print(
-                        f"[stage] '{stage.name}' advance criterion met "
-                        f"at step {global_step} (step_in_stage={step_in_stage})."
-                    )
-                    advanced = True
-
-                # ── Global exit check ─────────────────────────────────────────
-                if (max_steps is not None and global_step >= max_steps) or advanced:
-                    break
-
-            # end batch loop
-
-            if advanced:
-                # Stage handoff: save full checkpoint + adapter sidecar
-                _save_checkpoint(
-                    ckpt_dir, stage, stage_cfg, stage_idx,
-                    global_step, epoch, micro_step_in_epoch, step_in_stage,
-                    encoder, adapter, llama, optimizer, scaler, scheduler,
-                    suffix="stage-handoff",
-                )
-                epoch = 0   # next stage starts from a fresh epoch
-                break       # exit epoch loop; outer while increments stage_idx
-
-            epoch += 1
-        # end epoch loop
-
-        prev_opt  = optimizer
-        stage_idx += 1
+        stopped = run_stage(
+            encoder, adapter, llama,
+            optimizer, scheduler, scaler,
+            metrics, tokenizer,
+            _diag_loader, _diag_iter,
+            stage, stage_idx, run,
+            cfg, device, sep_token_id, use_wandb,
+            ckpt_dir, baselines_data, train_start,
+        )
+        if stopped:
+            break
     # end stage loop
 
     # ── Final checkpoint ──────────────────────────────────────────────────────
-    _final = ckpt_dir / f"final-step{global_step}.pt"
+    _final = ckpt_dir / f"final-step{run.global_step}.pt"
     save_checkpoint(
         _final,
-        step                = global_step,
-        epoch               = epoch,
+        step                = run.global_step,
+        epoch               = run.epoch,
         micro_step_in_epoch = 0,
-        step_in_stage       = step_in_stage,
+        step_in_stage       = run.step_in_stage,
         stage_index         = stage_idx,
-        batch_size          = cfg.stages[-1].batch_size,
+        batch_size          = stages[stage_idx].batch_size,
         adapter             = adapter,
         optimizer           = optimizer,
         scaler              = scaler,
@@ -577,15 +600,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Final checkpoint saved → {_final}")
 
-    _final_ada = ckpt_dir / f"final-adapter-step{global_step}.pt"
+    _final_ada = ckpt_dir / f"final-adapter-step{run.global_step}.pt"
     save_adapter_checkpoint(
         _final_ada,
-        step                = global_step,
-        epoch               = epoch,
+        step                = run.global_step,
+        epoch               = run.epoch,
         micro_step_in_epoch = 0,
-        step_in_stage       = step_in_stage,
+        step_in_stage       = run.step_in_stage,
         stage_index         = stage_idx,
-        batch_size          = cfg.stages[-1].batch_size,
+        batch_size          = stages[stage_idx].batch_size,
         adapter             = adapter,
         optimizer           = optimizer,
     )
@@ -601,7 +624,6 @@ def main(argv: list[str] | None = None) -> None:
 def _save_checkpoint(
     ckpt_dir:     Path,
     stage:        Stage,
-    stage_cfg:    Any,
     stage_idx:    int,
     global_step:  int,
     epoch:        int,
@@ -627,7 +649,7 @@ def _save_checkpoint(
         micro_step_in_epoch = micro_step_in_epoch,
         step_in_stage       = step_in_stage,
         stage_index         = stage_idx,
-        batch_size          = stage_cfg.batch_size,
+        batch_size          = stage.batch_size,
         adapter             = adapter,
         optimizer           = optimizer,
         scaler              = scaler,
@@ -639,7 +661,7 @@ def _save_checkpoint(
 
     # Adapter sidecar for cross-stage loading: always at stage handoff,
     # only for adapter-only stages during periodic saves
-    is_adapter_only = set(stage_cfg.trainable) == {"adapter"}
+    is_adapter_only = set(stage.trainable) == {"adapter"}
     if suffix == "stage-handoff" or is_adapter_only:
         ada_path = ckpt_dir / f"{name}-adapter.pt"
         save_adapter_checkpoint(
@@ -649,7 +671,7 @@ def _save_checkpoint(
             micro_step_in_epoch = micro_step_in_epoch,
             step_in_stage       = step_in_stage,
             stage_index         = stage_idx,
-            batch_size          = stage_cfg.batch_size,
+            batch_size          = stage.batch_size,
             adapter             = adapter,
             optimizer           = optimizer,
         )
@@ -662,7 +684,7 @@ def _log_wandb(
     global_step:   int,
     stage_idx:     int,
     stage:         Stage,
-    stage_cfg:     Any,
+    epoch:         int,
     avg_loss:      float,
     loss_ema:      float,
     optimizer:     torch.optim.Optimizer,
@@ -684,7 +706,7 @@ def _log_wandb(
     }
 
     # Per-module trainable flags
-    trainable_set = set(stage_cfg.trainable)
+    trainable_set = set(stage.trainable)
     trainable_flags = {
         "train/encoder_trainable": float("encoder" in trainable_set),
         "train/adapter_trainable": float("adapter" in trainable_set),
@@ -714,6 +736,7 @@ def _log_wandb(
         "train/loss_ema":   loss_ema,
         "train/stage_index": stage_idx,
         "train/stage_name":  stage.name,
+        "train/epoch":       epoch,
         **trainable_flags,
         **lr_dict,
         "runtime/throughput_audio_sec_per_sec": throughput,

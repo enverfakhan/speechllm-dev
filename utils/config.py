@@ -127,7 +127,6 @@ class MetricsConfig:
 class RunConfig:
     """Top-level run configuration."""
     max_steps:        int | None = None
-    start_stage:      int        = 0
     instruction_mode: str        = "unformatted"
 
 
@@ -262,7 +261,6 @@ def _build_metrics(d: dict) -> MetricsConfig:
 def _build_run(d: dict) -> RunConfig:
     return RunConfig(
         max_steps        = d.get("max_steps"),
-        start_stage      = int(d.get("start_stage", 0)),
         instruction_mode = str(d.get("instruction_mode", "unformatted")),
     )
 
@@ -343,10 +341,6 @@ def _validate(cfg: Config) -> None:
         )
     if cfg.run.max_steps is not None and cfg.run.max_steps <= 0:
         raise ValueError(f"run.max_steps: must be > 0, got {cfg.run.max_steps}")
-    if not (0 <= cfg.run.start_stage < len(cfg.stages)):
-        raise ValueError(
-            f"run.start_stage: must be in [0, {len(cfg.stages)}), got {cfg.run.start_stage}"
-        )
 
     # optim
     b0, b1 = cfg.optim.betas
@@ -639,11 +633,6 @@ if __name__ == "__main__":
     # empty stages
     _assert_raises(replace(cfg, stages=[]), "stages")
     print("[OK] empty stages")
-
-    # start_stage out of range
-    bad_run = replace(cfg.run, start_stage=99)
-    _assert_raises(replace(cfg, run=bad_run), "start_stage")
-    print("[OK] start_stage out of range")
 
     print("\nPASSED")
     sys.exit(0)
