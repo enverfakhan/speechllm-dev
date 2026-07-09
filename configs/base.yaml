@@ -16,7 +16,7 @@ model:
   stub: false
   stub_dims: {n_layers: 6, d_model: 512, n_heads: 8, n_kv_heads: 2, intermediate_size: 1024}
   whisper_ckpt: weights/whisper_small.pt
-  llama_ckpt: weights/Llama3.1-8B/
+  llama_ckpt: weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/
   adapter_pca_init: null
   gradient_checkpointing: true   # recompute activations during backward to reduce peak VRAM
   init_from: null                # path to checkpoint for weights-only warm-start
