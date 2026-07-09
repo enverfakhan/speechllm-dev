@@ -5,11 +5,12 @@ Eval mode (--eval):
   Models run in .eval() under torch.no_grad() + bfloat16 autocast.
   Use this to find the largest batch size for inference / evaluation.
 
-Training modes (--stage 1 or 2):
+Training modes (--stage 1, 2, or 3):
   Stage 1: adapter only (encoder + Llama frozen, excluded from optimizer).
   Stage 2: encoder + adapter + Llama, all trainable.
+  Stage 3: encoder + adapter trainable, Llama frozen (excluded from optimizer).
 
-  Both training stages use:
+  All training stages use:
     - Full Llama 3.1 8B dims (d_model=4096, 32 layers, GQA 32/8 heads)
     - Flash Attention via F.scaled_dot_product_attention
     - torch.utils.checkpoint for gradient checkpointing
@@ -20,8 +21,8 @@ Training modes (--stage 1 or 2):
   fits in VRAM when running accum_steps forward+backward passes before a single
   optimizer step.
 
-  Stage 2 note: bitsandbytes AdamW8bit defers GPU state allocation until the 4th
-  optimizer.step() call. Without a warm-up this creates a surprise ~14 GB spike
+  Stage 2/3 note: bitsandbytes AdamW8bit defers GPU state allocation until the 4th
+  optimizer.step() call. Without a warm-up this creates a surprise memory spike
   mid-accumulation that would make the binary search unreliable. The script runs
   4 warm-up steps at batch=1 before searching to pre-materialise the state.
 
@@ -30,6 +31,7 @@ Usage:
     python tools/find_max_batch.py --stage 2
     python tools/find_max_batch.py --stage 2 --accum 1 4 8
     python tools/find_max_batch.py --stage 1 --accum 1
+    python tools/find_max_batch.py --stage 3 --accum 1 4 8
 """
 
 
@@ -70,8 +72,9 @@ def _parse_args() -> argparse.Namespace:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--eval", action="store_true",
                       help="Eval mode: no optimizer, no gradients, no grad checkpointing.")
-    mode.add_argument("--stage", type=int, choices=[1, 2],
-                      help="Training stage: 1=adapter only, 2=all params trainable.")
+    mode.add_argument("--stage", type=int, choices=[1, 2, 3],
+                      help="Training stage: 1=adapter only, 2=all params trainable, "
+                           "3=encoder+adapter trainable (Llama frozen).")
     p.add_argument("--accum", type=int, nargs="+", default=[1, 2, 4, 8],
                    help="Gradient accumulation steps to probe (training only, default: 1 2 4 8).")
     p.add_argument("--min_batch", type=int, default=1)
@@ -106,6 +109,8 @@ def _build_models(
     if stage == 1:
         encoder.requires_grad_(False)
         llama.requires_grad_(False)
+    elif stage == 3:
+        llama.requires_grad_(False)
 
     llama.enable_gradient_checkpointing()
     encoder.train()
@@ -124,6 +129,14 @@ def _build_optimizer(
     import bitsandbytes as bnb
     if stage == 1:
         return bnb.optim.AdamW8bit(adapter.parameters(), weight_decay=0.01)
+    if stage == 3:
+        return bnb.optim.AdamW8bit(
+            [
+                {"params": list(encoder.parameters()), "lr": 1e-7},
+                {"params": list(adapter.parameters()), "lr": 1e-5},
+            ],
+            weight_decay=0.01,
+        )
     return bnb.optim.AdamW8bit(
         [
             {"params": list(encoder.parameters()), "lr": 1e-7},
@@ -383,14 +396,19 @@ def main() -> None:
         return
 
     # ── Training path ─────────────────────────────────────────────────────────
-    print(f"Stage {args.stage}: {'adapter only' if args.stage == 1 else 'all params trainable'}")
+    stage_labels = {
+        1: "adapter only (encoder + Llama frozen)",
+        2: "all params trainable",
+        3: "encoder + adapter trainable (Llama frozen)",
+    }
+    print(f"Stage {args.stage}: {stage_labels[args.stage]}")
     print(f"Probing accum_steps: {args.accum}")
     print()
 
     encoder, adapter, llama = _build_models(args.stage, for_eval=False)
     optimizer = _build_optimizer(args.stage, encoder, adapter, llama)
 
-    if args.stage == 2:
+    if args.stage in (2, 3):
         print("Pre-warming optimizer (4 steps at batch=1, mel_t=800) ...")
         _warmup_optimizer(encoder, adapter, llama, optimizer)
         try:
@@ -419,8 +437,12 @@ def main() -> None:
 
     # ── Summary table ─────────────────────────────────────────────────────────
     print("═" * 62)
-    print(f"SUMMARY  stage={args.stage}  "
-          f"({'adapter-only' if args.stage == 1 else 'all params, bf16'})")
+    summary_labels = {
+        1: "adapter-only",
+        2: "all params, bf16",
+        3: "encoder+adapter, Llama frozen, bf16",
+    }
+    print(f"SUMMARY  stage={args.stage}  ({summary_labels[args.stage]})")
     print("═" * 62)
     print(f"  {'accum':>6}  {'micro-bs':>9}  {'eff-bs':>7}  {'peak':>8}  {'util':>6}")
     print("  " + "─" * 50)
