@@ -1,0 +1,46 @@
+# encoder_adapter_from_stage1_4680.yaml
+# New stage: encoder + adapter trainable, Llama frozen. Warm-starts weights
+# (encoder, adapter, llama) from the stage-1 adapter-only checkpoint at step
+# 4680 via model.init_from — NOT --resume, since we want a fresh optimizer
+# and step counter (step 0), not a continuation of the stage-1 run/schedule.
+#
+# batch_size=36 / accum_steps=3 chosen via tools/find_max_batch.py --stage 3.
+#
+# Launch with:
+#   python training.py --config configs/encoder_adapter_from_stage1_4680.yaml
+
+seed: 43
+model:
+  init_from: checkpoints/stage1-both-format/step_0004680.pt
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: encoder-adapter-from-stage1-4680
+checkpoint:
+  dir:        checkpoints/encoder-adapter-from-stage1-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        encoder_adapter_both
+    trainable:   [encoder, adapter]
+    lrs:         {encoder: 1.0e-5, adapter: 5.0e-5}
+    schedule:    {warmup_steps: 1000}
+    batch_size:  36
+    accum_steps: 3
+    exit:        {strategy: never}
