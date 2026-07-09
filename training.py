@@ -541,6 +541,13 @@ def main(argv: list[str] | None = None) -> None:
     ckpt: dict | None = None
     if cfg.resume is not None:
         ckpt = read_checkpoint(cfg.resume)
+        ckpt_kind = ckpt.get("kind", "periodic")  # untagged legacy checkpoints → resumable
+        if ckpt_kind == "handoff":
+            raise ValueError(
+                f"{cfg.resume} is a handoff/weights checkpoint (kind='handoff'), not a "
+                f"full-state resume point. Use model.init_from to warm-start weights from "
+                f"it; use --resume only with a periodic checkpoint."
+            )
         start_stage = ckpt["stage_index"]
         if not (0 <= start_stage < len(stages)):
             raise ValueError(
@@ -597,6 +604,7 @@ def main(argv: list[str] | None = None) -> None:
         scheduler           = scheduler,
         encoder             = encoder,
         llama               = llama,
+        kind                = "periodic",
     )
     print(f"Final checkpoint saved → {_final}")
 
@@ -656,6 +664,7 @@ def _save_checkpoint(
         scheduler           = scheduler,
         encoder             = encoder,
         llama               = llama,
+        kind                = "handoff" if suffix == "stage-handoff" else "periodic",
     )
     print(f"Checkpoint saved → {ckpt_path}")
 

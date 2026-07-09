@@ -3,17 +3,21 @@
 Two checkpoint formats are supported:
 
 Full checkpoint  (used for same-stage resume)
-    keys: step, epoch, micro_step_in_epoch, batch_size,
+    keys: step, epoch, micro_step_in_epoch, batch_size, kind,
+          step_in_stage, stage_index,
           adapter, optimizer, scaler,
           scheduler?  (present only when a LR scheduler is active)
           encoder?    (present when encoder is not permanently frozen)
           llama?      (present when Llama is not permanently frozen)
 
 Adapter-only checkpoint  (saved at stage boundaries for archival)
-    keys: step, epoch, micro_step_in_epoch, batch_size,
+    keys: step, epoch, micro_step_in_epoch, batch_size, kind,
+          step_in_stage, stage_index,
           adapter, optimizer_adapter
 
 The caller decides which optional modules to include by passing them (or None).
+Untagged legacy checkpoints (no "kind" key) are treated as kind="periodic" and
+are resumable.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ def save_checkpoint(
     llama:                nn.Module | None = None,
     step_in_stage:        int = 0,
     stage_index:          int = 0,
+    kind:                 str = "periodic",
 ) -> None:
     """Save a full training checkpoint.
 
@@ -71,6 +76,7 @@ def save_checkpoint(
         "batch_size":          batch_size,
         "step_in_stage":       step_in_stage,
         "stage_index":         stage_index,
+        "kind":                kind,
         "adapter":             adapter.state_dict(),
         "optimizer":           optimizer.state_dict(),
         "scaler":              scaler.state_dict(),
@@ -95,6 +101,7 @@ def save_adapter_checkpoint(
     optimizer:           torch.optim.Optimizer,
     step_in_stage:       int = 0,
     stage_index:         int = 0,
+    kind:                str = "handoff",
 ) -> None:
     """Save an adapter-only checkpoint for cross-stage loading.
 
@@ -118,6 +125,7 @@ def save_adapter_checkpoint(
             "batch_size":          batch_size,
             "step_in_stage":       step_in_stage,
             "stage_index":         stage_index,
+            "kind":                kind,
             "adapter":             adapter.state_dict(),
             "optimizer_adapter":   optimizer.state_dict(),
         },
@@ -289,9 +297,10 @@ if __name__ == "__main__":
         raw = torch.load(full_path, map_location="cpu")
         assert set(raw.keys()) == {
             "step", "epoch", "micro_step_in_epoch", "batch_size",
-            "step_in_stage", "stage_index",
+            "step_in_stage", "stage_index", "kind",
             "adapter", "optimizer", "scaler", "encoder", "llama",
         }, f"Unexpected full-ckpt keys: {set(raw.keys())}"
+        assert raw["kind"] == "periodic", f"default kind should be 'periodic', got {raw['kind']!r}"
         assert raw["step_in_stage"] == 0, "step_in_stage default not stored"
         assert raw["stage_index"]   == 0, "stage_index default not stored"
 
@@ -384,10 +393,15 @@ if __name__ == "__main__":
         assert rs_old.stage_index == 0, f"expected stage_index=0, got {rs_old.stage_index}"
         print("  [OK] old-format checkpoint: step_in_stage→step, stage_index→0")
 
-        # ── 5. Scheduler present/absent paths ────────────────────────────────
+        # ── 5. Scheduler + scaler continuity round-trip ───────────────────────
         ada6 = nn.Linear(4, 4)
         opt6 = torch.optim.SGD(ada6.parameters(), lr=1e-3)
         scl6 = torch.amp.GradScaler("cpu")
+        # Set a non-default scale so the round-trip assertion is meaningful
+        scl6.load_state_dict({
+            "scale": 256.0, "growth_factor": 2.0, "backoff_factor": 0.5,
+            "growth_interval": 2000, "_growth_tracker": 0,
+        })
         sched6 = torch.optim.lr_scheduler.LambdaLR(opt6, lr_lambda=lambda s: min(s / 10, 1.0))
         for _ in range(5):
             sched6.step()
@@ -403,15 +417,24 @@ if __name__ == "__main__":
 
         ada7 = nn.Linear(4, 4)
         opt7 = torch.optim.SGD(ada7.parameters(), lr=1e-3)
-        scl7 = torch.amp.GradScaler("cpu")
+        scl7 = torch.amp.GradScaler("cpu")   # default scale (65536), not 256
         sched7 = torch.optim.lr_scheduler.LambdaLR(opt7, lr_lambda=lambda s: min(s / 10, 1.0))
         rs5 = load_full_checkpoint(
             sched_path, adapter=ada7, optimizer=opt7, scaler=scl7, scheduler=sched7,
         )
         assert rs5.step == 5
-        # scheduler last_epoch should be restored (5 steps)
+        # scheduler last_epoch must be restored (5 steps)
         assert sched7.last_epoch == 5, f"scheduler.last_epoch={sched7.last_epoch}"
-        print("  [OK] scheduler round-trip")
+        # LR value must match — catches a resume landing at the wrong warmup position
+        assert sched7.get_last_lr() == sched6.get_last_lr(), (
+            f"scheduler LR mismatch after resume: {sched7.get_last_lr()} vs {sched6.get_last_lr()}"
+        )
+        # Scaler scale must survive the round-trip (not revert to the fresh-scaler default)
+        assert scl7.state_dict()["scale"] == scl6.state_dict()["scale"], (
+            f"scaler scale mismatch after resume: "
+            f"{scl7.state_dict()['scale']} vs {scl6.state_dict()['scale']}"
+        )
+        print("  [OK] scheduler + scaler continuity round-trip")
 
         # ── 6. load_weights: weights-only overlay ────────────────────────────
         # Save a checkpoint that has encoder + adapter but NOT llama.
