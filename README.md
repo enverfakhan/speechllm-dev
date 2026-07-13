@@ -10,7 +10,7 @@ This README is the entry point. It explains why the project exists, what was bui
 
 ## Why this project
 
-I wanted hands-on, end-to-end experience training a model that is state-of-the-art *in its approach* within my field (ASR): an **instructible SpeechLLM** — a model whose transcription style follows the instruction it is given. The goal was never to beat Whisper on WER. The goals were, in order:
+I wanted hands-on, end-to-end experience training a model that is state-of-the-art *in its approach* within my field (ASR): an **instructible SpeechLLM** — a model whose transcription style follows the instruction it is given. The goals are, in order:
 
 1. **Experience the full arc** — from raw data and pretrained checkpoints, through pipeline construction and debugging, to multi-stage training on rented cloud GPUs.
 2. **Keep the implementation as simple as possible** — every component from scratch, readable, and educational. Complexity that doesn't teach something is avoided.
