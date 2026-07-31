@@ -44,8 +44,8 @@ run:
   instruction_mode: both
 stages:
   - name:        audio_adapters_both
-    trainable:   [audio_adapters]
-    lrs:         {audio_adapters: 1.0e-4}
+    trainable:   [adapter, audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
     batch_size:  64
     accum_steps: 2
     exit:        {strategy: never}
