@@ -344,12 +344,14 @@ class LlamaBlock(nn.Module):
         Returns:
             (B, S, d_model)
         """
+        if self.audio_adapter is not None and audio_mask is not None:
+            x_hat = self.audio_adapter(x, audio_mask)
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
         # The gate at 0 makes this an exact no-op; still skip the compute when
         # there is no adapter or no mask (keeps the frozen text path untouched).
         if self.audio_adapter is not None and audio_mask is not None:
-            x = x + self.audio_adapter(x, audio_mask)
+            x = x + x_hat
         return x
 
 
