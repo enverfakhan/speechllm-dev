@@ -274,7 +274,7 @@ def _run_accum(
                 _wa, _wal, _wii, _wil, _wti, _wtl,
                 llama.embed_tokens, sep_token_id=_SEP_ID,
             )
-            _, _wloss = llama(_wins, _wlbl)
+            _, _wloss = llama(_wins, _wlbl, audio_lengths=_wal)
         _backward(_wloss, 1, scaler)
         _optimizer_step(optimizer, scaler, all_params)
         optimizer.zero_grad(set_to_none=True)
@@ -300,7 +300,7 @@ def _run_accum(
                         inst_ids, inst_lens, trans_ids, trans_lens,
                         llama.embed_tokens, sep_token_id=_SEP_ID,
                     )
-                    _, loss = llama(inputs, labels)
+                    _, loss = llama(inputs, labels, audio_lengths=audio_lengths)
 
                 if step == verbose_step:
                     print(f"  step {step}  micro {k+1}/{accum_steps}  [after  fwd]  {_mem()}")
@@ -419,7 +419,7 @@ def _run_diagnostic(
                 _wa, _wal, _wii, _wil, _wti, _wtl,
                 llama.embed_tokens, sep_token_id=_SEP_ID,
             )
-            _, _wloss = llama(_wins, _wlbl)
+            _, _wloss = llama(_wins, _wlbl, audio_lengths=_wal)
         _backward(_wloss, 1, scaler)
         _optimizer_step(optimizer, scaler, all_params)
         optimizer.zero_grad(set_to_none=True)
@@ -452,7 +452,7 @@ def _run_diagnostic(
                         inst_ids, inst_lens, trans_ids, trans_lens,
                         llama.embed_tokens, sep_token_id=_SEP_ID,
                     )
-                    _, loss = llama(inputs, labels)
+                    _, loss = llama(inputs, labels, audio_lengths=audio_lengths)
 
                 _backward(loss, accum_steps, scaler)
 

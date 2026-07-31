@@ -39,6 +39,7 @@ class LlamaConfig:
     max_seq_len:       int   = 131072
     rms_norm_eps:      float = 1e-5
     rope_theta:        float = 500000.0   # Llama 3.1 uses 500k (3.0 used 10k)
+    audio_adapter_r:   int   = 0          # gated audio adapter bottleneck; 0 = disabled
 
 
 # ── RMSNorm ────────────────────────────────────────────────────────────────────
@@ -226,16 +227,81 @@ class SwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+# ── Gated audio adapter ─────────────────────────────────────────────────────────
+
+class AudioLayerAdapter(nn.Module):
+    """Gated parallel bottleneck adapter applied only at audio-token positions.
+
+    Adds a small residual branch inside a frozen Llama block that reshapes the
+    audio stream while leaving every pretrained parameter untouched (all new
+    capacity lives here).  The branch computes
+
+        audio_mask * tanh(gate) * up(gelu(down(norm(x))))
+
+    A per-layer scalar ``gate`` initialised at 0 makes ``tanh(gate) == 0``, so
+    the branch is an *exact* no-op at step 0 — inserting the module never
+    perturbs the pretrained forward pass.  The model opens each layer's gate
+    only if the audio task rewards it, which is exactly the per-depth diagnostic
+    we want to watch.  ``norm`` is a fresh RMSNorm owned here (never the block's
+    pretrained norms), so no pretrained parameter is read or written.
+    """
+
+    def __init__(self, d_model: int, r: int, n_layers: int, eps: float) -> None:
+        """Build the bottleneck, its own RMSNorm, and the zero-init gate.
+
+        Args:
+            d_model:  residual-stream width (matches the block)
+            r:        bottleneck rank
+            n_layers: model depth; used for the scaled residual-write init
+            eps:      RMSNorm epsilon (same value the block's norms use)
+        """
+        super().__init__()
+        self.norm      = RMSNorm(d_model, eps)
+        self.down_proj = nn.Linear(d_model, r,       bias=False)   # d_model → r
+        self.up_proj   = nn.Linear(r,       d_model, bias=False)   # r → d_model (writes residual)
+        # Scalar gate; tanh(0)=0 → identity branch at init (see class docstring).
+        self.gate      = nn.Parameter(torch.zeros(1))
+
+        # up_proj writes into the residual stream, so it gets the same GPT-2
+        # scaled init as LlamaBlock's o_proj / down_proj (std = 0.02/sqrt(L)).
+        # This keeps the branch well-scaled once the gate opens; down_proj keeps
+        # the default nn.Linear init.
+        nn.init.normal_(self.up_proj.weight, mean=0.0, std=0.02 / math.sqrt(n_layers))
+
+    def forward(self, x: torch.Tensor, audio_mask: torch.Tensor) -> torch.Tensor:
+        """Return the masked, gated adapter branch (residual add stays in the block).
+
+        Args:
+            x:          (B, S, d_model) — the block's running residual stream
+            audio_mask: (B, S, 1) float — 1.0 at audio positions, else 0.0
+
+        Returns:
+            (B, S, d_model) — zero everywhere except audio positions, scaled by
+            tanh(gate); add this to x in the caller.
+        """
+        branch = self.up_proj(F.gelu(self.down_proj(self.norm(x))))
+        return audio_mask * torch.tanh(self.gate) * branch
+
+
 # ── Transformer block ─────────────────────────────────────────────────────────
 
 class LlamaBlock(nn.Module):
-    """Single Llama transformer block with Pre-RMSNorm and residual connections."""
+    """Single Llama transformer block with Pre-RMSNorm and residual connections.
 
-    def __init__(self, config: LlamaConfig) -> None:
-        """Initialise attention, MLP, and their preceding layer norms.
+    When ``has_audio_adapter`` and ``config.audio_adapter_r > 0``, the block also
+    owns an :class:`AudioLayerAdapter` whose gated branch is added at audio-token
+    positions only.  The adapter is the sole new-parameter path; every other
+    submodule here is a pretrained Llama parameter and is never modified.
+    """
+
+    def __init__(self, config: LlamaConfig, has_audio_adapter: bool = False) -> None:
+        """Initialise attention, MLP, their preceding layer norms, and the adapter.
 
         Args:
-            config: model hyperparameters
+            config:            model hyperparameters
+            has_audio_adapter: construct the audio adapter for this block (the
+                               caller passes False for the last layer, whose
+                               audio-position outputs feed nothing)
         """
         super().__init__()
         self.input_layernorm          = RMSNorm(config.d_model, config.rms_norm_eps)
@@ -250,24 +316,40 @@ class LlamaBlock(nn.Module):
         nn.init.normal_(self.self_attn.o_proj.weight, mean=0.0, std=std)
         nn.init.normal_(self.mlp.down_proj.weight,    mean=0.0, std=std)
 
+        # Named `audio_adapter` so its parameter names contain that substring —
+        # stage setup, grad metrics, and checkpoint tolerance all key off it.
+        if has_audio_adapter and config.audio_adapter_r > 0:
+            self.audio_adapter: AudioLayerAdapter | None = AudioLayerAdapter(
+                config.d_model, config.audio_adapter_r, config.n_layers, config.rms_norm_eps
+            )
+        else:
+            self.audio_adapter = None
+
     def forward(
         self,
-        x:   torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        x:          torch.Tensor,
+        cos:        torch.Tensor,
+        sin:        torch.Tensor,
+        audio_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply attention and MLP sub-layers with residual connections.
+        """Apply attention, MLP, and (optionally) the gated audio adapter.
 
         Args:
-            x:   (B, S, d_model)
-            cos: (S, head_dim)
-            sin: (S, head_dim)
+            x:          (B, S, d_model)
+            cos:        (S, head_dim)
+            sin:        (S, head_dim)
+            audio_mask: (B, S, 1) float mask, or None to disable the adapter
+                        branch (text-only / stub paths)
 
         Returns:
             (B, S, d_model)
         """
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
+        # The gate at 0 makes this an exact no-op; still skip the compute when
+        # there is no adapter or no mask (keeps the frozen text path untouched).
+        if self.audio_adapter is not None and audio_mask is not None:
+            x = x + self.audio_adapter(x, audio_mask)
         return x
 
 
@@ -291,8 +373,14 @@ class Llama(nn.Module):
         self.config = config
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
+        # Skip the audio adapter on the LAST layer: its audio-position outputs
+        # feed nothing (only transcript positions read the final hidden state).
         self.layers       = nn.ModuleList(
-            [LlamaBlock(config) for _ in range(config.n_layers)]
+            [LlamaBlock(config, has_audio_adapter=(i < config.n_layers - 1))
+             for i in range(config.n_layers)]
+        )
+        self._has_audio_adapters = any(
+            layer.audio_adapter is not None for layer in self.layers
         )
         self.norm    = RMSNorm(config.d_model, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -324,12 +412,19 @@ class Llama(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         labels:        torch.Tensor | None = None,
+        audio_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a forward pass and optionally compute next-token-prediction loss.
 
         Args:
             inputs_embeds: (B, S, d_model) — full embedded sequence from prepare_input()
             labels:        (B, S) — -100 at masked positions; true token IDs at transcript
+            audio_lengths: (B,) — per-sample audio-token count; audio occupies
+                           positions [0, audio_lengths[i]).  When provided (and the
+                           model has audio adapters) it builds the audio mask so the
+                           gated adapters fire only at audio positions.  When None,
+                           the adapters stay inactive — text-only and stub self-test
+                           paths behave exactly as before.
 
         Returns:
             logits: (B, S, vocab_size)
@@ -340,12 +435,25 @@ class Llama(nn.Module):
         cos = self.rope_cos[:S]   # (S, head_dim)
         sin = self.rope_sin[:S]
 
+        # Build the audio mask once and share it across every layer.  Masking the
+        # full-sequence branch output is the legible choice: audio lengths vary
+        # across the batch, and audio dominates sequence length anyway, so
+        # per-sample slicing would buy nothing but complexity.
+        audio_mask: torch.Tensor | None = None
+        if audio_lengths is not None and self._has_audio_adapters:
+            positions  = torch.arange(S, device=inputs_embeds.device)
+            audio_mask = (
+                (positions[None, :] < audio_lengths[:, None])   # (B, S) bool
+                .unsqueeze(-1)                                    # (B, S, 1)
+                .to(inputs_embeds.dtype)
+            )
+
         x = inputs_embeds
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, cos, sin, use_reentrant=False)
+                x = checkpoint(layer, x, cos, sin, audio_mask, use_reentrant=False)
             else:
-                x = layer(x, cos, sin)
+                x = layer(x, cos, sin, audio_mask)
 
         x      = self.norm(x)
         logits = self.lm_head(x)   # (B, S, vocab_size)
@@ -366,6 +474,27 @@ class Llama(nn.Module):
     def enable_gradient_checkpointing(self) -> None:
         """Enable activation recomputation during backward to reduce peak VRAM."""
         self.gradient_checkpointing = True
+
+    def audio_adapter_parameters(self) -> list[nn.Parameter]:
+        """Return every parameter belonging to the gated audio adapters.
+
+        Selected by the substring 'audio_adapter' in the parameter name — the
+        same predicate stage setup and checkpoint tolerance use, so the three
+        stay in lockstep.  Empty when audio adapters are disabled.
+        """
+        return [p for name, p in self.named_parameters() if "audio_adapter" in name]
+
+    def audio_gate_values(self) -> dict[str, float]:
+        """Return per-layer effective gate values tanh(gate) for W&B logging.
+
+        This is the key diagnostic for the gated-adapter experiment: which
+        depths open their gates, and how fast.  Keys are 'gates/layer_XX'.
+        """
+        return {
+            f"gates/layer_{i:02d}": float(torch.tanh(layer.audio_adapter.gate).item())
+            for i, layer in enumerate(self.layers)
+            if layer.audio_adapter is not None
+        }
 
     def load_meta_weights(
         self,
@@ -523,3 +652,119 @@ class Llama(nn.Module):
                 "Check that the checkpoint format is supported and the directory "
                 "contains the expected files."
             )
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    torch.manual_seed(0)
+
+    # Tiny CPU-only config; audio_adapter_r > 0 constructs the gated adapters.
+    _COMMON = dict(
+        n_layers=3, d_model=64, n_heads=4, n_kv_heads=2,
+        intermediate_size=128, vocab_size=100,
+    )
+    cfg_on  = LlamaConfig(**_COMMON, audio_adapter_r=16)
+    cfg_off = LlamaConfig(**_COMMON, audio_adapter_r=0)
+
+    model_on  = Llama(cfg_on)
+    model_off = Llama(cfg_off)
+
+    # Make the two models share every pretrained-path weight so a forward-pass
+    # comparison isolates the adapter branch.  model_on's extra audio_adapter.*
+    # keys are the only ones that should be "unexpected" for model_off.
+    incompat = model_off.load_state_dict(model_on.state_dict(), strict=False)
+    assert not incompat.missing_keys, f"unexpected missing keys: {incompat.missing_keys}"
+    assert all("audio_adapter" in k for k in incompat.unexpected_keys), incompat.unexpected_keys
+
+    model_on.eval()
+    model_off.eval()
+
+    B, S, D = 2, 10, cfg_on.d_model
+    inputs        = torch.randn(B, S, D)
+    audio_lengths = torch.tensor([4, 7])
+
+    # ── Test: last layer has no adapter ────────────────────────────────────────
+    assert model_on.layers[-1].audio_adapter is None, "last layer must not own an adapter"
+    assert all(model_on.layers[i].audio_adapter is not None for i in range(cfg_on.n_layers - 1))
+    assert model_off.layers[0].audio_adapter is None, "r=0 must construct no adapters"
+    print("[OK] last layer has no adapter; r=0 constructs none")
+
+    # ── Test: identity at init (tanh(0) == 0 → exact no-op) ─────────────────────
+    with torch.no_grad():
+        logits_on,  _ = model_on(inputs, audio_lengths=audio_lengths)
+        logits_off, _ = model_off(inputs, audio_lengths=audio_lengths)
+    assert torch.allclose(logits_on, logits_off, atol=1e-6), (
+        f"adapter branch must be a no-op at init; max diff "
+        f"{(logits_on - logits_off).abs().max().item():.2e}"
+    )
+    print("[OK] identity at init: r=16 (gates=0) matches r=0")
+
+    # ── Test: mask correctness at a single block ───────────────────────────────
+    # Comparing whole-model logits would let causal attention spread an
+    # audio-position perturbation to transcript positions.  A single block adds
+    # the masked branch AFTER attention/MLP, so it perturbs ONLY audio positions
+    # — which is exactly what the mask claims to guarantee.
+    block = LlamaBlock(cfg_on, has_audio_adapter=True)
+    block.eval()
+    head_dim = cfg_on.d_model // cfg_on.n_heads
+    cos, sin = _precompute_rope_cos_sin(head_dim, S, cfg_on.rope_theta)
+    x = torch.randn(B, S, D)
+    audio_mask = (
+        (torch.arange(S)[None, :] < audio_lengths[:, None]).unsqueeze(-1).float()
+    )
+    with torch.no_grad():
+        ref = block(x, cos, sin, audio_mask=None)          # adapter disabled
+        block.audio_adapter.gate.data.fill_(5.0)           # force the gate wide open
+        out = block(x, cos, sin, audio_mask)               # adapter active at audio pos
+    for i in range(B):
+        n = int(audio_lengths[i].item())
+        assert not torch.allclose(out[i, :n], ref[i, :n]), (
+            f"sample {i}: audio positions [0,{n}) should change when gate opens"
+        )
+        assert torch.allclose(out[i, n:], ref[i, n:], atol=1e-6), (
+            f"sample {i}: non-audio positions [{n},{S}) must be untouched"
+        )
+    print("[OK] mask correctness: only audio positions change when a gate opens")
+
+    # ── Test: gradient-checkpointing path, adapter-only training regime ─────────
+    # Mirrors the real stage: pretrained params frozen, inputs_embeds require no
+    # grad (frozen adapter/embed), only the audio adapters train.  use_reentrant
+    # =False must still route gradients into the adapters.
+    gc_model = Llama(cfg_on)
+    gc_model.train()
+    gc_model.enable_gradient_checkpointing()
+    for name, p in gc_model.named_parameters():
+        p.requires_grad_("audio_adapter" in name)
+    for layer in gc_model.layers:
+        if layer.audio_adapter is not None:
+            layer.audio_adapter.gate.data.fill_(0.5)       # open gates so down/up get signal
+
+    gc_inputs = torch.randn(B, S, D)                        # requires_grad=False (frozen upstream)
+    gc_labels = torch.full((B, S), -100, dtype=torch.long)
+    gc_labels[:, 7:] = torch.randint(0, cfg_on.vocab_size, (B, S - 7))
+    _, gc_loss = gc_model(gc_inputs, gc_labels, audio_lengths=audio_lengths)
+    gc_loss.backward()
+
+    aa_params = gc_model.audio_adapter_parameters()
+    assert aa_params, "expected non-empty audio adapter parameter list"
+    assert all(p.grad is not None for p in aa_params), "every audio adapter param needs a grad"
+    total_aa_grad = sum(p.grad.abs().sum().item() for p in aa_params)
+    assert total_aa_grad > 0, "audio adapter grads are all zero"
+    for name, p in gc_model.named_parameters():
+        if "audio_adapter" not in name:
+            assert not p.requires_grad, f"pretrained param {name} should be frozen"
+            assert p.grad is None, f"frozen param {name} should have no grad"
+    print("[OK] gradient checkpointing: adapters get grads, frozen llama stays grad-free")
+
+    # ── Test: helper methods ───────────────────────────────────────────────────
+    gates = model_on.audio_gate_values()
+    assert set(gates.keys()) == {f"gates/layer_{i:02d}" for i in range(cfg_on.n_layers - 1)}, gates
+    assert all(v == 0.0 for v in gates.values()), "gate values should be tanh(0)=0 at init"
+    assert model_off.audio_gate_values() == {}, "r=0 model exposes no gates"
+    print("[OK] audio_gate_values / audio_adapter_parameters helpers")
+
+    print("\nPASSED")
+    sys.exit(0)

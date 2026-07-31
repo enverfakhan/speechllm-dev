@@ -63,7 +63,11 @@ def greedy_generate(
 
     for _ in range(max_new_tokens):
         with torch.amp.autocast("cuda", dtype=torch.float16):
-            logits, _ = llama(pfx.get_batch(), labels=None)  # (B, S, vocab)
+            # audio_lengths is unchanged as the context grows: audio remains the
+            # per-sample prefix [0, audio_lengths[i]), so the same mask keeps the
+            # gated adapters firing on audio positions only while generated tokens
+            # land beyond it.
+            logits, _ = llama(pfx.get_batch(), labels=None, audio_lengths=audio_lengths)  # (B, S, vocab)
 
         # Read the logit at each sequence's current generation position
         idx_t    = pfx.logit_indices                          # (B,)

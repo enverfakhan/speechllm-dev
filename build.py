@@ -22,7 +22,7 @@ def build_models(
     *,
     train: bool = True,
     apply_init_from: bool = True,
-) -> tuple[WhisperEncoder, AudioAdapter, Llama]:
+) -> tuple[WhisperEncoder, AudioAdapter, Llama, list[str]]:
     """Instantiate and initialise all three model components.
 
     Args:
@@ -37,16 +37,30 @@ def build_models(
       1. Architecture (stub or full)
       2. Pretrained weights (whisper + llama) if not stub
       3. Warm-start overlay from cfg.model.init_from if set and apply_init_from=True
+
+    Returns:
+        (encoder, adapter, llama, init_from_loaded) where init_from_loaded is the
+        list of module names actually overlaid from cfg.model.init_from (empty
+        when init_from is unset or apply_init_from=False).  The training loop
+        seeds its checkpoint dirty set from this: encoder/llama warm-started from
+        a delta diverge from pretrained and must be saved thereafter.
     """
     with (cfg.data.tokenizer / "pruned_config.json").open() as f:
         vocab_size = json.load(f)["vocab_size"]
 
     if cfg.model.stub:
-        llama_cfg = LlamaConfig(**cfg.model.stub_dims, vocab_size=vocab_size)
+        llama_cfg = LlamaConfig(
+            **cfg.model.stub_dims,
+            vocab_size=vocab_size,
+            audio_adapter_r=cfg.model.audio_adapter_r,
+        )
         llama_dim = cfg.model.stub_dims["d_model"]
         print("STUB mode: tiny randomly-initialised model (no pretrained weights).")
     else:
-        llama_cfg = LlamaConfig(vocab_size=vocab_size)
+        llama_cfg = LlamaConfig(
+            vocab_size=vocab_size,
+            audio_adapter_r=cfg.model.audio_adapter_r,
+        )
         llama_dim = 4096
 
     encoder = WhisperEncoder()
@@ -73,10 +87,13 @@ def build_models(
         print("Loading Whisper encoder weights (stub mode) …")
         encoder.load_openai_weights(cfg.model.whisper_ckpt)
 
+    init_from_loaded: list[str] = []
     if apply_init_from and cfg.model.init_from is not None:
         print(f"Warm-starting from {cfg.model.init_from} …")
-        loaded = load_weights(cfg.model.init_from, encoder=encoder, adapter=adapter, llama=llama)
-        print(f"  Warm-start complete (loaded: {loaded}).")
+        init_from_loaded = load_weights(
+            cfg.model.init_from, encoder=encoder, adapter=adapter, llama=llama
+        )
+        print(f"  Warm-start complete (loaded: {init_from_loaded}).")
 
     encoder = encoder.to(device)
     adapter = adapter.to(device)
@@ -101,11 +118,17 @@ def build_models(
 
     n_enc = sum(p.numel() for p in encoder.parameters())
     n_ada = sum(p.numel() for p in adapter.parameters())
-    n_llm = sum(p.numel() for p in llama.parameters())
-    print(
+    # Report the gated audio adapters separately and EXCLUDE them from the llama
+    # count so the pretrained figure stays recognisable (~8B).
+    n_aa  = sum(p.numel() for name, p in llama.named_parameters() if "audio_adapter" in name)
+    n_llm = sum(p.numel() for name, p in llama.named_parameters() if "audio_adapter" not in name)
+    msg = (
         f"Parameters — encoder: {n_enc / 1e6:.1f}M  "
         f"adapter: {n_ada / 1e6:.1f}M  "
         f"llama: {n_llm / 1e6:.0f}M  "
-        f"total: {(n_enc + n_ada + n_llm) / 1e9:.2f}B"
     )
-    return encoder, adapter, llama
+    if n_aa > 0:
+        msg += f"audio_adapters: {n_aa / 1e6:.2f}M  "
+    msg += f"total: {(n_enc + n_ada + n_llm + n_aa) / 1e9:.2f}B"
+    print(msg)
+    return encoder, adapter, llama, init_from_loaded

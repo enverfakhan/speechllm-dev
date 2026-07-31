@@ -35,7 +35,18 @@ from utils import optim as optim_utils
 
 # ── Module ordering ────────────────────────────────────────────────────────────
 # Canonical order for param groups; we iterate this and skip non-trainable ones.
-_MODULE_ORDER: tuple[str, ...] = ("encoder", "adapter", "llama")
+# "audio_adapters" is not a module — it is the name-selected subset of llama's
+# parameters holding the gated per-layer audio adapters (see _is_audio_adapter).
+_MODULE_ORDER: tuple[str, ...] = ("encoder", "adapter", "llama", "audio_adapters")
+
+
+def _is_audio_adapter(param_name: str) -> bool:
+    """True when a parameter belongs to a gated audio adapter.
+
+    Selected by the substring 'audio_adapter' — the same predicate llama.py,
+    the grad metrics, and checkpoint tolerance all use, so they stay in lockstep.
+    """
+    return "audio_adapter" in param_name
 
 
 # ── StageContext ───────────────────────────────────────────────────────────────
@@ -190,28 +201,53 @@ class Stage:
         }
         trainable_set = set(self._config.trainable)
 
-        # Set requires_grad in place on every parameter.
+        # Set requires_grad in place on every parameter.  llama is name-aware:
+        # its audio-adapter params are governed by "audio_adapters" in the
+        # trainable set, every other llama param by "llama".  This lets a stage
+        # train the gated adapters while the whole pretrained backbone stays
+        # frozen (the two are disjoint parameter subsets of one module).
+        llama_on = "llama"          in trainable_set
+        aa_on    = "audio_adapters" in trainable_set
         for mod_name, mod in modules.items():
-            grad_on = mod_name in trainable_set
-            for p in mod.parameters():
-                p.requires_grad_(grad_on)
+            if mod_name == "llama":
+                for name, p in mod.named_parameters():
+                    p.requires_grad_(aa_on if _is_audio_adapter(name) else llama_on)
+            else:
+                grad_on = mod_name in trainable_set
+                for p in mod.parameters():
+                    p.requires_grad_(grad_on)
 
-        # Build named param groups in canonical order, skipping non-trainable modules.
+        # Selector for each canonical group's parameters.  "audio_adapters" and
+        # "llama" both draw from the llama module but from disjoint name subsets.
+        def _group_params(group_name: str) -> list[nn.Parameter]:
+            if group_name == "llama":
+                return [p for n, p in llama.named_parameters()
+                        if p.requires_grad and not _is_audio_adapter(n)]
+            if group_name == "audio_adapters":
+                return [p for n, p in llama.named_parameters()
+                        if p.requires_grad and _is_audio_adapter(n)]
+            return [p for p in modules[group_name].parameters() if p.requires_grad]
+
+        # Build named param groups in canonical order, skipping non-trainable ones.
         param_groups: list[dict] = []
         for mod_name in _MODULE_ORDER:
             if mod_name not in trainable_set:
                 continue
-            mod    = modules[mod_name]
-            params = [p for p in mod.parameters() if p.requires_grad]
+            params = _group_params(mod_name)
             assert params, (
                 f"Param group '{mod_name}' is empty after requires_grad — "
-                "check model construction."
+                "check model construction (e.g. 'audio_adapters' with audio_adapter_r=0)."
             )
-            param_groups.append({
+            group: dict = {
                 "name":   mod_name,
                 "params": params,
                 "lr":     self._config.lrs[mod_name],
-            })
+            }
+            # Zero weight decay for the gated adapters: global wd would push the
+            # zero-init scalar gate closed and decay the adapter RMSNorm off 1.
+            if mod_name == "audio_adapters":
+                group["weight_decay"] = 0.0
+            param_groups.append(group)
 
         optimizer = optim_utils.build_adamw8bit(
             param_groups,
@@ -411,6 +447,64 @@ if __name__ == "__main__":
     )
 
     print("[OK] setup stage[1]")
+
+    # ── Test: audio_adapters group (name-selected subset of llama) ─────────────
+    class _FakeLlamaWithAdapters(nn.Module):
+        """llama stub: one 'backbone' param (frozen) + one 'audio_adapter' param."""
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone      = nn.Linear(4, 8)   # stands in for pretrained weights
+            self.audio_adapter = nn.Linear(8, 4)   # names contain "audio_adapter"
+
+    aa_cfg = StageConfig(
+        name             = "audio_layer_adapters",
+        trainable        = ["audio_adapters"],
+        lrs              = {"audio_adapters": 1.0e-4},
+        schedule         = Schedule(warmup_steps=0),
+        batch_size       = 64,
+        accum_steps      = 1,
+        exit             = ExitConfig(strategy="never", threshold=None, min_steps=0),
+    )
+
+    enc_aa = nn.Linear(4, 4)
+    ada_aa = nn.Linear(4, 4)
+    llm_aa = _FakeLlamaWithAdapters()
+
+    with mock.patch.object(optim_utils, "build_adamw8bit", side_effect=_fake_adamw8bit):
+        stage_aa       = Stage(aa_cfg, ctx)
+        opt_aa, sch_aa = stage_aa.setup(enc_aa, ada_aa, llm_aa)
+
+    # Exactly one param group, named "audio_adapters", with weight_decay 0.0.
+    assert len(opt_aa.param_groups) == 1, f"expected 1 group, got {len(opt_aa.param_groups)}"
+    assert opt_aa.param_groups[0]["name"] == "audio_adapters", opt_aa.param_groups[0]["name"]
+    assert opt_aa.param_groups[0]["weight_decay"] == 0.0, opt_aa.param_groups[0]["weight_decay"]
+    assert abs(opt_aa.param_groups[0]["lr"] - 1e-4) < 1e-12, opt_aa.param_groups[0]["lr"]
+
+    # requires_grad True only for name-matching llama params.
+    for name, p in llm_aa.named_parameters():
+        if "audio_adapter" in name:
+            assert p.requires_grad, f"{name} should require grad"
+        else:
+            assert not p.requires_grad, f"{name} should NOT require grad"
+    assert not any(p.requires_grad for p in enc_aa.parameters()), "encoder must stay frozen"
+    assert not any(p.requires_grad for p in ada_aa.parameters()), "adapter must stay frozen"
+
+    print("[OK] setup audio_adapters group")
+
+    # ── Test: empty audio_adapters group is caught by the assert guard ─────────
+    # A plain llama stub has no 'audio_adapter' params, so trainable=[audio_adapters]
+    # selects nothing — this must fail loudly (mirrors audio_adapter_r=0).
+    llm_plain = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 4))
+    _empty_raised = False
+    try:
+        with mock.patch.object(optim_utils, "build_adamw8bit", side_effect=_fake_adamw8bit):
+            Stage(aa_cfg, ctx).setup(nn.Linear(4, 4), nn.Linear(4, 4), llm_plain)
+    except AssertionError as exc:
+        _empty_raised = True
+        assert "audio_adapters" in str(exc), str(exc)
+    assert _empty_raised, "expected AssertionError for empty audio_adapters group"
+
+    print("[OK] empty audio_adapters group caught by guard")
 
     # ── Test: optimizer_init "inherit" raises NotImplementedError ──────────────
     inherit_cfg = replace(s0_cfg, optimizer_init="inherit")

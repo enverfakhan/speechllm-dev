@@ -70,6 +70,7 @@ class ModelConfig:
     adapter_pca_init:       Path | None = None
     gradient_checkpointing: bool        = False
     init_from:              Path | None = None
+    audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,7 @@ def _build_model(d: dict) -> ModelConfig:
         adapter_pca_init       = _opt_path(d.get("adapter_pca_init")),
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
         init_from              = _opt_path(d.get("init_from")),
+        audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
     )
 
 
@@ -307,7 +309,9 @@ def _assemble(d: dict, stages: list[StageConfig], resume: Path | None) -> Config
 # ── Validation ────────────────────────────────────────────────────────────────
 
 _VALID_INSTRUCTION_MODES = {"unformatted", "formatted", "both"}
-_VALID_TRAINABLE         = {"encoder", "adapter", "llama"}
+# "audio_adapters" is a name-selected subset of llama's parameters (the gated
+# per-layer audio adapters), not a separate nn.Module — see stages.Stage.setup.
+_VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {"first_token_below", "eval_loss_below", "max_steps", "never"}
 _EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below"}
@@ -493,10 +497,22 @@ def load_config(
     stage_defaults = deep_merge(base_sd, run_sd)
 
     # 4. Build stages: each entry deep-merged onto stage_defaults.
+    #    `lrs` is the exception — it is replaced wholesale (not deep-merged) when
+    #    the stage provides it.  lrs keys are coupled to `trainable`, so a stage
+    #    that trains a different set than the default (e.g. [audio_adapters]) must
+    #    not inherit the default adapter lr, which would leave a key with no
+    #    matching trainable module and fail validation.  (`schedule`/`exit` still
+    #    deep-merge so a stage can override just one of their sub-keys.)
+    def _merge_stage(defaults: dict, s: dict) -> dict:
+        merged_stage = deep_merge(defaults, {k: v for k, v in s.items() if k != "lrs"})
+        if "lrs" in s:
+            merged_stage["lrs"] = s["lrs"]
+        return merged_stage
+
     run_inst_mode = (merged.get("run") or {}).get("instruction_mode", "unformatted")
     raw_stages    = merged.get("stages") or []
     stages        = [
-        _build_stage(deep_merge(stage_defaults, s), run_inst_mode)
+        _build_stage(_merge_stage(stage_defaults, s), run_inst_mode)
         for s in raw_stages
     ]
 

@@ -123,7 +123,7 @@ def run_eval_pass(
                 d_trans_ids, d_trans_lens,
                 llama.embed_tokens, sep_token_id,
             )
-            d_logits, d_loss = llama(d_inp, d_lbl)
+            d_logits, d_loss = llama(d_inp, d_lbl, audio_lengths=d_audio_len)
 
         metrics.observe("eval", global_step, logits=d_logits, labels=d_lbl, loss=d_loss.detach())
         retained.append((d_mel, d_audio_len, d_inst_ids, d_inst_lens, d_trans_ids, d_trans_lens))
@@ -234,11 +234,16 @@ def run_stage(
     ckpt_dir:     Path,
     baselines_data: dict,
     train_start:  float,
+    modules_dirty: set[str],
 ) -> bool:
     """Run one stage to completion (or until the global step cap is hit).
 
     Returns True iff training should stop entirely (cfg.run.max_steps reached);
     False means this stage advanced and the caller should move to the next one.
+
+    modules_dirty is the run-level set of heavy modules ("encoder"/"llama") that
+    diverge from pretrained and must be written into every checkpoint (delta
+    invariant — see utils/checkpoint.save_checkpoint).
     """
     optimizer.zero_grad()
     accum_loss  = 0.0
@@ -281,7 +286,7 @@ def run_stage(
                     llama.embed_tokens,
                     sep_token_id,
                 )
-                logits, loss = llama(inputs, labels)
+                logits, loss = llama(inputs, labels, audio_lengths=audio_lengths)
 
             metrics.observe("train", run.global_step, logits=logits, labels=labels)
             scaler.scale(loss / stage.accum_steps).backward()
@@ -327,6 +332,7 @@ def run_stage(
                     ckpt_dir, stage, stage_idx,
                     run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
                     encoder, adapter, llama, optimizer, scaler, scheduler,
+                    modules_dirty, cfg,
                 )
 
             # ── Eval pass ─────────────────────────────────────────────────────
@@ -374,12 +380,21 @@ def run_stage(
 
             # ── W&B ───────────────────────────────────────────────────────────
             if use_wandb:
+                # Per-layer gate diagnostic: which depths open their gates, and
+                # how fast.  Only when the gated adapters exist AND this stage
+                # trains them (cheap: n_layers-1 scalars).
+                gate_metrics = (
+                    llama.audio_gate_values()
+                    if (cfg.model.audio_adapter_r > 0
+                        and "audio_adapters" in set(stage.trainable))
+                    else {}
+                )
                 _log_wandb(
                     run.global_step, stage_idx, stage, run.epoch,
                     avg_loss, loss_ema,
                     optimizer, throughput, total_audio_s, t_now, train_start,
                     train_metrics, eval_metrics, wer_metrics,
-                    baselines_data,
+                    baselines_data, gate_metrics,
                 )
 
             # ── Stage advance check ───────────────────────────────────────────
@@ -402,6 +417,7 @@ def run_stage(
                 ckpt_dir, stage, stage_idx,
                 run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
                 encoder, adapter, llama, optimizer, scaler, scheduler,
+                modules_dirty, cfg,
                 suffix="stage-handoff",
             )
             run.epoch = 0
@@ -436,7 +452,16 @@ def main(argv: list[str] | None = None) -> None:
     baselines_data: dict = json.loads(baseline_path.read_text()) if baseline_path.exists() else {}
 
     # ── Models ────────────────────────────────────────────────────────────────
-    encoder, adapter, llama = build_models(cfg, device)
+    encoder, adapter, llama, init_from_loaded = build_models(cfg, device)
+
+    # modules_dirty: the run-level set of heavy modules that DIFFER from the
+    # pretrained base and therefore must be written into every checkpoint (delta
+    # invariant — see utils/checkpoint.save_checkpoint).  It lives here as run
+    # provenance (next to init_from), not on RunState, because it is not a
+    # per-stage counter; on resume it is restored explicitly from the checkpoint.
+    # Seed: encoder/llama warm-started from init_from already diverge from
+    # pretrained.  (adapter/audio_adapters are always saved, so ignore them here.)
+    modules_dirty: set[str] = {m for m in init_from_loaded if m in ("encoder", "llama")}
 
     # ── Persistent scaler (shared across all stages) ──────────────────────────
     scaler = torch.amp.GradScaler("cuda")
@@ -564,16 +589,28 @@ def main(argv: list[str] | None = None) -> None:
             rs = apply_full_checkpoint(
                 ckpt, encoder=encoder, adapter=adapter, llama=llama,
                 optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+                current_init_from=(
+                    str(cfg.model.init_from) if cfg.model.init_from is not None else None
+                ),
             )
             run = RunState.from_resume(rs)
+            # Restore the accumulated dirty set so the resumed run keeps saving
+            # every module the original run had already dirtied.
+            modules_dirty |= set(rs.modules_dirty)
             del ckpt  # free the CPU-side checkpoint dict
             ckpt = None
             print(
                 f"  Restored: global_step={run.global_step} "
-                f"step_in_stage={run.step_in_stage} epoch={run.epoch}"
+                f"step_in_stage={run.step_in_stage} epoch={run.epoch} "
+                f"modules_dirty={sorted(modules_dirty)}"
             )
         else:
             run.enter_new_stage()
+
+        # Every stage (fresh or resumed) dirties the heavy modules it trains, and
+        # dirtiness persists: a run that finetunes llama in stage 0 then freezes
+        # it in stage 1 must still save llama in stage-1 checkpoints.
+        modules_dirty |= set(stage.trainable) & {"encoder", "llama"}
 
         stopped = run_stage(
             encoder, adapter, llama,
@@ -583,13 +620,15 @@ def main(argv: list[str] | None = None) -> None:
             stage, stage_idx, run,
             cfg, device, sep_token_id, use_wandb,
             ckpt_dir, baselines_data, train_start,
+            modules_dirty,
         )
         if stopped:
             break
     # end stage loop
 
-    # ── Final checkpoint ──────────────────────────────────────────────────────
+    # ── Final checkpoint (same delta gating as periodic saves) ────────────────
     _final = ckpt_dir / f"final-step{run.global_step}.pt"
+    _final_init_from = str(cfg.model.init_from) if cfg.model.init_from is not None else None
     save_checkpoint(
         _final,
         step                = run.global_step,
@@ -602,8 +641,11 @@ def main(argv: list[str] | None = None) -> None:
         optimizer           = optimizer,
         scaler              = scaler,
         scheduler           = scheduler,
-        encoder             = encoder,
-        llama               = llama,
+        encoder             = encoder if "encoder" in modules_dirty else None,
+        llama               = llama   if "llama"   in modules_dirty else None,
+        audio_adapters_from = llama,
+        modules_dirty       = modules_dirty,
+        init_from           = _final_init_from,
         kind                = "periodic",
     )
     print(f"Final checkpoint saved → {_final}")
@@ -619,6 +661,7 @@ def main(argv: list[str] | None = None) -> None:
         batch_size          = stages[stage_idx].batch_size,
         adapter             = adapter,
         optimizer           = optimizer,
+        llama               = llama,   # rides audio-adapter tensors along, if any
     )
     print(f"Final adapter checkpoint saved → {_final_ada}")
 
@@ -643,13 +686,21 @@ def _save_checkpoint(
     optimizer:    torch.optim.Optimizer,
     scaler:       torch.amp.GradScaler,
     scheduler:    torch.optim.lr_scheduler.LRScheduler,
+    modules_dirty: set[str],
+    cfg:          Config,
     suffix:       str = "",
 ) -> None:
-    """Save full checkpoint + optional adapter sidecar for adapter-only stages."""
+    """Save full checkpoint + optional adapter sidecar for adapter-only stages.
+
+    The full checkpoint is a DELTA over pretrained (see utils/checkpoint): the
+    heavy encoder/llama states are written only when in modules_dirty; audio
+    adapters are always harvested from llama when full llama is skipped.
+    """
     name = f"step{global_step:07d}"
     if suffix:
         name += f"-{suffix}"
     ckpt_path = ckpt_dir / f"{name}.pt"
+    init_from = str(cfg.model.init_from) if cfg.model.init_from is not None else None
     save_checkpoint(
         ckpt_path,
         step                = global_step,
@@ -662,8 +713,13 @@ def _save_checkpoint(
         optimizer           = optimizer,
         scaler              = scaler,
         scheduler           = scheduler,
-        encoder             = encoder,
-        llama               = llama,
+        # Delta gating: write the big frozen states only when they diverge from
+        # pretrained; always harvest the small audio-adapter delta from llama.
+        encoder             = encoder if "encoder" in modules_dirty else None,
+        llama               = llama   if "llama"   in modules_dirty else None,
+        audio_adapters_from = llama,
+        modules_dirty       = modules_dirty,
+        init_from           = init_from,
         kind                = "handoff" if suffix == "stage-handoff" else "periodic",
     )
     print(f"Checkpoint saved → {ckpt_path}")
@@ -683,6 +739,7 @@ def _save_checkpoint(
             batch_size          = stage.batch_size,
             adapter             = adapter,
             optimizer           = optimizer,
+            llama               = llama,   # rides audio-adapter tensors along, if any
         )
         print(f"Adapter checkpoint saved → {ada_path}")
 
@@ -705,6 +762,7 @@ def _log_wandb(
     eval_metrics:  dict,
     wer_metrics:   dict,
     baselines_data: dict,
+    gate_metrics:  dict | None = None,
 ) -> None:
     import wandb as _wandb
 
@@ -756,6 +814,7 @@ def _log_wandb(
         **wer_metrics,
         **gap,
         **baseline_payload,
+        **(gate_metrics or {}),
     }
 
     _wandb.log(payload, step=global_step)
