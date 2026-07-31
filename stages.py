@@ -243,8 +243,8 @@ class Stage:
                 "params": params,
                 "lr":     self._config.lrs[mod_name],
             }
-            # Zero weight decay for the gated adapters: global wd would push the
-            # zero-init scalar gate closed and decay the adapter RMSNorm off 1.
+            # Zero weight decay for the gated adapters: global wd would pull the
+            # scalar gate (init 1.0) closed and decay the adapter RMSNorm off 1.
             if mod_name == "audio_adapters":
                 group["weight_decay"] = 0.0
             param_groups.append(group)

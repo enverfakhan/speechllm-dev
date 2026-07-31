@@ -238,41 +238,47 @@ class AudioLayerAdapter(nn.Module):
 
         audio_mask * tanh(gate) * up(gelu(down(norm(x))))
 
-    A per-layer scalar ``gate`` initialised at 0 makes ``tanh(gate) == 0``, so
-    the branch is an *exact* no-op at step 0 — inserting the module never
-    perturbs the pretrained forward pass.  The model opens each layer's gate
-    only if the audio task rewards it, which is exactly the per-depth diagnostic
-    we want to watch.  ``norm`` is a fresh RMSNorm owned here (never the block's
-    pretrained norms), so no pretrained parameter is read or written.
+    The branch is an *exact* no-op at step 0 — inserting the module never
+    perturbs the pretrained forward pass — because ``up_proj`` (the projection
+    that writes the residual) is zero-initialised.  The scalar ``gate`` instead
+    starts *open* at 1.0 (``tanh(1) ≈ 0.762``), so it is a learned magnitude the
+    model can shrink or grow rather than a switch it must first turn on; the
+    per-layer ``tanh(gate)`` trace stays the per-depth diagnostic we watch.
+    ``norm`` is a fresh RMSNorm owned here (never the block's pretrained norms),
+    so no pretrained parameter is read or written.
+
+    Only ``up_proj`` is zeroed: zeroing ``down_proj`` too would make every
+    gradient in the branch exactly zero (``d/d down_proj ∝ up_proj.weight`` and
+    ``d/d up_proj ∝ gelu(down_proj(·))``), leaving the adapter permanently dead.
     """
 
-    def __init__(self, d_model: int, r: int, n_layers: int, eps: float) -> None:
-        """Build the bottleneck, its own RMSNorm, and the zero-init gate.
+    def __init__(self, d_model: int, r: int, eps: float) -> None:
+        """Build the bottleneck, its own RMSNorm, and the open scalar gate.
 
         Args:
-            d_model:  residual-stream width (matches the block)
-            r:        bottleneck rank
-            n_layers: model depth; used for the scaled residual-write init
-            eps:      RMSNorm epsilon (same value the block's norms use)
+            d_model: residual-stream width (matches the block)
+            r:       bottleneck rank
+            eps:     RMSNorm epsilon (same value the block's norms use)
         """
         super().__init__()
         self.norm      = RMSNorm(d_model, eps)
         self.down_proj = nn.Linear(d_model, r,       bias=False)   # d_model → r
         self.up_proj   = nn.Linear(r,       d_model, bias=False)   # r → d_model (writes residual)
-        # Scalar gate; tanh(0)=0 → identity branch at init (see class docstring).
-        self.gate      = nn.Parameter(torch.zeros(1))
+        # Scalar gate, initialised open at 1.0 → tanh(1) ≈ 0.762 (see class docstring).
+        self.gate      = nn.Parameter(torch.ones(1))
 
-        # up_proj writes into the residual stream, so it gets the same GPT-2
-        # scaled init as LlamaBlock's o_proj / down_proj (std = 0.02/sqrt(L)).
-        # This keeps the branch well-scaled once the gate opens; down_proj keeps
-        # the default nn.Linear init.
-        nn.init.normal_(self.up_proj.weight, mean=0.0, std=0.02 / math.sqrt(n_layers))
+        # up_proj writes into the residual stream and is zero-initialised, which
+        # is what makes the whole branch an exact no-op at step 0.  It is the ONLY
+        # tensor here that may be zeroed — down_proj keeps the default nn.Linear
+        # init so gradients can flow on the very first step.
+        nn.init.zeros_(self.up_proj.weight)
 
     def forward(self, x: torch.Tensor, audio_mask: torch.Tensor) -> torch.Tensor:
         """Return the masked, gated adapter branch (residual add stays in the block).
 
         Args:
-            x:          (B, S, d_model) — the block's running residual stream
+            x:          (B, S, d_model) — the block's INPUT residual stream (the
+                        branch runs parallel to the whole layer)
             audio_mask: (B, S, 1) float — 1.0 at audio positions, else 0.0
 
         Returns:
@@ -320,7 +326,7 @@ class LlamaBlock(nn.Module):
         # stage setup, grad metrics, and checkpoint tolerance all key off it.
         if has_audio_adapter and config.audio_adapter_r > 0:
             self.audio_adapter: AudioLayerAdapter | None = AudioLayerAdapter(
-                config.d_model, config.audio_adapter_r, config.n_layers, config.rms_norm_eps
+                config.d_model, config.audio_adapter_r, config.rms_norm_eps
             )
         else:
             self.audio_adapter = None
@@ -344,12 +350,14 @@ class LlamaBlock(nn.Module):
         Returns:
             (B, S, d_model)
         """
+        # Read the BLOCK INPUT: the adapter runs parallel to the whole layer
+        # (attention + MLP), not just parallel to the MLP.
         if self.audio_adapter is not None and audio_mask is not None:
             x_hat = self.audio_adapter(x, audio_mask)
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
-        # The gate at 0 makes this an exact no-op; still skip the compute when
-        # there is no adapter or no mask (keeps the frozen text path untouched).
+        # Zero-init up_proj makes this an exact no-op at step 0; still skip the
+        # compute when there is no adapter or no mask (frozen text path untouched).
         if self.audio_adapter is not None and audio_mask is not None:
             x = x + x_hat
         return x
@@ -694,7 +702,7 @@ if __name__ == "__main__":
     assert model_off.layers[0].audio_adapter is None, "r=0 must construct no adapters"
     print("[OK] last layer has no adapter; r=0 constructs none")
 
-    # ── Test: identity at init (tanh(0) == 0 → exact no-op) ─────────────────────
+    # ── Test: identity at init (up_proj == 0 → exact no-op) ─────────────────────
     with torch.no_grad():
         logits_on,  _ = model_on(inputs, audio_lengths=audio_lengths)
         logits_off, _ = model_off(inputs, audio_lengths=audio_lengths)
@@ -702,7 +710,7 @@ if __name__ == "__main__":
         f"adapter branch must be a no-op at init; max diff "
         f"{(logits_on - logits_off).abs().max().item():.2e}"
     )
-    print("[OK] identity at init: r=16 (gates=0) matches r=0")
+    print("[OK] identity at init: r=16 (up_proj=0) matches r=0")
 
     # ── Test: mask correctness at a single block ───────────────────────────────
     # Comparing whole-model logits would let causal attention spread an
@@ -719,7 +727,9 @@ if __name__ == "__main__":
     )
     with torch.no_grad():
         ref = block(x, cos, sin, audio_mask=None)          # adapter disabled
-        block.audio_adapter.gate.data.fill_(5.0)           # force the gate wide open
+        # up_proj is zero at init, so give it real weights — otherwise the branch
+        # is still the exact no-op the previous test just checked.
+        block.audio_adapter.up_proj.weight.normal_(mean=0.0, std=0.05)
         out = block(x, cos, sin, audio_mask)               # adapter active at audio pos
     for i in range(B):
         n = int(audio_lengths[i].item())
@@ -742,7 +752,9 @@ if __name__ == "__main__":
         p.requires_grad_("audio_adapter" in name)
     for layer in gc_model.layers:
         if layer.audio_adapter is not None:
-            layer.audio_adapter.gate.data.fill_(0.5)       # open gates so down/up get signal
+            # Lift up_proj off its zero init so down_proj, norm and gate — whose
+            # grads are all proportional to it — see signal on this first step.
+            layer.audio_adapter.up_proj.weight.data.normal_(mean=0.0, std=0.05)
 
     gc_inputs = torch.randn(B, S, D)                        # requires_grad=False (frozen upstream)
     gc_labels = torch.full((B, S), -100, dtype=torch.long)
@@ -753,8 +765,9 @@ if __name__ == "__main__":
     aa_params = gc_model.audio_adapter_parameters()
     assert aa_params, "expected non-empty audio adapter parameter list"
     assert all(p.grad is not None for p in aa_params), "every audio adapter param needs a grad"
-    total_aa_grad = sum(p.grad.abs().sum().item() for p in aa_params)
-    assert total_aa_grad > 0, "audio adapter grads are all zero"
+    assert all(p.grad.abs().sum().item() > 0 for p in aa_params), (
+        "every audio adapter param (norm, down, up, gate) must receive a non-zero grad"
+    )
     for name, p in gc_model.named_parameters():
         if "audio_adapter" not in name:
             assert not p.requires_grad, f"pretrained param {name} should be frozen"
@@ -764,7 +777,9 @@ if __name__ == "__main__":
     # ── Test: helper methods ───────────────────────────────────────────────────
     gates = model_on.audio_gate_values()
     assert set(gates.keys()) == {f"gates/layer_{i:02d}" for i in range(cfg_on.n_layers - 1)}, gates
-    assert all(v == 0.0 for v in gates.values()), "gate values should be tanh(0)=0 at init"
+    assert all(abs(v - math.tanh(1.0)) < 1e-6 for v in gates.values()), (
+        f"gates should start open at tanh(1)={math.tanh(1.0):.4f}: {gates}"
+    )
     assert model_off.audio_gate_values() == {}, "r=0 model exposes no gates"
     print("[OK] audio_gate_values / audio_adapter_parameters helpers")
 
