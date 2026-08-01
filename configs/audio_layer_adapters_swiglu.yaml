@@ -1,0 +1,68 @@
+# audio_layer_adapters_swiglu.yaml — experiment v3
+# Gated parallel audio-layer adapters with a SwiGLU bottleneck. Identical to
+# audio_layer_adapters.yaml (v2) in every other respect — same init_from, same
+# rank, same LRs, same trainable set — so the runs isolate ONE variable: the
+# adapter's internal network.
+#
+# The v-series (all warm-started from stage-1 step 4680):
+#   v1  bottleneck MLP, branch parallel to the MLP sub-block only
+#   v2  bottleneck MLP, branch parallel to the WHOLE transformer layer
+#   v3  SwiGLU bottleneck, branch parallel to the whole layer   ← this config
+#
+# v3 init (model/llama.py, AudioSwiGLUAdapter):
+#   down_proj  GPT-2 scaled init (std 0.02/sqrt(32)) — the residual writer starts
+#              at the same magnitude as a regular transformer layer's o_proj
+#   gate_proj  zeros — silu(0)=0 makes step 0 an exact no-op, silu'(0)=0.5 keeps
+#              its gradient alive, so it is the tensor that moves first
+#   up_proj    default init;  gate scalar 1.0 → tanh(1) ≈ 0.762 (starts open)
+#
+# Capacity note: SwiGLU is 3 matrices vs the MLP's 2, so at r=128 this run has
+# ~48.8M adapter params vs v2's ~32.5M (+50%). Set audio_adapter_r: 88 instead
+# if you want a parameter-matched comparison rather than a same-rank one.
+#
+# The init_from checkpoint predates audio adapters — expect the load message
+# "[load] N audio-adapter tensors not found in checkpoint — keeping fresh init".
+# That is correct: the branch is an exact no-op at step 0, so loss should open at
+# the stage-1 plateau, not above it. init_from (NOT --resume): fresh optimizer,
+# step counter from 0. A v2 checkpoint is NOT a valid init_from here — the
+# adapter tensors have different names and shapes and the load will fail loudly.
+#
+# Launch with:
+#   python training.py --config configs/audio_layer_adapters_swiglu.yaml
+
+seed: 45                        # fresh run; decorrelate data order from 42/43/44
+model:
+  init_from: checkpoints/stage1-both-format/step_0004680.pt
+  audio_adapter_r:    88
+  audio_adapter_type: swiglu
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: audio-adapters-from-stage1-v3-4680
+checkpoint:
+  dir:        checkpoints/audio-adapters-from-stage1-v3-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        audio_adapters_both
+    trainable:   [adapter, audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: never}

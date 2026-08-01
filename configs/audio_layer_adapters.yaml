@@ -8,8 +8,9 @@
 #
 # The init_from checkpoint predates audio adapters — expect the load message
 # "[load] N audio-adapter tensors not found in checkpoint — keeping fresh init".
-# That is correct: gates start at tanh(0)=0, so step 0 is exactly the frozen
-# stage-1 model, and loss should open at the stage-1 plateau, not above it.
+# That is correct: up_proj starts at zero (the scalar gate starts OPEN at 1.0),
+# so step 0 is exactly the frozen stage-1 model, and loss should open at the
+# stage-1 plateau, not above it.
 #
 # Launch with:
 #   python training.py --config configs/audio_adapters_from_stage1_4680.yaml

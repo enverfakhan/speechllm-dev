@@ -20,6 +20,8 @@ model:
   adapter_pca_init: null
   gradient_checkpointing: true   # recompute activations during backward to reduce peak VRAM
   init_from: null                # path to checkpoint for weights-only warm-start
+  audio_adapter_r: 0             # gated per-layer audio adapter width; 0 = disabled
+  audio_adapter_type: mlp        # mlp (down→gelu→up) | swiglu (SwiGLU bottleneck)
 
 optim:
   betas: [0.9, 0.999]

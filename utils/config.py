@@ -71,6 +71,7 @@ class ModelConfig:
     gradient_checkpointing: bool        = False
     init_from:              Path | None = None
     audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
+    audio_adapter_type:     str         = "mlp"   # "mlp" | "swiglu"
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,7 @@ def _build_model(d: dict) -> ModelConfig:
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
         init_from              = _opt_path(d.get("init_from")),
         audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
+        audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
     )
 
 
@@ -312,6 +314,9 @@ _VALID_INSTRUCTION_MODES = {"unformatted", "formatted", "both"}
 # "audio_adapters" is a name-selected subset of llama's parameters (the gated
 # per-layer audio adapters), not a separate nn.Module — see stages.Stage.setup.
 _VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
+# Mirrors model.llama.AUDIO_ADAPTER_TYPES; duplicated so config loading stays
+# import-light (utils.config must not pull in torch to validate a YAML file).
+_VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {"first_token_below", "eval_loss_below", "max_steps", "never"}
 _EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below"}
@@ -336,6 +341,13 @@ def _validate(cfg: Config) -> None:
             raise ValueError("model.whisper_ckpt: required when model.stub is false")
         if cfg.model.llama_ckpt is None:
             raise ValueError("model.llama_ckpt: required when model.stub is false")
+    if cfg.model.audio_adapter_r < 0:
+        raise ValueError(f"model.audio_adapter_r: must be >= 0, got {cfg.model.audio_adapter_r}")
+    if cfg.model.audio_adapter_type not in _VALID_AUDIO_ADAPTER_TYPES:
+        raise ValueError(
+            f"model.audio_adapter_type: must be one of "
+            f"{sorted(_VALID_AUDIO_ADAPTER_TYPES)}, got {cfg.model.audio_adapter_type!r}"
+        )
 
     # run
     if cfg.run.instruction_mode not in _VALID_INSTRUCTION_MODES:
