@@ -285,7 +285,7 @@ class AudioLayerAdapter(nn.Module):
             (B, S, d_model) — zero everywhere except audio positions, scaled by
             tanh(gate); add this to x in the caller.
         """
-        branch = self.up_proj(F.silu(self.down_proj(self.norm(x))))
+        branch = self.up_proj(F.gelu(self.down_proj(self.norm(x))))
         return audio_mask * torch.tanh(self.gate) * branch
 
 
