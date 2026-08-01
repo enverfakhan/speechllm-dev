@@ -22,6 +22,8 @@ model:
   init_from: null                # path to checkpoint for weights-only warm-start
   audio_adapter_r: 0             # gated per-layer audio adapter width; 0 = disabled
   audio_adapter_type: mlp        # mlp (down→gelu→up) | swiglu (SwiGLU bottleneck)
+  audio_adapter_zero_writer_layers: 0   # swiglu only: first N layers zero down_proj
+                                        # instead of gate_proj (0 = none)
 
 optim:
   betas: [0.9, 0.999]

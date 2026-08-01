@@ -54,6 +54,7 @@ def build_models(
             vocab_size=vocab_size,
             audio_adapter_r=cfg.model.audio_adapter_r,
             audio_adapter_type=cfg.model.audio_adapter_type,
+            audio_adapter_zero_writer_layers=cfg.model.audio_adapter_zero_writer_layers,
         )
         llama_dim = cfg.model.stub_dims["d_model"]
         print("STUB mode: tiny randomly-initialised model (no pretrained weights).")
@@ -62,6 +63,7 @@ def build_models(
             vocab_size=vocab_size,
             audio_adapter_r=cfg.model.audio_adapter_r,
             audio_adapter_type=cfg.model.audio_adapter_type,
+            audio_adapter_zero_writer_layers=cfg.model.audio_adapter_zero_writer_layers,
         )
         llama_dim = 4096
 

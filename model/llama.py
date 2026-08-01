@@ -41,6 +41,9 @@ class LlamaConfig:
     rope_theta:        float = 500000.0   # Llama 3.1 uses 500k (3.0 used 10k)
     audio_adapter_r:   int   = 0          # gated audio adapter bottleneck; 0 = disabled
     audio_adapter_type: str  = "mlp"      # "mlp" (down→gelu→up) | "swiglu" (SwiGLU bottleneck)
+    # swiglu only: the first N adapter layers zero their writer (down_proj) instead
+    # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
+    audio_adapter_zero_writer_layers: int = 0
 
 
 # ── RMSNorm ────────────────────────────────────────────────────────────────────
@@ -304,29 +307,46 @@ class AudioSwiGLUAdapter(nn.Module):
     ``gate_proj``/``up_proj`` are the two d_model→r input projections and
     ``down_proj`` (r→d_model) is the one that writes the residual.
 
-    Init: ``down_proj`` — the residual writer — gets the GPT-2 scaled init
-    (std = 0.02/sqrt(L)) that o_proj and mlp.down_proj use, so once the branch
-    turns on it writes at the same magnitude as a regular transformer layer.
-    The step-0 no-op therefore has to come from an input projection instead, and
-    ``gate_proj`` is the one zeroed: ``silu(0) == 0`` kills the product exactly,
-    while ``silu'(0) == 0.5`` keeps the gradient path open, so ``gate_proj``
-    receives a non-zero gradient on the very first step (the self-test asserts
-    this).  ``up_proj`` and ``down_proj`` join from step 2, once ``gate_proj``
-    is non-zero.
+    Either init mode makes the branch an exact no-op at step 0, and both leave
+    exactly ONE live gradient path — zeroing any second projection makes every
+    gradient in the branch identically zero and the adapter never trains.
 
-    As in the MLP variant, exactly ONE tensor may be zeroed — zeroing any second
-    projection makes every gradient in the branch identically zero and the
-    adapter never trains.
+    ``zero_writer=False`` (default, v3):
+        ``down_proj`` — the residual writer — gets the GPT-2 scaled init
+        (std = 0.02/sqrt(L)) that o_proj and mlp.down_proj use, so once the
+        branch turns on it writes at the same magnitude as a regular transformer
+        layer.  The no-op then has to come from an input projection, and
+        ``gate_proj`` is the one zeroed: ``silu(0) == 0`` kills the product
+        exactly, while ``silu'(0) == 0.5`` keeps its gradient alive, so
+        ``gate_proj`` trains on step 0 and the rest join from step 1.
+
+    ``zero_writer=True`` (v4, early layers):
+        ``down_proj`` is zeroed instead and BOTH input projections keep their
+        default init — the LoRA B=0 convention.  ``down_proj`` is then the live
+        tensor at step 0 (its gradient is proportional to the non-zero SwiGLU
+        hidden state), so the branch's residual write starts at magnitude zero
+        and grows in a loss-aligned direction, rather than starting at
+        transformer-layer scale in a random direction.  ``gate_proj`` must NOT
+        also be zeroed here.
     """
 
-    def __init__(self, d_model: int, r: int, n_layers: int, eps: float) -> None:
+    def __init__(
+        self,
+        d_model:     int,
+        r:           int,
+        n_layers:    int,
+        eps:         float,
+        zero_writer: bool = False,
+    ) -> None:
         """Build the SwiGLU bottleneck, its own RMSNorm, and the open scalar gate.
 
         Args:
-            d_model:  residual-stream width (matches the block)
-            r:        bottleneck width (the SwiGLU intermediate size)
-            n_layers: model depth; sets the GPT-2 scaled init std for down_proj
-            eps:      RMSNorm epsilon (same value the block's norms use)
+            d_model:     residual-stream width (matches the block)
+            r:           bottleneck width (the SwiGLU intermediate size)
+            n_layers:    model depth; sets the GPT-2 scaled init std for down_proj
+            eps:         RMSNorm epsilon (same value the block's norms use)
+            zero_writer: zero down_proj (and leave gate_proj at default init)
+                         instead of the default zero-gate_proj scheme
         """
         super().__init__()
         self.norm      = RMSNorm(d_model, eps)
@@ -335,12 +355,18 @@ class AudioSwiGLUAdapter(nn.Module):
         self.down_proj = nn.Linear(r,       d_model, bias=False)   # r → d_model (writes residual)
         # Scalar gate, initialised open at 1.0 → tanh(1) ≈ 0.762.
         self.gate      = nn.Parameter(torch.ones(1))
+        self.zero_writer = zero_writer
 
-        # Residual writer at transformer-layer scale (same std as o_proj / mlp.down_proj).
-        nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02 / math.sqrt(n_layers))
-        # Exact no-op at step 0: silu(0) = 0 zeroes the SwiGLU product. Gradient
-        # still flows here because silu'(0) = 0.5 (see class docstring).
-        nn.init.zeros_(self.gate_proj.weight)
+        if zero_writer:
+            # Residual write starts at exactly zero; gate_proj/up_proj keep their
+            # default init so down_proj has a live gradient on step 0.
+            nn.init.zeros_(self.down_proj.weight)
+        else:
+            # Writer at transformer-layer scale (same std as o_proj / mlp.down_proj)…
+            nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02 / math.sqrt(n_layers))
+            # …so the no-op comes from silu(0) = 0 instead.  Gradient still flows
+            # here because silu'(0) = 0.5 (see class docstring).
+            nn.init.zeros_(self.gate_proj.weight)
 
     def forward(self, x: torch.Tensor, audio_mask: torch.Tensor) -> torch.Tensor:
         """Return the masked, gated adapter branch (residual add stays in the block).
@@ -362,7 +388,7 @@ class AudioSwiGLUAdapter(nn.Module):
 AUDIO_ADAPTER_TYPES: frozenset[str] = frozenset({"mlp", "swiglu"})
 
 
-def build_audio_adapter(config: LlamaConfig) -> nn.Module:
+def build_audio_adapter(config: LlamaConfig, layer_idx: int) -> nn.Module:
     """Construct the audio adapter variant named by ``config.audio_adapter_type``.
 
     The two variants have different constructor signatures (only the SwiGLU one
@@ -370,7 +396,9 @@ def build_audio_adapter(config: LlamaConfig) -> nn.Module:
     rather than a name→class table.
 
     Args:
-        config: model hyperparameters (audio_adapter_type, audio_adapter_r, …)
+        config:    model hyperparameters (audio_adapter_type, audio_adapter_r, …)
+        layer_idx: index of the owning block; decides which SwiGLU init scheme
+                   applies (see config.audio_adapter_zero_writer_layers)
 
     Returns:
         An AudioLayerAdapter or AudioSwiGLUAdapter.
@@ -381,7 +409,8 @@ def build_audio_adapter(config: LlamaConfig) -> nn.Module:
         )
     if config.audio_adapter_type == "swiglu":
         return AudioSwiGLUAdapter(
-            config.d_model, config.audio_adapter_r, config.n_layers, config.rms_norm_eps
+            config.d_model, config.audio_adapter_r, config.n_layers, config.rms_norm_eps,
+            zero_writer=layer_idx < config.audio_adapter_zero_writer_layers,
         )
     raise ValueError(
         f"audio_adapter_type: must be one of {sorted(AUDIO_ADAPTER_TYPES)}, "
@@ -402,7 +431,12 @@ class LlamaBlock(nn.Module):
     parameter and is never modified.
     """
 
-    def __init__(self, config: LlamaConfig, has_audio_adapter: bool = False) -> None:
+    def __init__(
+        self,
+        config:            LlamaConfig,
+        has_audio_adapter: bool = False,
+        layer_idx:         int  = 0,
+    ) -> None:
         """Initialise attention, MLP, their preceding layer norms, and the adapter.
 
         Args:
@@ -410,6 +444,8 @@ class LlamaBlock(nn.Module):
             has_audio_adapter: construct the audio adapter for this block (the
                                caller passes False for the last layer, whose
                                audio-position outputs feed nothing)
+            layer_idx:         this block's depth index; only used to pick the
+                               adapter's init scheme (see build_audio_adapter)
         """
         super().__init__()
         self.input_layernorm          = RMSNorm(config.d_model, config.rms_norm_eps)
@@ -427,7 +463,7 @@ class LlamaBlock(nn.Module):
         # Named `audio_adapter` so its parameter names contain that substring —
         # stage setup, grad metrics, and checkpoint tolerance all key off it.
         if has_audio_adapter and config.audio_adapter_r > 0:
-            self.audio_adapter: nn.Module | None = build_audio_adapter(config)
+            self.audio_adapter: nn.Module | None = build_audio_adapter(config, layer_idx)
         else:
             self.audio_adapter = None
 
@@ -482,11 +518,20 @@ class Llama(nn.Module):
         super().__init__()
         self.config = config
 
+        # Adapters live on layers 0 … n_layers-2, so a split larger than that
+        # would silently mean "all of them" — fail loud instead.
+        if config.audio_adapter_zero_writer_layers > config.n_layers - 1:
+            raise ValueError(
+                f"audio_adapter_zero_writer_layers "
+                f"({config.audio_adapter_zero_writer_layers}) exceeds the number of "
+                f"adapter-bearing layers ({config.n_layers - 1})"
+            )
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         # Skip the audio adapter on the LAST layer: its audio-position outputs
         # feed nothing (only transcript positions read the final hidden state).
         self.layers       = nn.ModuleList(
-            [LlamaBlock(config, has_audio_adapter=(i < config.n_layers - 1))
+            [LlamaBlock(config, has_audio_adapter=(i < config.n_layers - 1), layer_idx=i)
              for i in range(config.n_layers)]
         )
         self._has_audio_adapters = any(
@@ -914,7 +959,9 @@ if __name__ == "__main__":
     )
 
     try:
-        build_audio_adapter(LlamaConfig(**_COMMON, audio_adapter_r=16, audio_adapter_type="nope"))
+        build_audio_adapter(
+            LlamaConfig(**_COMMON, audio_adapter_r=16, audio_adapter_type="nope"), layer_idx=0
+        )
     except ValueError:
         pass
     else:
@@ -958,6 +1005,64 @@ if __name__ == "__main__":
         f"every adapter param must train once gate_proj is non-zero: {grads_step1}"
     )
     print("[OK] swiglu adapter: gate_proj trains at step 0, all params from step 1")
+
+    # ── Test: v4 split init (first N layers zero the writer instead) ───────────
+    # cfg has 3 layers → adapters on 0,1; split=1 puts layer 0 in zero-writer
+    # mode and leaves layer 1 on the default scheme.
+    cfg_split = LlamaConfig(
+        **_COMMON, audio_adapter_r=16, audio_adapter_type="swiglu",
+        audio_adapter_zero_writer_layers=1,
+    )
+    sp_model = Llama(cfg_split)
+    early, late = sp_model.layers[0].audio_adapter, sp_model.layers[1].audio_adapter
+    assert early.zero_writer and not late.zero_writer, "split assigned to the wrong layers"
+    assert torch.count_nonzero(early.down_proj.weight) == 0, "early layer must zero its writer"
+    assert torch.count_nonzero(early.gate_proj.weight) > 0, (
+        "early layer must NOT also zero gate_proj — that kills every gradient"
+    )
+    assert torch.count_nonzero(late.gate_proj.weight)  == 0, "late layer keeps the v3 scheme"
+    assert torch.count_nonzero(late.down_proj.weight)  > 0,  "late layer keeps the GPT-2 writer"
+
+    sp_off    = Llama(cfg_off)
+    incompat  = sp_off.load_state_dict(sp_model.state_dict(), strict=False)
+    assert not incompat.missing_keys, f"unexpected missing keys: {incompat.missing_keys}"
+    sp_model.eval()
+    sp_off.eval()
+    with torch.no_grad():
+        sp_on_logits,  _ = sp_model(inputs, audio_lengths=audio_lengths)
+        sp_off_logits, _ = sp_off(inputs, audio_lengths=audio_lengths)
+    assert torch.allclose(sp_on_logits, sp_off_logits, atol=1e-6), (
+        f"both init schemes must be no-ops at init; max diff "
+        f"{(sp_on_logits - sp_off_logits).abs().max().item():.2e}"
+    )
+
+    # Gradients: the zero-writer layer trains through down_proj on step 0, the
+    # default layer through gate_proj — mirror images, both alive.
+    sp_train = Llama(cfg_split)
+    sp_train.train()
+    for name, p in sp_train.named_parameters():
+        p.requires_grad_("audio_adapter" in name)
+    _, sp_loss = sp_train(torch.randn(B, S, D), sw_labels, audio_lengths=audio_lengths)
+    sp_loss.backward()
+    sp_grads = {
+        n: p.grad.abs().sum().item()
+        for n, p in sp_train.named_parameters() if "audio_adapter" in n
+    }
+    assert sp_grads["layers.0.audio_adapter.down_proj.weight"] > 0, sp_grads
+    assert sp_grads["layers.0.audio_adapter.gate_proj.weight"] == 0.0, sp_grads
+    assert sp_grads["layers.1.audio_adapter.gate_proj.weight"] > 0, sp_grads
+    assert sp_grads["layers.1.audio_adapter.down_proj.weight"] == 0.0, sp_grads
+
+    try:
+        Llama(LlamaConfig(
+            **_COMMON, audio_adapter_r=16, audio_adapter_type="swiglu",
+            audio_adapter_zero_writer_layers=_COMMON["n_layers"],
+        ))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("split beyond the adapter-bearing layers must raise")
+    print("[OK] swiglu split init: zero-writer early layers, v3 scheme late, both alive")
 
     print("\nPASSED")
     sys.exit(0)

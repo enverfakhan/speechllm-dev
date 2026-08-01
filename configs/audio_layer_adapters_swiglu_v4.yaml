@@ -1,0 +1,73 @@
+# audio_layer_adapters_swiglu_v4.yaml — experiment v4
+# v3 with a DEPTH-SPLIT adapter init. Identical to audio_layer_adapters_swiglu.yaml
+# in every other respect (same init_from, r=88, same LRs, same trainable set), so
+# the runs isolate ONE variable: how the early layers' branches start.
+#
+# The v-series (all warm-started from stage-1 step 4680):
+#   v1  bottleneck MLP, branch parallel to the MLP sub-block only
+#   v2  bottleneck MLP, branch parallel to the WHOLE transformer layer
+#   v3  SwiGLU bottleneck, branch parallel to the whole layer
+#   v4  v3 + zero-writer init on the first 15 adapter layers   ← this config
+#
+# Adapters live on layers 0…30 (the last layer has none), so the split is:
+#   layers 0-14   zero-writer: down_proj = 0, gate_proj/up_proj default init.
+#                 The residual write starts at magnitude zero and grows in a
+#                 loss-aligned direction. down_proj is the live tensor at step 0.
+#   layers 15-30  the v3 scheme: down_proj at GPT-2 scale (std 0.02/sqrt(32)),
+#                 gate_proj = 0. gate_proj is the live tensor at step 0.
+# Both schemes are exact no-ops at step 0, so loss still opens at the stage-1
+# plateau. In both, exactly ONE tensor is zeroed — zeroing gate_proj as well in
+# the early layers would make every gradient in those branches identically zero.
+#
+# Hypothesis under test: a random-direction write at full transformer-layer
+# magnitude is riskier the earlier it happens, because 30+ frozen layers sit
+# downstream of it. Deep layers have less left to disturb, so they keep the
+# faster-moving v3 init. Watch gates/layer_00…14 vs 15…30 to see whether the two
+# halves diverge.
+#
+# The init_from checkpoint predates audio adapters — expect the load message
+# "[load] N audio-adapter tensors not found in checkpoint — keeping fresh init".
+# init_from (NOT --resume): fresh optimizer, step counter from 0. A v2/v3
+# checkpoint is NOT a valid init_from here (v2 differs in tensor names/shapes;
+# v3 would load but overwrite the split init that is the point of this run).
+#
+# Launch with:
+#   python training.py --config configs/audio_layer_adapters_swiglu_v4.yaml
+
+seed: 46                        # fresh run; decorrelate data order from 42/43/44/45
+model:
+  init_from: checkpoints/stage1-both-format/step_0004680.pt
+  audio_adapter_r:    88
+  audio_adapter_type: swiglu
+  audio_adapter_zero_writer_layers: 15
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: audio-adapters-from-stage1-v4-4680
+checkpoint:
+  dir:        checkpoints/audio-adapters-from-stage1-v4-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        audio_adapters_both
+    trainable:   [adapter, audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: never}

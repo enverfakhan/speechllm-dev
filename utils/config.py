@@ -72,6 +72,9 @@ class ModelConfig:
     init_from:              Path | None = None
     audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
     audio_adapter_type:     str         = "mlp"   # "mlp" | "swiglu"
+    # swiglu only: first N adapter layers zero their writer (down_proj) instead
+    # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
+    audio_adapter_zero_writer_layers: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +212,7 @@ def _build_model(d: dict) -> ModelConfig:
         init_from              = _opt_path(d.get("init_from")),
         audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
         audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
+        audio_adapter_zero_writer_layers = int(d.get("audio_adapter_zero_writer_layers", 0)),
     )
 
 
@@ -347,6 +351,18 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             f"model.audio_adapter_type: must be one of "
             f"{sorted(_VALID_AUDIO_ADAPTER_TYPES)}, got {cfg.model.audio_adapter_type!r}"
+        )
+    if cfg.model.audio_adapter_zero_writer_layers < 0:
+        raise ValueError(
+            f"model.audio_adapter_zero_writer_layers: must be >= 0, "
+            f"got {cfg.model.audio_adapter_zero_writer_layers}"
+        )
+    if cfg.model.audio_adapter_zero_writer_layers > 0 and cfg.model.audio_adapter_type != "swiglu":
+        # The mlp variant already zeroes its writer in every layer, so the split
+        # would be a silent no-op rather than the requested per-depth scheme.
+        raise ValueError(
+            "model.audio_adapter_zero_writer_layers: only applies to "
+            f"audio_adapter_type: swiglu, got {cfg.model.audio_adapter_type!r}"
         )
 
     # run
