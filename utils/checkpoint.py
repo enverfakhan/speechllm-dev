@@ -298,7 +298,7 @@ def load_weights(
     Args:
         path:    checkpoint file path
         encoder: WhisperEncoder module, or None to skip
-        adapter: AudioAdapter module, or None to skip
+        adapter: bridge adapter module, or None to skip
         llama:   Llama module, or None to skip
 
     Returns:

@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from build import build_models
 from data import build_dataloader, list_shards, PrunedTokenizer, INSTRUCTION_VARIANTS
-from model.adapter import AudioAdapter
+from model.adapter import BridgeAdapter
 from model.llama import Llama
 from model.sequence import prepare_input
 from model.whisper_encoder import WhisperEncoder
@@ -82,7 +82,7 @@ class RunState:
 
 def run_eval_pass(
     encoder:      WhisperEncoder,
-    adapter:      AudioAdapter,
+    adapter:      BridgeAdapter,
     llama:        Llama,
     diag_loader:  torch.utils.data.DataLoader,
     diag_iter:    Any,
@@ -142,7 +142,7 @@ def maybe_run_wer(
     global_step:  int,
     eval_subset:  list[tuple],
     encoder:      WhisperEncoder,
-    adapter:      AudioAdapter,
+    adapter:      BridgeAdapter,
     llama:        Llama,
     tokenizer:    PrunedTokenizer,
     sep_token_id: int,
@@ -215,7 +215,7 @@ def maybe_run_wer(
 
 def run_stage(
     encoder:      WhisperEncoder,
-    adapter:      AudioAdapter,
+    adapter:      BridgeAdapter,
     llama:        Llama,
     optimizer:    torch.optim.Optimizer,
     scheduler:    torch.optim.lr_scheduler.LRScheduler,
@@ -380,11 +380,11 @@ def run_stage(
 
             # ── W&B ───────────────────────────────────────────────────────────
             if use_wandb:
-                # Per-layer gate diagnostic: which depths open their gates, and
-                # how fast.  Only when the gated adapters exist AND this stage
-                # trains them (cheap: n_layers-1 scalars).
-                gate_metrics = (
-                    llama.audio_gate_values()
+                # Per-layer adapter magnitude diagnostic: which depths engage,
+                # and how fast.  Only when the audio adapters exist AND this
+                # stage trains them (cheap: 2·(n_layers-1) scalars).
+                adapter_scale_metrics = (
+                    llama.audio_adapter_scales()
                     if (cfg.model.audio_adapter_r > 0
                         and "audio_adapters" in set(stage.trainable))
                     else {}
@@ -394,7 +394,7 @@ def run_stage(
                     avg_loss, loss_ema,
                     optimizer, throughput, total_audio_s, t_now, train_start,
                     train_metrics, eval_metrics, wer_metrics,
-                    baselines_data, gate_metrics,
+                    baselines_data, adapter_scale_metrics,
                 )
 
             # ── Stage advance check ───────────────────────────────────────────
@@ -762,7 +762,7 @@ def _log_wandb(
     eval_metrics:  dict,
     wer_metrics:   dict,
     baselines_data: dict,
-    gate_metrics:  dict | None = None,
+    adapter_scale_metrics:  dict | None = None,
 ) -> None:
     import wandb as _wandb
 
@@ -814,7 +814,7 @@ def _log_wandb(
         **wer_metrics,
         **gap,
         **baseline_payload,
-        **(gate_metrics or {}),
+        **(adapter_scale_metrics or {}),
     }
 
     _wandb.log(payload, step=global_step)

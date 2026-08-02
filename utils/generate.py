@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from model.adapter import AudioAdapter
+from model.adapter import BridgeAdapter
 from model.sequence import EvalPrefixBatch
 from model.llama import Llama
 from model.whisper_encoder import WhisperEncoder
@@ -13,7 +13,7 @@ from model.whisper_encoder import WhisperEncoder
 @torch.no_grad()
 def greedy_generate(
     encoder:             WhisperEncoder,
-    adapter:             AudioAdapter,
+    adapter:             BridgeAdapter,
     llama:               Llama,
     mel:                 torch.Tensor,
     audio_lengths:       torch.Tensor,

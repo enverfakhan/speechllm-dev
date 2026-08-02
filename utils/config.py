@@ -71,6 +71,7 @@ class ModelConfig:
     gradient_checkpointing: bool        = False
     init_from:              Path | None = None
     audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
+    bridge_type:            str         = "mlp"   # encoder→llama bridge: "mlp" | "swiglu"
     audio_adapter_type:     str         = "mlp"   # "mlp" | "swiglu"
     # swiglu only: first N adapter layers zero their writer (down_proj) instead
     # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
@@ -211,6 +212,7 @@ def _build_model(d: dict) -> ModelConfig:
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
         init_from              = _opt_path(d.get("init_from")),
         audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
+        bridge_type            = str(d.get("bridge_type", "mlp")),
         audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
         audio_adapter_zero_writer_layers = int(d.get("audio_adapter_zero_writer_layers", 0)),
     )
@@ -318,9 +320,11 @@ _VALID_INSTRUCTION_MODES = {"unformatted", "formatted", "both"}
 # "audio_adapters" is a name-selected subset of llama's parameters (the gated
 # per-layer audio adapters), not a separate nn.Module — see stages.Stage.setup.
 _VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
-# Mirrors model.llama.AUDIO_ADAPTER_TYPES; duplicated so config loading stays
-# import-light (utils.config must not pull in torch to validate a YAML file).
+# Mirror model.llama.AUDIO_ADAPTER_TYPES / model.adapter.BRIDGE_TYPES; duplicated
+# so config loading stays import-light (utils.config must not pull in torch to
+# validate a YAML file).
 _VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
+_VALID_BRIDGE_TYPES        = {"mlp", "swiglu"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {"first_token_below", "eval_loss_below", "max_steps", "never"}
 _EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below"}
@@ -347,6 +351,11 @@ def _validate(cfg: Config) -> None:
             raise ValueError("model.llama_ckpt: required when model.stub is false")
     if cfg.model.audio_adapter_r < 0:
         raise ValueError(f"model.audio_adapter_r: must be >= 0, got {cfg.model.audio_adapter_r}")
+    if cfg.model.bridge_type not in _VALID_BRIDGE_TYPES:
+        raise ValueError(
+            f"model.bridge_type: must be one of {sorted(_VALID_BRIDGE_TYPES)}, "
+            f"got {cfg.model.bridge_type!r}"
+        )
     if cfg.model.audio_adapter_type not in _VALID_AUDIO_ADAPTER_TYPES:
         raise ValueError(
             f"model.audio_adapter_type: must be one of "

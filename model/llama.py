@@ -39,7 +39,7 @@ class LlamaConfig:
     max_seq_len:       int   = 131072
     rms_norm_eps:      float = 1e-5
     rope_theta:        float = 500000.0   # Llama 3.1 uses 500k (3.0 used 10k)
-    audio_adapter_r:   int   = 0          # gated audio adapter bottleneck; 0 = disabled
+    audio_adapter_r:   int   = 0          # per-layer audio adapter bottleneck; 0 = disabled
     audio_adapter_type: str  = "mlp"      # "mlp" (down→gelu→up) | "swiglu" (SwiGLU bottleneck)
     # swiglu only: the first N adapter layers zero their writer (down_proj) instead
     # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
@@ -231,33 +231,33 @@ class SwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-# ── Gated audio adapter ─────────────────────────────────────────────────────────
+# ── Audio adapters ─────────────────────────────────────────────────────────────
 
 class AudioLayerAdapter(nn.Module):
-    """Gated parallel bottleneck adapter applied only at audio-token positions.
+    """Parallel bottleneck adapter applied only at audio-token positions.
 
     Adds a small residual branch inside a frozen Llama block that reshapes the
     audio stream while leaving every pretrained parameter untouched (all new
     capacity lives here).  The branch computes
 
-        audio_mask * tanh(gate) * up(gelu(down(norm(x))))
+        audio_mask * up(gelu(down(norm(x))))
 
     The branch is an *exact* no-op at step 0 — inserting the module never
     perturbs the pretrained forward pass — because ``up_proj`` (the projection
-    that writes the residual) is zero-initialised.  The scalar ``gate`` instead
-    starts *open* at 1.0 (``tanh(1) ≈ 0.762``), so it is a learned magnitude the
-    model can shrink or grow rather than a switch it must first turn on; the
-    per-layer ``tanh(gate)`` trace stays the per-depth diagnostic we watch.
-    ``norm`` is a fresh RMSNorm owned here (never the block's pretrained norms),
-    so no pretrained parameter is read or written.
+    that writes the residual) is zero-initialised.  ``norm`` is a fresh RMSNorm
+    owned here (never the block's pretrained norms), so no pretrained parameter
+    is read or written.
 
     Only ``up_proj`` is zeroed: zeroing ``down_proj`` too would make every
     gradient in the branch exactly zero (``d/d down_proj ∝ up_proj.weight`` and
     ``d/d up_proj ∝ gelu(down_proj(·))``), leaving the adapter permanently dead.
+
+    There is no scalar gate: the input projection already scales the branch
+    per-channel, which subsumes a single per-layer multiplier.
     """
 
     def __init__(self, d_model: int, r: int, eps: float) -> None:
-        """Build the bottleneck, its own RMSNorm, and the open scalar gate.
+        """Build the bottleneck and its own RMSNorm.
 
         Args:
             d_model: residual-stream width (matches the block)
@@ -268,8 +268,6 @@ class AudioLayerAdapter(nn.Module):
         self.norm      = RMSNorm(d_model, eps)
         self.down_proj = nn.Linear(d_model, r,       bias=False)   # d_model → r
         self.up_proj   = nn.Linear(r,       d_model, bias=False)   # r → d_model (writes residual)
-        # Scalar gate, initialised open at 1.0 → tanh(1) ≈ 0.762 (see class docstring).
-        self.gate      = nn.Parameter(torch.ones(1))
 
         # up_proj writes into the residual stream and is zero-initialised, which
         # is what makes the whole branch an exact no-op at step 0.  It is the ONLY
@@ -277,8 +275,15 @@ class AudioLayerAdapter(nn.Module):
         # init so gradients can flow on the very first step.
         nn.init.zeros_(self.up_proj.weight)
 
+    def scales(self) -> dict[str, float]:
+        """Per-layer magnitude diagnostic: RMS of the writer and input weights."""
+        return {
+            "writer": float(self.up_proj.weight.detach().pow(2).mean().sqrt().item()),
+            "input":  float(self.down_proj.weight.detach().pow(2).mean().sqrt().item()),
+        }
+
     def forward(self, x: torch.Tensor, audio_mask: torch.Tensor) -> torch.Tensor:
-        """Return the masked, gated adapter branch (residual add stays in the block).
+        """Return the masked adapter branch (residual add stays in the block).
 
         Args:
             x:          (B, S, d_model) — the block's INPUT residual stream (the
@@ -286,22 +291,25 @@ class AudioLayerAdapter(nn.Module):
             audio_mask: (B, S, 1) float — 1.0 at audio positions, else 0.0
 
         Returns:
-            (B, S, d_model) — zero everywhere except audio positions, scaled by
-            tanh(gate); add this to x in the caller.
+            (B, S, d_model) — zero everywhere except audio positions; add this
+            to x in the caller.
         """
         branch = self.up_proj(F.gelu(self.down_proj(self.norm(x))))
-        return audio_mask * torch.tanh(self.gate) * branch
+        return audio_mask * branch
 
 
 class AudioSwiGLUAdapter(nn.Module):
-    """Gated parallel SwiGLU adapter applied only at audio-token positions.
+    """Parallel SwiGLU adapter applied only at audio-token positions.
 
     Same contract as :class:`AudioLayerAdapter` (same forward signature, same
-    ``audio_adapter`` parameter-name prefix, same scalar ``tanh(gate)``); the
-    bottleneck is a SwiGLU instead of a 2-layer MLP, so the branch computes
+    ``audio_adapter`` parameter-name prefix); the bottleneck is a SwiGLU instead
+    of a 2-layer MLP, so the branch computes
 
-        audio_mask * tanh(gate) * down_proj(silu(gate_proj(h)) ⊙ up_proj(h))
+        audio_mask * down_proj(silu(gate_proj(h)) ⊙ up_proj(h))
         h = norm(x)
+
+    ``gate_proj`` is the branch's gate — per-channel and input-dependent, which
+    is why there is no additional scalar gate multiplying the whole layer.
 
     Projection names follow :class:`SwiGLUMLP`, NOT AudioLayerAdapter: here
     ``gate_proj``/``up_proj`` are the two d_model→r input projections and
@@ -338,7 +346,7 @@ class AudioSwiGLUAdapter(nn.Module):
         eps:         float,
         zero_writer: bool = False,
     ) -> None:
-        """Build the SwiGLU bottleneck, its own RMSNorm, and the open scalar gate.
+        """Build the SwiGLU bottleneck and its own RMSNorm.
 
         Args:
             d_model:     residual-stream width (matches the block)
@@ -353,8 +361,6 @@ class AudioSwiGLUAdapter(nn.Module):
         self.gate_proj = nn.Linear(d_model, r,       bias=False)   # d_model → r (SwiGLU gate)
         self.up_proj   = nn.Linear(d_model, r,       bias=False)   # d_model → r (SwiGLU value)
         self.down_proj = nn.Linear(r,       d_model, bias=False)   # r → d_model (writes residual)
-        # Scalar gate, initialised open at 1.0 → tanh(1) ≈ 0.762.
-        self.gate      = nn.Parameter(torch.ones(1))
         self.zero_writer = zero_writer
 
         if zero_writer:
@@ -368,20 +374,27 @@ class AudioSwiGLUAdapter(nn.Module):
             # here because silu'(0) = 0.5 (see class docstring).
             nn.init.zeros_(self.gate_proj.weight)
 
+    def scales(self) -> dict[str, float]:
+        """Per-layer magnitude diagnostic: RMS of the writer and gate weights."""
+        return {
+            "writer": float(self.down_proj.weight.detach().pow(2).mean().sqrt().item()),
+            "input":  float(self.gate_proj.weight.detach().pow(2).mean().sqrt().item()),
+        }
+
     def forward(self, x: torch.Tensor, audio_mask: torch.Tensor) -> torch.Tensor:
-        """Return the masked, gated adapter branch (residual add stays in the block).
+        """Return the masked adapter branch (residual add stays in the block).
 
         Args:
             x:          (B, S, d_model) — the block's INPUT residual stream
             audio_mask: (B, S, 1) float — 1.0 at audio positions, else 0.0
 
         Returns:
-            (B, S, d_model) — zero everywhere except audio positions, scaled by
-            tanh(gate); add this to x in the caller.
+            (B, S, d_model) — zero everywhere except audio positions; add this
+            to x in the caller.
         """
         h      = self.norm(x)
         branch = self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h))
-        return audio_mask * torch.tanh(self.gate) * branch
+        return audio_mask * branch
 
 
 # Adapter variants selectable via cfg.model.audio_adapter_type (validated there too).
@@ -425,8 +438,8 @@ class LlamaBlock(nn.Module):
 
     When ``has_audio_adapter`` and ``config.audio_adapter_r > 0``, the block also
     owns an audio adapter (:class:`AudioLayerAdapter` or
-    :class:`AudioSwiGLUAdapter`, per ``config.audio_adapter_type``) whose gated
-    branch is added at audio-token positions only.  The adapter is the sole
+    :class:`AudioSwiGLUAdapter`, per ``config.audio_adapter_type``) whose branch
+    is added at audio-token positions only.  The adapter is the sole
     new-parameter path; every other submodule here is a pretrained Llama
     parameter and is never modified.
     """
@@ -474,7 +487,7 @@ class LlamaBlock(nn.Module):
         sin:        torch.Tensor,
         audio_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply attention, MLP, and (optionally) the gated audio adapter.
+        """Apply attention, MLP, and (optionally) the audio adapter branch.
 
         Args:
             x:          (B, S, d_model)
@@ -492,8 +505,9 @@ class LlamaBlock(nn.Module):
             x_hat = self.audio_adapter(x, audio_mask)
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         x = x + self.mlp(self.post_attention_layernorm(x))
-        # Zero-init up_proj makes this an exact no-op at step 0; still skip the
-        # compute when there is no adapter or no mask (frozen text path untouched).
+        # The adapter's zero-initialised projection makes this an exact no-op at
+        # step 0; still skip the compute when there is no adapter or no mask
+        # (keeps the frozen text path untouched).
         if self.audio_adapter is not None and audio_mask is not None:
             x = x + x_hat
         return x
@@ -577,7 +591,7 @@ class Llama(nn.Module):
             audio_lengths: (B,) — per-sample audio-token count; audio occupies
                            positions [0, audio_lengths[i]).  When provided (and the
                            model has audio adapters) it builds the audio mask so the
-                           gated adapters fire only at audio positions.  When None,
+                           adapters fire only at audio positions.  When None,
                            the adapters stay inactive — text-only and stub self-test
                            paths behave exactly as before.
 
@@ -631,7 +645,7 @@ class Llama(nn.Module):
         self.gradient_checkpointing = True
 
     def audio_adapter_parameters(self) -> list[nn.Parameter]:
-        """Return every parameter belonging to the gated audio adapters.
+        """Return every parameter belonging to the audio adapters.
 
         Selected by the substring 'audio_adapter' in the parameter name — the
         same predicate stage setup and checkpoint tolerance use, so the three
@@ -639,16 +653,26 @@ class Llama(nn.Module):
         """
         return [p for name, p in self.named_parameters() if "audio_adapter" in name]
 
-    def audio_gate_values(self) -> dict[str, float]:
-        """Return per-layer effective gate values tanh(gate) for W&B logging.
+    def audio_adapter_scales(self) -> dict[str, float]:
+        """Return per-layer adapter weight magnitudes for W&B logging.
 
-        This is the key diagnostic for the gated-adapter experiment: which
-        depths open their gates, and how fast.  Keys are 'gates/layer_XX'.
+        Replaces the old tanh(gate) trace (the scalar gate is gone) as the
+        which-depths-engage diagnostic.  Two scalars per layer, keys
+        'adapter_scale/layer_XX_writer' and '…_input':
+
+          writer  RMS of the projection that writes the residual
+          input   RMS of the projection that is zeroed at init in the OTHER
+                  scheme (gelu-MLP: down_proj; SwiGLU: gate_proj)
+
+        Whichever tensor a layer zero-initialised starts this trace at exactly
+        0, so its rise is the "this depth is engaging" signal; the other starts
+        at its init scale and moving there means the branch is being reshaped.
         """
         return {
-            f"gates/layer_{i:02d}": float(torch.tanh(layer.audio_adapter.gate).item())
+            f"adapter_scale/layer_{i:02d}_{key}": value
             for i, layer in enumerate(self.layers)
             if layer.audio_adapter is not None
+            for key, value in layer.audio_adapter.scales().items()
         }
 
     def load_meta_weights(
@@ -816,7 +840,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(0)
 
-    # Tiny CPU-only config; audio_adapter_r > 0 constructs the gated adapters.
+    # Tiny CPU-only config; audio_adapter_r > 0 constructs the audio adapters.
     _COMMON = dict(
         n_layers=3, d_model=64, n_heads=4, n_kv_heads=2,
         intermediate_size=128, vocab_size=100,
@@ -879,12 +903,12 @@ if __name__ == "__main__":
     for i in range(B):
         n = int(audio_lengths[i].item())
         assert not torch.allclose(out[i, :n], ref[i, :n]), (
-            f"sample {i}: audio positions [0,{n}) should change when gate opens"
+            f"sample {i}: audio positions [0,{n}) should change when the branch is live"
         )
         assert torch.allclose(out[i, n:], ref[i, n:], atol=1e-6), (
             f"sample {i}: non-audio positions [{n},{S}) must be untouched"
         )
-    print("[OK] mask correctness: only audio positions change when a gate opens")
+    print("[OK] mask correctness: only audio positions change when the branch is live")
 
     # ── Test: gradient-checkpointing path, adapter-only training regime ─────────
     # Mirrors the real stage: pretrained params frozen, inputs_embeds require no
@@ -897,8 +921,8 @@ if __name__ == "__main__":
         p.requires_grad_("audio_adapter" in name)
     for layer in gc_model.layers:
         if layer.audio_adapter is not None:
-            # Lift up_proj off its zero init so down_proj, norm and gate — whose
-            # grads are all proportional to it — see signal on this first step.
+            # Lift up_proj off its zero init so down_proj and norm — whose grads
+            # are both proportional to it — see signal on this first step.
             layer.audio_adapter.up_proj.weight.data.normal_(mean=0.0, std=0.05)
 
     gc_inputs = torch.randn(B, S, D)                        # requires_grad=False (frozen upstream)
@@ -911,7 +935,7 @@ if __name__ == "__main__":
     assert aa_params, "expected non-empty audio adapter parameter list"
     assert all(p.grad is not None for p in aa_params), "every audio adapter param needs a grad"
     assert all(p.grad.abs().sum().item() > 0 for p in aa_params), (
-        "every audio adapter param (norm, down, up, gate) must receive a non-zero grad"
+        "every audio adapter param (norm, down_proj, up_proj) must receive a non-zero grad"
     )
     for name, p in gc_model.named_parameters():
         if "audio_adapter" not in name:
@@ -920,13 +944,19 @@ if __name__ == "__main__":
     print("[OK] gradient checkpointing: adapters get grads, frozen llama stays grad-free")
 
     # ── Test: helper methods ───────────────────────────────────────────────────
-    gates = model_on.audio_gate_values()
-    assert set(gates.keys()) == {f"gates/layer_{i:02d}" for i in range(cfg_on.n_layers - 1)}, gates
-    assert all(abs(v - math.tanh(1.0)) < 1e-6 for v in gates.values()), (
-        f"gates should start open at tanh(1)={math.tanh(1.0):.4f}: {gates}"
-    )
-    assert model_off.audio_gate_values() == {}, "r=0 model exposes no gates"
-    print("[OK] audio_gate_values / audio_adapter_parameters helpers")
+    # No scalar gate exists any more — the branch is scaled by its projections.
+    assert not any("gate" in n and "gate_proj" not in n
+                   for n, _ in model_on.named_parameters()), "scalar gate must be gone"
+    scales = model_on.audio_adapter_scales()
+    assert set(scales) == {
+        f"adapter_scale/layer_{i:02d}_{k}"
+        for i in range(cfg_on.n_layers - 1) for k in ("writer", "input")
+    }, scales
+    # The mlp variant zeroes its writer (up_proj), so that trace starts at 0.
+    assert all(v == 0.0 for k, v in scales.items() if k.endswith("_writer")), scales
+    assert all(v  > 0.0 for k, v in scales.items() if k.endswith("_input")),  scales
+    assert model_off.audio_adapter_scales() == {}, "r=0 model exposes no adapter scales"
+    print("[OK] audio_adapter_scales / audio_adapter_parameters helpers")
 
     # ── Test: SwiGLU variant — construction and init ───────────────────────────
     cfg_swiglu = LlamaConfig(**_COMMON, audio_adapter_r=16, audio_adapter_type="swiglu")
@@ -942,7 +972,12 @@ if __name__ == "__main__":
     assert 0.5 * want_std < got_std < 2.0 * want_std, (
         f"down_proj std {got_std:.5f} should sit near GPT-2 scale {want_std:.5f}"
     )
-    assert set(sw_model.audio_gate_values()) == set(model_on.audio_gate_values()), "gate logging"
+    # Same logging keys as the mlp variant, but here the ZEROED tensor is the
+    # input projection, so it is the '_input' trace that starts at 0.
+    sw_scales = sw_model.audio_adapter_scales()
+    assert set(sw_scales) == set(model_on.audio_adapter_scales()), "scale logging keys"
+    assert all(v == 0.0 for k, v in sw_scales.items() if k.endswith("_input")),  sw_scales
+    assert all(v  > 0.0 for k, v in sw_scales.items() if k.endswith("_writer")), sw_scales
 
     sw_off   = Llama(cfg_off)
     incompat = sw_off.load_state_dict(sw_model.state_dict(), strict=False)

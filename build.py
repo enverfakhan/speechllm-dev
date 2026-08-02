@@ -9,7 +9,7 @@ import json
 
 import torch
 
-from model.adapter import AudioAdapter
+from model.adapter import build_bridge_adapter, BridgeAdapter
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 from utils.checkpoint import load_weights
@@ -22,7 +22,7 @@ def build_models(
     *,
     train: bool = True,
     apply_init_from: bool = True,
-) -> tuple[WhisperEncoder, AudioAdapter, Llama, list[str]]:
+) -> tuple[WhisperEncoder, BridgeAdapter, Llama, list[str]]:
     """Instantiate and initialise all three model components.
 
     Args:
@@ -68,7 +68,8 @@ def build_models(
         llama_dim = 4096
 
     encoder = WhisperEncoder()
-    adapter = AudioAdapter(
+    adapter = build_bridge_adapter(
+        cfg.model.bridge_type,
         llama_dim=llama_dim,
         pca_init_path=cfg.model.adapter_pca_init,
     )
