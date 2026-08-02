@@ -63,7 +63,7 @@ model:
   bridge_type:        swiglu
   audio_adapter_r:    88
   audio_adapter_type: swiglu
-  audio_adapter_zero_writer_layers: 15
+  audio_adapter_zero_writer_layers: 0
 data:
   shards_file: data/full_training_shards.txt
   diag_shard:  data/full-eval-test-dev-clean-other.tar
