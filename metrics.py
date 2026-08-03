@@ -150,29 +150,43 @@ class _Metric:
 # ── Concrete metrics ──────────────────────────────────────────────────────────
 
 class GradNormMetric(_Metric):
-    """Per-component gradient L2 norms and encoder/llm ratio."""
+    """Per-component gradient L2 norms and encoder/llm ratio.
 
-    name         = ["grad/encoder", "grad/adapter", "grad/llama", "grad/enc_llm_ratio"]
+    llama is split by parameter name into the gated audio adapters
+    ('audio_adapter' substring → grad/audio_ada) and everything else
+    (grad/llama).  Excluding the adapters from grad/llama means a frozen
+    backbone reports grad/llama == 0 even while the adapters train, so the two
+    numbers stay independently meaningful.
+    """
+
+    name         = ["grad/encoder", "grad/adapter", "grad/llama",
+                    "grad/audio_ada", "grad/enc_llm_ratio"]
     input_family = "grads"
     phases       = {"train"}
     emit_period  = 1
 
     def __init__(self) -> None:
-        self._enc: float | None = None
-        self._ada: float | None = None
-        self._llm: float | None = None
+        self._enc:       float | None = None
+        self._ada:       float | None = None
+        self._llm:       float | None = None
+        self._audio_ada: float | None = None
 
     def update(self, *, encoder: nn.Module, adapter: nn.Module, llama: nn.Module) -> None:
-        def _norm(m: nn.Module) -> float:
+        def _norm(params) -> float:
             total = 0.0
-            for p in m.parameters():
+            for p in params:
                 if p.grad is not None:
                     total += p.grad.detach().float().norm().item() ** 2
             return math.sqrt(total)
 
-        self._enc = _norm(encoder)
-        self._ada = _norm(adapter)
-        self._llm = _norm(llama)
+        # Split llama's params by name: gated audio adapters vs pretrained rest.
+        aa_params  = [p for n, p in llama.named_parameters() if "audio_adapter" in n]
+        llm_params = [p for n, p in llama.named_parameters() if "audio_adapter" not in n]
+
+        self._enc       = _norm(encoder.parameters())
+        self._ada       = _norm(adapter.parameters())
+        self._llm       = _norm(llm_params)
+        self._audio_ada = _norm(aa_params)
 
     def compute(self) -> dict[str, float | str]:
         if self._enc is None:
@@ -182,11 +196,12 @@ class GradNormMetric(_Metric):
             "grad/encoder":       self._enc,
             "grad/adapter":       self._ada,
             "grad/llama":         self._llm,
+            "grad/audio_ada":     self._audio_ada,
             "grad/enc_llm_ratio": self._enc / denom,
         }
 
     def reset(self) -> None:
-        self._enc = self._ada = self._llm = None
+        self._enc = self._ada = self._llm = self._audio_ada = None
 
 
 class TokenBudgetMetric(_Metric):
@@ -654,6 +669,7 @@ def _print_summary(step: int, m: dict, label: str, mode: str) -> None:
         ge        = m.get("grad/encoder")
         ga        = m.get("grad/adapter")
         gl        = m.get("grad/llama")
+        gaa       = m.get("grad/audio_ada")
         ratio     = m.get("grad/enc_llm_ratio")
         top5      = m.get("diag/first_token_top5")
         sep_frac  = m.get("collapse/train_sep_fraction")
@@ -668,7 +684,7 @@ def _print_summary(step: int, m: dict, label: str, mode: str) -> None:
         lf_miss   = m.get("loss/eval_first_miss")
         lr_hit    = m.get("loss/eval_rest_hit")
         lr_miss   = m.get("loss/eval_rest_miss")
-        ge = ga = gl = ratio = gen_ent = None
+        ge = ga = gl = gaa = ratio = gen_ent = None
         top5      = m.get("diag_eval/first_token_top5")
         sep_frac  = m.get("collapse/eval_sep_fraction")
         ent       = m.get("entropy/eval")
@@ -693,7 +709,10 @@ def _print_summary(step: int, m: dict, label: str, mode: str) -> None:
         print(f"  rest  hit/miss   hit {hit_s}   miss {miss_s}")
 
     if ge is not None:
-        print(f"  grad norms       enc {ge:.3e}  ada {ga:.3e}  llm {gl:.3e}")
+        line = f"  grad norms       enc {ge:.3e}  ada {ga:.3e}  llm {gl:.3e}"
+        if gaa is not None:
+            line += f"  aud {gaa:.3e}"
+        print(line)
     if ratio is not None:
         flag = "  ⚠ enc >> llm" if ratio > 10 else ""
         print(f"  grad enc/llm     {ratio:.2f}{flag}")
@@ -786,7 +805,8 @@ if __name__ == "__main__":
 
     # ── Run 10 optimizer steps, each with 4 micro-steps ───────────────────────
     EXPECTED_TRAIN_GRAD_KEYS = {
-        "grad/encoder", "grad/adapter", "grad/llama", "grad/enc_llm_ratio",
+        "grad/encoder", "grad/adapter", "grad/llama", "grad/audio_ada",
+        "grad/enc_llm_ratio",
     }
     EXPECTED_TRAIN_LOG_KEYS = EXPECTED_TRAIN_GRAD_KEYS | {
         "diag/transcript_tokens_per_micro",

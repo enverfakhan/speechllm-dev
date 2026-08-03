@@ -15,8 +15,17 @@ def build_adamw8bit(
 
     Centralises the import and call so every optimizer construction site
     (stage-1 and stage-2, including the auto-stage transition) stays DRY.
+
+    Per-group weight decay: a group may carry its own ``"weight_decay"`` key,
+    which overrides the global default for that group only.  This is required by
+    the ``audio_adapters`` group, which must train at wd=0 — global decay on a
+    zero-init scalar gate is a constant force closing the gate, and it also
+    decays the adapter RMSNorm weights away from 1.  Groups without the key fall
+    back to the global ``weight_decay``.
     """
     import bitsandbytes as bnb
+    for group in param_groups:
+        group.setdefault("weight_decay", weight_decay)
     return bnb.optim.AdamW8bit(param_groups, betas=betas, weight_decay=weight_decay)
 
 

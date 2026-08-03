@@ -142,7 +142,8 @@ class EvalPrefixBatch:
         generated = [[] for _ in range(B)]
         for _ in range(max_new_tokens):
             context = pfx.get_batch()          # (B, current_len, d)
-            logits, _ = llama(context, None)   # (B, current_len, vocab)
+            # audio_lengths keeps gated audio adapters firing on the prefix only
+            logits, _ = llama(context, None, audio_lengths=audio_lengths)  # (B, current_len, vocab)
             next_ids = logits[torch.arange(B), pfx.logit_indices, :].argmax(dim=-1)
             for i in range(B):
                 if not finished[i]:

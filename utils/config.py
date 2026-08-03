@@ -70,6 +70,12 @@ class ModelConfig:
     adapter_pca_init:       Path | None = None
     gradient_checkpointing: bool        = False
     init_from:              Path | None = None
+    audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
+    bridge_type:            str         = "mlp"   # encoder→llama bridge: "mlp" | "swiglu"
+    audio_adapter_type:     str         = "mlp"   # "mlp" | "swiglu"
+    # swiglu only: first N adapter layers zero their writer (down_proj) instead
+    # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
+    audio_adapter_zero_writer_layers: int = 0
 
 
 @dataclass(frozen=True)
@@ -205,6 +211,10 @@ def _build_model(d: dict) -> ModelConfig:
         adapter_pca_init       = _opt_path(d.get("adapter_pca_init")),
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
         init_from              = _opt_path(d.get("init_from")),
+        audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
+        bridge_type            = str(d.get("bridge_type", "mlp")),
+        audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
+        audio_adapter_zero_writer_layers = int(d.get("audio_adapter_zero_writer_layers", 0)),
     )
 
 
@@ -307,7 +317,14 @@ def _assemble(d: dict, stages: list[StageConfig], resume: Path | None) -> Config
 # ── Validation ────────────────────────────────────────────────────────────────
 
 _VALID_INSTRUCTION_MODES = {"unformatted", "formatted", "both"}
-_VALID_TRAINABLE         = {"encoder", "adapter", "llama"}
+# "audio_adapters" is a name-selected subset of llama's parameters (the gated
+# per-layer audio adapters), not a separate nn.Module — see stages.Stage.setup.
+_VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
+# Mirror model.llama.AUDIO_ADAPTER_TYPES / model.adapter.BRIDGE_TYPES; duplicated
+# so config loading stays import-light (utils.config must not pull in torch to
+# validate a YAML file).
+_VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
+_VALID_BRIDGE_TYPES        = {"mlp", "swiglu"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {"first_token_below", "eval_loss_below", "max_steps", "never"}
 _EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below"}
@@ -332,6 +349,30 @@ def _validate(cfg: Config) -> None:
             raise ValueError("model.whisper_ckpt: required when model.stub is false")
         if cfg.model.llama_ckpt is None:
             raise ValueError("model.llama_ckpt: required when model.stub is false")
+    if cfg.model.audio_adapter_r < 0:
+        raise ValueError(f"model.audio_adapter_r: must be >= 0, got {cfg.model.audio_adapter_r}")
+    if cfg.model.bridge_type not in _VALID_BRIDGE_TYPES:
+        raise ValueError(
+            f"model.bridge_type: must be one of {sorted(_VALID_BRIDGE_TYPES)}, "
+            f"got {cfg.model.bridge_type!r}"
+        )
+    if cfg.model.audio_adapter_type not in _VALID_AUDIO_ADAPTER_TYPES:
+        raise ValueError(
+            f"model.audio_adapter_type: must be one of "
+            f"{sorted(_VALID_AUDIO_ADAPTER_TYPES)}, got {cfg.model.audio_adapter_type!r}"
+        )
+    if cfg.model.audio_adapter_zero_writer_layers < 0:
+        raise ValueError(
+            f"model.audio_adapter_zero_writer_layers: must be >= 0, "
+            f"got {cfg.model.audio_adapter_zero_writer_layers}"
+        )
+    if cfg.model.audio_adapter_zero_writer_layers > 0 and cfg.model.audio_adapter_type != "swiglu":
+        # The mlp variant already zeroes its writer in every layer, so the split
+        # would be a silent no-op rather than the requested per-depth scheme.
+        raise ValueError(
+            "model.audio_adapter_zero_writer_layers: only applies to "
+            f"audio_adapter_type: swiglu, got {cfg.model.audio_adapter_type!r}"
+        )
 
     # run
     if cfg.run.instruction_mode not in _VALID_INSTRUCTION_MODES:
@@ -493,10 +534,22 @@ def load_config(
     stage_defaults = deep_merge(base_sd, run_sd)
 
     # 4. Build stages: each entry deep-merged onto stage_defaults.
+    #    `lrs` is the exception — it is replaced wholesale (not deep-merged) when
+    #    the stage provides it.  lrs keys are coupled to `trainable`, so a stage
+    #    that trains a different set than the default (e.g. [audio_adapters]) must
+    #    not inherit the default adapter lr, which would leave a key with no
+    #    matching trainable module and fail validation.  (`schedule`/`exit` still
+    #    deep-merge so a stage can override just one of their sub-keys.)
+    def _merge_stage(defaults: dict, s: dict) -> dict:
+        merged_stage = deep_merge(defaults, {k: v for k, v in s.items() if k != "lrs"})
+        if "lrs" in s:
+            merged_stage["lrs"] = s["lrs"]
+        return merged_stage
+
     run_inst_mode = (merged.get("run") or {}).get("instruction_mode", "unformatted")
     raw_stages    = merged.get("stages") or []
     stages        = [
-        _build_stage(deep_merge(stage_defaults, s), run_inst_mode)
+        _build_stage(_merge_stage(stage_defaults, s), run_inst_mode)
         for s in raw_stages
     ]
 

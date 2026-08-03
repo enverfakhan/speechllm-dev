@@ -1,0 +1,97 @@
+# audio_layer_adapters_swiglu_v5.yaml — experiment v5
+# v4 plus a SwiGLU BRIDGE adapter (the encoder→Llama projection), and with the
+# scalar tanh(gate) removed from the per-layer audio adapters everywhere.
+#
+# The v-series:
+#   v1  bottleneck MLP adapters, branch parallel to the MLP sub-block only
+#   v2  bottleneck MLP adapters, branch parallel to the WHOLE transformer layer
+#   v3  SwiGLU adapters (r=88), zero gate_proj + GPT-2-scale writer
+#   v4  v3 + zero-writer init on the first 15 adapter layers
+#   v5  v4 + SwiGLU bridge adapter, no scalar gate anywhere   ← this config
+#
+# ⚠ NO WARM START. v1-v4 all warm-started the bridge from stage-1 step 4680,
+# whose bridge is the 2-layer MLP (768→2048→4096). A SwiGLU bridge has different
+# tensor names and shapes, so that checkpoint cannot be loaded — attempting it
+# fails loudly in load_weights. v5 therefore trains its bridge FROM SCRATCH:
+# its loss opens at the from-scratch level (~10.6, near log(vocab)), not at the
+# stage-1 plateau, and the early curve is NOT comparable to v2/v3/v4.
+#
+# If you want a like-for-like comparison instead, make this a two-stage run:
+#   stages:
+#     - name: bridge_only          # reproduce stage 1 for the new bridge
+#       trainable: [adapter]
+#       lrs: {adapter: 1.0e-4}
+#       batch_size: 64
+#       accum_steps: 2
+#       exit: {strategy: max_steps, min_steps: 4680}
+#     - name: audio_adapters_both  # then the v5 comparison proper
+#       trainable: [adapter, audio_adapters]
+#       lrs: {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+#       batch_size: 64
+#       accum_steps: 2
+#       exit: {strategy: never}
+# …which costs an extra ~4.7k steps but starts the adapter comparison from a
+# converged bridge, exactly as v2-v4 did.
+#
+# Init (no scalar gate in any adapter — gate_proj is the per-channel gate):
+#   bridge          down_proj NEAR-zero (std 0.02/sqrt(6), zero bias), exactly as
+#                   the MLP bridge; gate_proj/up_proj default init
+#   adapters  0-14  zero writer (down_proj = 0), gate_proj/up_proj default init
+#   adapters 15-30  zero gate_proj, writer at GPT-2 scale (std 0.02/sqrt(32))
+# In each adapter exactly ONE tensor is zeroed; zeroing a second would make every
+# gradient in that module identically zero.
+#
+# ⚠ The BRIDGE writer must not be exactly zero, unlike the in-layer adapters.
+# The bridge output is the whole content of the audio positions and Llama is
+# bias-free, so zero embeddings stay zero through all 32 layers; every RMSNorm on
+# that dead stream adds a 1/sqrt(eps) ≈ 316× backward gain and the gradient
+# reaching the bridge hits ~1e7, overflowing fp16 → GradScaler skips every step
+# and the model never leaves the degenerate state. Measured on the stub stack:
+# exact zero → dL/d(audio emb) 1.5e7 (inf in fp16); near-zero → 1e-1 (healthy).
+#
+# W&B: the old gates/layer_XX trace is gone with the scalar gate. Its replacement
+# is adapter_scale/layer_XX_{writer,input} — the RMS of each adapter's writer and
+# gate projections. Whichever one a layer zero-initialised starts at 0, so its
+# rise is the "this depth is engaging" signal.
+#
+# Launch with:
+#   python training.py --config configs/audio_layer_adapters_swiglu_v5.yaml
+
+seed: 47                        # fresh run; decorrelate data order from 42-46
+model:
+  init_from:          null      # see the warm-start note above
+  bridge_type:        swiglu
+  audio_adapter_r:    88
+  audio_adapter_type: swiglu
+  audio_adapter_zero_writer_layers: 0
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: audio-adapters-from-stage1-v5-4680
+checkpoint:
+  dir:        checkpoints/audio-adapters-from-stage1-v5-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        audio_adapters_both
+    trainable:   [adapter, audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: never}

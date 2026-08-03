@@ -180,7 +180,7 @@ def _warmup_optimizer(
                 adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
                 llama.embed_tokens, sep_token_id=_VOCAB_SIZE - 1,
             )
-            _, loss = llama(inputs, labels)
+            _, loss = llama(inputs, labels, audio_lengths=a_lens)
 
         loss.backward()
         optimizer.step()
@@ -228,7 +228,7 @@ def _try_batch(
                     adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
                     llama.embed_tokens, sep_token_id=_VOCAB_SIZE - 1,
                 )
-                _, loss = llama(inputs, labels)
+                _, loss = llama(inputs, labels, audio_lengths=a_lens)
 
             (loss / accum_steps).backward()
 
@@ -274,7 +274,7 @@ def _try_batch_eval(
                 adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
                 llama.embed_tokens, sep_token_id=_VOCAB_SIZE - 1,
             )
-            _, loss = llama(inputs, labels)
+            _, loss = llama(inputs, labels, audio_lengths=a_lens)
 
         peak = torch.cuda.max_memory_allocated(device) / 1e9
         return True, peak

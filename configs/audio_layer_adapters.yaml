@@ -1,0 +1,52 @@
+# audio_adapters_from_stage1_4680.yaml
+# Gated parallel audio-layer adapters ONLY — bridge adapter, encoder, and
+# Llama all frozen. Warm-starts from the SAME stage-1 adapter-only checkpoint
+# (step 4680) as encoder_adapter_from_stage1_4680.yaml, so the two runs are a
+# head-to-head comparison of where to spend new capacity:
+#   encoder + bridge fine-tune   vs   fresh per-layer audio adapters.
+# init_from (NOT --resume): fresh optimizer, step counter from 0.
+#
+# The init_from checkpoint predates audio adapters — expect the load message
+# "[load] N audio-adapter tensors not found in checkpoint — keeping fresh init".
+# That is correct: up_proj starts at zero (the scalar gate starts OPEN at 1.0),
+# so step 0 is exactly the frozen stage-1 model, and loss should open at the
+# stage-1 plateau, not above it.
+#
+# Launch with:
+#   python training.py --config configs/audio_adapters_from_stage1_4680.yaml
+
+seed: 44                        # fresh run; decorrelate data order from 42/43
+model:
+  init_from: checkpoints/stage1-both-format/step_0004680.pt
+  audio_adapter_r: 128
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: audio-adapters-from-stage1-v2-4680
+checkpoint:
+  dir:        checkpoints/audio-adapters-from-stage1-v2-4680
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        20000
+  instruction_mode: both
+stages:
+  - name:        audio_adapters_both
+    trainable:   [adapter, audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: never}

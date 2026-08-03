@@ -171,7 +171,13 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # ── Build base model (pretrained weights, no checkpoint overlay yet) ──────
-    encoder, adapter, llama = build_models(cfg, device, train=False, apply_init_from=False)
+    # apply_init_from=False is correct under the delta invariant: every swept
+    # checkpoint is a COMPLETE delta over the pretrained base, so the base model
+    # must be pretrained-only and each checkpoint overlays its own delta below
+    # (load_weights per checkpoint).  Applying cfg.model.init_from here would
+    # leave stale warm-start weights bleeding across checkpoints.  The 4th return
+    # (init_from-loaded names) is empty here and unused.
+    encoder, adapter, llama, _ = build_models(cfg, device, train=False, apply_init_from=False)
 
     # ── Resolve evaluation parameters ─────────────────────────────────────────
     if args.full:

@@ -16,7 +16,7 @@ from utils.generate import greedy_generate
 
 if TYPE_CHECKING:
     from data import PrunedTokenizer
-    from model.adapter import AudioAdapter
+    from model.adapter import BridgeAdapter
     from model.llama import Llama
     from model.whisper_encoder import WhisperEncoder
 
@@ -33,7 +33,7 @@ def compute_wer(refs: list[str], hyps: list[str]) -> float:
 
 def evaluate_all_splits(
     encoder:      "WhisperEncoder",
-    adapter:      "AudioAdapter",
+    adapter:      "BridgeAdapter",
     llama:        "Llama",
     eval_loaders: dict[str, Any],
     tokenizer:    "PrunedTokenizer",
