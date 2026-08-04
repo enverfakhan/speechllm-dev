@@ -18,6 +18,10 @@ Usage:
     # touching the GPU:
     python tools/run_wer_sweep.py --config ... --experiments ... --dry-run
 
+    # Resume an interrupted sweep — each experiment's wer.csv is written as soon
+    # as it finishes, and --skip-existing reuses the ones already on disk:
+    python tools/run_wer_sweep.py --config ... --experiments ... --skip-existing
+
 Layout it expects — one directory per experiment, one .pt inside each:
 
     checkpoints_aux/
@@ -201,6 +205,28 @@ def discover_experiments(root: Path, manifest_path: Path | None) -> list[Experim
 
 # ── Architecture probing ──────────────────────────────────────────────────────
 
+def load_checkpoint(path: Path) -> dict:
+    """torch.load a checkpoint, memory-mapping its tensors when the format allows.
+
+    Checkpoints in this grid range from a ~40 MB bridge delta to a full-model
+    save from before the delta-checkpoint convention (~32 GB).  mmap keeps the
+    big one off the heap: tensors stay backed by the file and are paged in only
+    as they are read, which makes the probe pass — which touches nothing but key
+    names and shapes — effectively free, and lets a full-llama overlay stream
+    into the model instead of materialising twice.
+
+    Nothing here writes to a loaded tensor in place (fold_legacy_gate builds new
+    ones), so read-only mapped storage is safe.  Files written with the legacy
+    non-zipfile format cannot be mapped; those fall back to an ordinary load.
+    """
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except RuntimeError as exc:
+        if "mmap" not in str(exc).lower():
+            raise                     # a genuine load failure (e.g. truncated file)
+        return torch.load(path, map_location="cpu")
+
+
 def _audio_adapter_tensors(ckpt: dict) -> dict[str, torch.Tensor]:
     """Return the checkpoint's audio-adapter tensors, from wherever they live.
 
@@ -374,6 +400,23 @@ def _size_mb(path: Path) -> str:
         return f"{path.stat().st_size / 1e6:.1f} MB"
     except OSError:
         return "size unknown"
+
+
+def _read_exp_csv(path: Path) -> list[dict]:
+    """Read a per-experiment wer.csv back, restoring the numeric column types.
+
+    csv.DictReader yields strings; the summary table formats `wer` as a
+    percentage and prints `step` as an integer, so both are converted here
+    rather than leaving a reused row subtly different from a fresh one.
+    """
+    with path.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"{path} has no rows — delete it and re-run this experiment")
+    for row in rows:
+        row["wer"]  = float(row["wer"])
+        row["step"] = int(row["step"])
+    return rows
 
 
 def parse_step(stem: str, fallback: int = 0) -> int:
@@ -663,6 +706,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "--no-fold-legacy-gate makes such a checkpoint a hard error instead.",
     )
     parser.add_argument(
+        "--skip-existing", action="store_true", dest="skip_existing",
+        help="Reuse any experiment that already has a wer.csv in its directory "
+             "instead of re-evaluating it. Lets an interrupted sweep be resumed — "
+             "each experiment's CSV is written as soon as it finishes.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Probe every checkpoint, print the plan and rebuild order, then exit "
              "without building a model or touching the GPU.",
@@ -709,7 +758,7 @@ def main(argv: list[str] | None = None) -> None:
         # Probe every checkpoint even after one fails, so a batch of truncated
         # transfers is reported in a single pass instead of one re-run each.
         try:
-            ckpt = torch.load(exp.ckpt, map_location="cpu")
+            ckpt = load_checkpoint(exp.ckpt)
         except Exception as exc:                     # noqa: BLE001 — reported verbatim below
             unreadable.append((exp, f"{type(exc).__name__}: {exc}"))
             print(f"  {exp.id:<4} {exp.name:<26} UNREADABLE ({_size_mb(exp.ckpt)})")
@@ -816,6 +865,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\n{'=' * 78}\n[{n}/{len(order)}] {exp.id}  {exp.name}  "
               f"(step {step})\n  {arch.describe()}\n{'=' * 78}")
 
+        existing_csv = exp.directory / "wer.csv"
+        if args.skip_existing and existing_csv.exists():
+            # Skipping touches no module, so the live model stays whatever the
+            # previous experiment left it — built_arch / rebuild_needed still hold.
+            rows_by_exp[exp.id] = _read_exp_csv(existing_csv)
+            print(f"--skip-existing: reusing {existing_csv}")
+            continue
+
         if built_arch != arch or rebuild_needed:
             if encoder is not None:
                 del encoder, adapter, llama, pristine
@@ -832,7 +889,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             restore_pristine(pristine, encoder=encoder, adapter=adapter, llama=llama)
 
-        ckpt = torch.load(exp.ckpt, map_location="cpu")
+        ckpt = load_checkpoint(exp.ckpt)
         if legacy_of[exp.id]:
             n_folded = fold_legacy_gate(ckpt, arch.audio_adapter_type)
             print(f"[convert] folded tanh(gate) into the writer of {n_folded} audio "
