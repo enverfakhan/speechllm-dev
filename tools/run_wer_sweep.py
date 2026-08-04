@@ -368,6 +368,14 @@ def restore_pristine(pristine: dict, *, encoder, adapter, llama) -> None:
 
 # ── Misc helpers ──────────────────────────────────────────────────────────────
 
+def _size_mb(path: Path) -> str:
+    """Human-readable file size, for diagnosing truncated checkpoint transfers."""
+    try:
+        return f"{path.stat().st_size / 1e6:.1f} MB"
+    except OSError:
+        return "size unknown"
+
+
 def parse_step(stem: str, fallback: int = 0) -> int:
     """Extract the optimizer step from a filename stem ('step0002880', 'step_0004680')."""
     m = re.search(r"step[_-]?(\d+)", stem, re.IGNORECASE)
@@ -696,8 +704,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Probing {len(experiments)} experiment checkpoint(s) …")
     arch_of:   dict[str, Arch] = {}
     legacy_of: dict[str, int]  = {}
+    unreadable: list[tuple[Experiment, str]] = []
     for exp in experiments:
-        ckpt = torch.load(exp.ckpt, map_location="cpu")
+        # Probe every checkpoint even after one fails, so a batch of truncated
+        # transfers is reported in a single pass instead of one re-run each.
+        try:
+            ckpt = torch.load(exp.ckpt, map_location="cpu")
+        except Exception as exc:                     # noqa: BLE001 — reported verbatim below
+            unreadable.append((exp, f"{type(exc).__name__}: {exc}"))
+            print(f"  {exp.id:<4} {exp.name:<26} UNREADABLE ({_size_mb(exp.ckpt)})")
+            continue
         arch = probe_arch(ckpt, exp.ckpt)
         gates = legacy_gate_keys(ckpt)
         arch_of[exp.id]   = arch
@@ -706,6 +722,20 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  {exp.id:<4} {exp.name:<26} step {parse_step(exp.ckpt.stem):>6}  "
               f"{arch.describe()}{note}")
         del ckpt
+
+    if unreadable:
+        detail = "\n".join(
+            f"    {exp.ckpt}  ({_size_mb(exp.ckpt)})\n      {err}"
+            for exp, err in unreadable
+        )
+        raise SystemExit(
+            f"[error] {len(unreadable)} of {len(experiments)} checkpoints could not be "
+            f"read:\n{detail}\n"
+            "  A torch .pt file is a zip archive; 'failed finding central directory' "
+            "means it is truncated — almost always an interrupted or still-running "
+            "copy from GCS. Re-fetch those files (gsutil cp / gcloud storage cp) and "
+            "compare sizes against the source before re-running."
+        )
 
     stale_gates = [e for e in experiments if legacy_of[e.id]]
     if stale_gates and not args.fold_legacy_gate:
