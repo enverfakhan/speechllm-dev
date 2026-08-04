@@ -1,0 +1,69 @@
+# wer_sweep_experiments.yaml — the E0…E6 comparison grid for tools/run_wer_sweep.py
+#
+# Defines WHICH experiment directories take part in the sweep, in WHAT order the
+# comparison table lists them, and the descriptive columns that go into the CSV.
+# It deliberately does NOT declare model architecture: run_wer_sweep.py probes
+# bridge type, audio-adapter type and rank from each checkpoint's own tensors, so
+# a stale entry here can never cause an experiment to be scored against the wrong
+# model.
+#
+# Directories are relative to --experiments. 'checkpoint:' is optional — omit it
+# and the single .pt in the directory is used (two .pt files is an error).
+# 'formats:' is optional and restricts that experiment to one instruction
+# variant; leave it out to evaluate both.
+#
+# Convention: {data}-{trainable}({warmstart}); scratch implied by absence of
+# parentheses. audad = per-layer audio adapters, bridge = the encoder→Llama
+# bridge adapter.
+#
+# Run with:
+#   python tools/run_wer_sweep.py \
+#       --config      configs/both_formats_scratch.yaml \
+#       --experiments checkpoints_aux \
+#       --manifest    configs/wer_sweep_experiments.yaml \
+#       --full
+
+experiments:
+  - id:        E0
+    dir:       unfmt-bridge-base
+    trainable: bridge
+    init:      scratch
+    data:      unformatted
+    # Trained on unformatted labels only. Both formats are still evaluated: the
+    # formatted column is the instruction-following floor the others improve on.
+
+  - id:        E1
+    dir:       bothfmt-bridge-ft(E0)
+    trainable: bridge
+    init:      warm from E0
+    data:      both
+
+  - id:        E2
+    dir:       bothfmt-bridge
+    trainable: bridge
+    init:      scratch
+    data:      both
+
+  - id:        E3
+    dir:       bothfmt-enc+bridge(E2)
+    trainable: encoder+bridge
+    init:      warm from E2
+    data:      both
+
+  - id:        E4
+    dir:       bothfmt-audad(E2)
+    trainable: audio adapters
+    init:      warm from E2
+    data:      both
+
+  - id:        E5
+    dir:       bothfmt-audad+bridge(E2)
+    trainable: audio adapters+bridge
+    init:      warm from E2
+    data:      both
+
+  - id:        E6
+    dir:       bothfmt-audad+bridge
+    trainable: audio adapters+bridge
+    init:      scratch
+    data:      both
