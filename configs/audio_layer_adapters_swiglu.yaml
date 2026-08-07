@@ -40,16 +40,16 @@ data:
   diag_shard:  data/full-eval-test-dev-clean-other.tar
   num_workers: 32
   eval:
-    dev_clean:  data/eval_subset/dev-clean-480.tar
-    dev_other:  data/eval_subset/dev-other-480.tar
-    test_clean: data/eval_subset/test-clean-480.tar
-    test_other: data/eval_subset/test-other-480.tar
+    dev_clean:  data/eval_subset_shards/dev-clean-480.tar
+    dev_other:  data/eval_subset_shards/dev-other-480.tar
+    test_clean: data/eval_subset_shards/test-clean-480.tar
+    test_other: data/eval_subset_shards/test-other-480.tar
 logging:
   wandb:    true
   project:  speechllm-auto-stage
-  run_name: audio-adapters-from-stage1-v3-4680
+  run_name: audio-adapters-from-stage1-v3-audad-only-4680
 checkpoint:
-  dir:        checkpoints/audio-adapters-from-stage1-v3-4680
+  dir:        checkpoints/audio-adapters-from-stage1-v3-audad-only-4680
   save_every: 360
 metrics:
   train_periods: {grads: 1, logits: 90, loss: 1}
@@ -57,12 +57,12 @@ metrics:
   eval_batches:    10
   eval_batch_size: 64
 run:
-  max_steps:        20000
+  max_steps:        2000
   instruction_mode: both
 stages:
-  - name:        audio_adapters_both
-    trainable:   [adapter, audio_adapters]
-    lrs:         {audio_adapters: 1.0e-4, adapter: 1.0e-4}
+  - name:        audio_adapters
+    trainable:   [audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4}
     batch_size:  64
     accum_steps: 2
     exit:        {strategy: never}

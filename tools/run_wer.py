@@ -257,7 +257,7 @@ def main(argv: list[str] | None = None) -> None:
                 tokenizer, sep_token_id, device,
                 max_batches       = max_batches,
                 n_samples         = n_samples,
-                sample_seed       = step,
+                sample_seed       = 2880,
                 formats           = args.formats,
                 progress_interval = progress_interval,
             )
