@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # ── Architecture constants (Whisper small) ────────────────────────────────────
 N_MELS      = 80
@@ -241,6 +242,8 @@ class WhisperEncoder(nn.Module):
         )
         self.ln_post = nn.LayerNorm(N_STATE)
 
+        self.gradient_checkpointing = False
+
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         """Encode a batch of log-mel spectrograms.
 
@@ -260,10 +263,32 @@ class WhisperEncoder(nn.Module):
         pos = torch.arange(T, device=x.device)
         x = x + self.pos_embedding(pos)  # broadcast over batch
 
+        # Only the transformer blocks are wrapped — the conv stem, positional
+        # embedding and ln_post hold negligible activation memory, the same rule
+        # Llama applies to its embedding/norm/lm_head.
+        #
+        # Freezing is all-or-nothing per module (stages.py sets requires_grad
+        # uniformly across the encoder), so checking one parameter is valid.
+        # When the encoder is frozen no autograd graph is built at all — the
+        # input spectrogram does not require grad either — so this path is
+        # intentionally a no-op in encoder-frozen stages; the benefit is
+        # encoder-trainable stages only.
+        use_checkpoint = (
+            self.gradient_checkpointing
+            and self.training
+            and next(self.parameters()).requires_grad
+        )
         for block in self.blocks:
-            x = block(x)
+            if use_checkpoint:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         return self.ln_post(x)  # (B, T_mel//2, N_STATE)
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable activation recomputation during backward to reduce peak VRAM."""
+        self.gradient_checkpointing = True
 
     def load_openai_weights(self, checkpoint_path: Path) -> None:
         """Load weights from an OpenAI Whisper small checkpoint (.pt file).
@@ -346,3 +371,86 @@ class WhisperEncoder(nn.Module):
 
         _load(self.ln_post.weight, "encoder.ln_post.weight")
         _load(self.ln_post.bias,   "encoder.ln_post.bias")
+
+
+# ── Self-test ──────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    # Random weights only — no checkpoint needed, so this runs anywhere on CPU.
+    # A short input keeps the 88M-param encoder cheap: T_mel=40 → 20 tokens.
+    torch.manual_seed(0)
+    enc = WhisperEncoder()
+    mel = torch.randn(2, N_MELS, 40)
+
+    def _grads(model: WhisperEncoder, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """One forward+backward; returns (output, {param name → grad clone})."""
+        model.zero_grad(set_to_none=True)
+        out = model(x)
+        out.square().mean().backward()   # scalar with a dense dependence on every param
+        return out.detach().clone(), {
+            n: p.grad.detach().clone() for n, p in model.named_parameters()
+            if p.grad is not None
+        }
+
+    # ── (a) eval mode: flag must not change the output ────────────────────────
+    enc.eval()
+    with torch.no_grad():
+        enc.gradient_checkpointing = False
+        out_eval_off = enc(mel)
+        enc.enable_gradient_checkpointing()
+        out_eval_on  = enc(mel)
+    assert torch.equal(out_eval_off, out_eval_on), (
+        "eval-mode output must be bit-identical with checkpointing on/off "
+        f"(max diff {(out_eval_off - out_eval_on).abs().max().item():.3e})"
+    )
+    print("[OK] eval mode: identical output with checkpointing on/off")
+
+    # ── (b) train mode, encoder trainable: outputs AND grads must match ───────
+    enc.train()
+    for p in enc.parameters():
+        p.requires_grad_(True)
+
+    enc.gradient_checkpointing = False
+    out_off, grads_off = _grads(enc, mel)
+    enc.enable_gradient_checkpointing()
+    out_on,  grads_on  = _grads(enc, mel)
+
+    assert torch.allclose(out_off, out_on, atol=1e-6), (
+        f"train-mode output differs by {(out_off - out_on).abs().max().item():.3e}"
+    )
+    assert grads_off.keys() == grads_on.keys(), "grad key sets differ"
+    assert grads_off, "expected gradients on a trainable encoder"
+    worst_name, worst_diff = "", 0.0
+    for name in grads_off:
+        diff = (grads_off[name] - grads_on[name]).abs().max().item()
+        if diff > worst_diff:
+            worst_name, worst_diff = name, diff
+        assert torch.allclose(grads_off[name], grads_on[name], atol=1e-6), (
+            f"grad mismatch for {name}: max diff {diff:.3e}"
+        )
+    print(
+        f"[OK] train mode (trainable): identical output and grads "
+        f"(worst grad diff {worst_diff:.2e} at {worst_name or 'n/a'})"
+    )
+
+    # ── (c) train mode, encoder frozen: no-op path, no error ──────────────────
+    for p in enc.parameters():
+        p.requires_grad_(False)
+    with torch.no_grad():
+        enc.gradient_checkpointing = False
+        out_frozen_off = enc(mel)
+        enc.enable_gradient_checkpointing()
+        out_frozen_on  = enc(mel)
+    assert torch.equal(out_frozen_off, out_frozen_on), (
+        "frozen train-mode output must be bit-identical (checkpointing is skipped)"
+    )
+    print("[OK] train mode (frozen): checkpointing skipped, identical output")
+
+    # ── Shape contract: (B, 80, T_mel) → (B, T_mel//2, N_STATE) ───────────────
+    assert out_off.shape == (2, 40 // 2, N_STATE), out_off.shape
+    print(f"[OK] output shape {tuple(out_off.shape)}")
+
+    print("\nPASSED")
+    sys.exit(0)

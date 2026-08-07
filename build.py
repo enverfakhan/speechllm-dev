@@ -112,6 +112,14 @@ def build_models(
             print("[info] gradient checkpointing enabled on Llama")
         # eval mode: gradient checkpointing irrelevant, skip silently
 
+    # No stub exemption here: the encoder is the real 88M Whisper module even in
+    # stub mode.  The flag is self-gating — the encoder's forward skips
+    # recomputation while the module is frozen — so it costs nothing to leave on
+    # in adapter-only stages and pays off the moment the encoder unfreezes.
+    if cfg.model.encoder_gradient_checkpointing and train:
+        encoder.enable_gradient_checkpointing()
+        print("[info] gradient checkpointing enabled on Whisper encoder")
+
     if train:
         encoder.train()
         adapter.train()
