@@ -67,6 +67,10 @@ stage_defaults:
   accum_steps: 1
   instruction_mode: null       # null = inherit run.instruction_mode
   optimizer_init: fresh
+  paired_prompts: false        # true = each audio contributes BOTH prompt variants
+                               # as two sequences sharing one encoder+bridge pass;
+                               # needs resolved instruction_mode "both" and an even
+                               # batch_size (which still counts SEQUENCES)
   # strategy: first_token_below | eval_loss_below | max_steps | epochs | never
   #   first_token_below / eval_loss_below  threshold = loss value (required)
   #   max_steps                            threshold = stage-local step budget

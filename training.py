@@ -288,15 +288,31 @@ def run_stage(
              instruction_ids, instruction_lengths,
              transcript_ids, transcript_lengths) = [t.to(device) for t in batch]
 
-            # audio_lengths[i] = adapter tokens; each = 8 mel frames @ 10 ms
+            # audio_lengths[i] = adapter tokens; each = 8 mel frames @ 10 ms.
+            # Always the UNIQUE-audio tensor: in paired mode the same audio is
+            # heard once by the encoder, so throughput counts it once.
             step_audio_s += audio_lengths.sum().item() * 8 * 0.01
 
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out     = encoder(mel)
                 adapter_out = adapter(enc_out)
+
+                if stage.paired_prompts:
+                    # Paired batch: n audio rows → 2n sequence rows, row 2i
+                    # unformatted and 2i+1 formatted for audio i (data.py's
+                    # interleave).  repeat_interleave is a view-expansion whose
+                    # backward SUMS the gradients of both sequence rows into the
+                    # shared adapter_out row — exactly the intended paired
+                    # objective: encoder and bridge get the combined signal from
+                    # both label variants of the same audio.  No detach, no clone.
+                    adapter_out       = adapter_out.repeat_interleave(2, dim=0)
+                    audio_lengths_seq = audio_lengths.repeat_interleave(2, dim=0)
+                else:
+                    audio_lengths_seq = audio_lengths
+
                 inputs, labels = prepare_input(
                     adapter_out,
-                    audio_lengths,
+                    audio_lengths_seq,
                     instruction_ids,
                     instruction_lengths,
                     transcript_ids,
@@ -304,7 +320,7 @@ def run_stage(
                     llama.embed_tokens,
                     sep_token_id,
                 )
-                logits, loss = llama(inputs, labels, audio_lengths=audio_lengths)
+                logits, loss = llama(inputs, labels, audio_lengths=audio_lengths_seq)
 
             metrics.observe("train", run.global_step, logits=logits, labels=labels)
             scaler.scale(loss / stage.accum_steps).backward()
@@ -569,6 +585,7 @@ def main(argv: list[str] | None = None) -> None:
                 "seed":                    cfg.seed,
                 "n_stages":                len(cfg.stages),
                 "instruction_mode":        cfg.run.instruction_mode,
+                "paired_prompts_any":      any(s.paired_prompts for s in cfg.stages),
                 "stub":                    cfg.model.stub,
                 "gradient_checkpointing":  cfg.model.gradient_checkpointing,
                 "resume":                  str(cfg.resume) if cfg.resume else None,

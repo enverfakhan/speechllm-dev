@@ -18,6 +18,11 @@ Batch format returned by the DataLoader:
 
 Pass this tuple directly to model.adapter.prepare_input().
 
+In PAIRED mode (build_dataloader(..., paired=True)) each audio contributes both
+prompt variants, so mel/audio_lengths keep one row per audio (B = n) while the
+instruction/transcript tensors carry 2n interleaved sequence rows — see the
+build_dataloader docstring for the full contract.
+
 Epoch-level shard shuffling is the caller's responsibility:
 
     all_shards = list_shards("data/shards/train-{000000..000127}.tar")
@@ -150,6 +155,8 @@ def build_dataloader(
     instruction_variants: list[tuple[str, str]],
     shuffle_buffer: int = 1000,
     partial: bool = False,
+    *,
+    paired: bool = False,
 ) -> torch.utils.data.DataLoader:
     """Build a DataLoader over preprocessed WebDataset shards.
 
@@ -163,23 +170,40 @@ def build_dataloader(
         tokenizer_path:       path to pruned tokenizer directory (build_vocab.py output)
         sep_token_id:         SEP token ID in the pruned vocabulary; stored in
                               pruned_config.json and forwarded to prepare_input()
-        batch_size:           samples per batch; incomplete final batches are dropped
+        batch_size:           SEQUENCES per batch; incomplete final batches are dropped
         num_workers:          DataLoader worker processes
         instruction_variants: list of (instruction_text, transcript_key) pairs.
                               Pass one pair to train on a single mode, or two for
                               joint training. transcript_key must be one of
                               "unformatted.txt" or "formatted.txt".
-                              One pair is chosen uniformly at random per sample.
+                              One pair is chosen uniformly at random per sample
+                              (unpaired mode); paired mode uses both.
         shuffle_buffer:       in-flight sample buffer; 2–3× batch_size is sufficient
                               when shards are pre-shuffled on disk
         partial:              if True, include the final incomplete batch (useful for
                               small diagnostic shards where dropping it may leave no
                               batches at all)
+        paired:               if True, every audio sample contributes BOTH prompt
+                              variants (requires exactly two instruction_variants
+                              with distinct transcript keys, and an even batch_size)
 
     Returns:
         DataLoader yielding 6-tuples:
             (mel, audio_lengths, instruction_ids, instruction_lengths,
              transcript_ids, transcript_lengths)
+
+        Unpaired (paired=False) — every tensor has batch dim B = batch_size, one
+        row per audio sample, one instruction variant drawn at random per sample.
+
+        Paired (paired=True) — the batch holds n = batch_size // 2 unique audios
+        and 2n sequences, so the two families of tensors have DIFFERENT batch dims:
+            mel            (n, 80, T_max)   audio_lengths       (n,)
+            instruction_*  (2n, …)          transcript_*        (2n, …)
+        Sequence rows 2i and 2i+1 both belong to audio i, in instruction_variants
+        order (row 2i = variants[0], row 2i+1 = variants[1]).  The caller is
+        responsible for expanding the audio side to 2n rows before sequence
+        assembly (training.py does this with adapter_out.repeat_interleave(2, 0),
+        whose backward sums both rows' gradients back into the shared audio row).
     """
     if isinstance(shard_pattern, str):
         shards = list_shards(shard_pattern)
@@ -188,6 +212,23 @@ def build_dataloader(
 
     if not shards:
         raise FileNotFoundError(f"No shards found for pattern: {shard_pattern!r}")
+
+    if paired:
+        if len(instruction_variants) != 2:
+            raise ValueError(
+                "paired=True requires exactly two instruction_variants (one per "
+                f"prompt mode), got {len(instruction_variants)}"
+            )
+        if instruction_variants[0][1] == instruction_variants[1][1]:
+            raise ValueError(
+                "paired=True requires two DISTINCT transcript keys, got "
+                f"{instruction_variants[0][1]!r} twice"
+            )
+        if batch_size % 2 != 0:
+            raise ValueError(
+                f"paired=True requires an even batch_size (it counts sequences, "
+                f"two per audio), got {batch_size}"
+            )
 
     tokenizer = PrunedTokenizer(tokenizer_path)
 
@@ -235,12 +276,72 @@ def build_dataloader(
 
         return (mel_batch, audio_lengths, instr_ids, instr_lens, trans_ids, trans_lens)
 
-    dataset = (
-        wds.WebDataset(shards, shardshuffle=False, nodesplitter=wds.split_by_node)
-        .map(_process)
-        .shuffle(shuffle_buffer)
-        .batched(batch_size, collation_fn=_collate, partial=partial)
-    )
+    def _process_paired(sample: dict[str, Any]) -> tuple:
+        """Emit BOTH prompt variants for one audio sample.
+
+        Returns (mel, inst_ids_a, trans_ids_a, inst_ids_b, trans_ids_b) where
+        a/b follow instruction_variants order — the transcript key comes from
+        the pair itself, so no key string is hardcoded here.
+        """
+        mel = np.load(io.BytesIO(sample["mel.npy"])).astype(np.float32)  # (80, T)
+
+        out: list[Any] = [mel]
+        for instruction_text, trans_key in instruction_variants:
+            out.append(tokenizer.encode(instruction_text))
+            out.append(tokenizer.encode(sample[trans_key].decode("utf-8")))
+        return tuple(out)
+
+    def _collate_paired(samples: list[tuple]) -> tuple[torch.Tensor, ...]:
+        """Collate paired samples: n audio rows, 2n interleaved sequence rows."""
+        mels, instr_a, trans_a, instr_b, trans_b = zip(*samples)
+        n = len(mels)
+
+        # ── Mel: one row per UNIQUE audio, padded to T_max (multiple of 8) ─────
+        T_list = [m.shape[1] for m in mels]
+        T_max  = math.ceil(max(T_list) / 8) * 8
+        mel_batch = torch.zeros(n, 80, T_max, dtype=torch.float32)
+        for i, m in enumerate(mels):
+            mel_batch[i, :, : m.shape[1]] = torch.from_numpy(m)
+
+        # Same formula as the unpaired path; one entry per unique audio.
+        audio_lengths = torch.tensor(
+            [(T // 2 + 3) // 4 for T in T_list], dtype=torch.long
+        )
+
+        # ── Interleave the two variants: row 2i = variant a, row 2i+1 = b ──────
+        instr_lists = [ids for pair in zip(instr_a, instr_b) for ids in pair]
+        trans_lists = [ids for pair in zip(trans_a, trans_b) for ids in pair]
+
+        def _pad(id_lists: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+            L_max   = max(len(ids) for ids in id_lists)
+            out     = torch.zeros(2 * n, L_max, dtype=torch.long)
+            lengths = torch.zeros(2 * n, dtype=torch.long)
+            for i, ids in enumerate(id_lists):
+                out[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+                lengths[i]         = len(ids)
+            return out, lengths
+
+        instr_ids, instr_lens = _pad(instr_lists)
+        trans_ids, trans_lens = _pad(trans_lists)
+
+        return (mel_batch, audio_lengths, instr_ids, instr_lens, trans_ids, trans_lens)
+
+    dataset = wds.WebDataset(shards, shardshuffle=False, nodesplitter=wds.split_by_node)
+    if paired:
+        # batch_size counts sequences; each audio yields two of them.
+        dataset = (
+            dataset
+            .map(_process_paired)
+            .shuffle(shuffle_buffer)
+            .batched(batch_size // 2, collation_fn=_collate_paired, partial=partial)
+        )
+    else:
+        dataset = (
+            dataset
+            .map(_process)
+            .shuffle(shuffle_buffer)
+            .batched(batch_size, collation_fn=_collate, partial=partial)
+        )
 
     return torch.utils.data.DataLoader(
         dataset,
@@ -432,24 +533,16 @@ if __name__ == "__main__":
         _p.print_help()
         sys.exit(0)
 
-    # ── build_sorted_eval_dataloader self-test ────────────────────────────────
-    with tempfile.TemporaryDirectory() as _tmp:
-        import tarfile as _tf_mod
-        _tmp_dir = Path(_tmp)
-        _shard   = _tmp_dir / "test.tar"
+    import tarfile as _tf_mod
 
-        # Fake tokenizer dir with minimal vocab_map.json + pruned_config.json
-        _tok_dir = _tmp_dir / "tokenizer"
-        _tok_dir.mkdir()
-        # We only need instruction IDs to be non-empty lists — mock PrunedTokenizer.
-        _IDS_UNFMT = [1, 2, 3]
-        _IDS_FMT   = [4, 5, 6, 7]
-        _VARIANTS  = ["unfmt instruction", "fmt instruction"]
+    # Synthetic shard written by both self-tests below: sample {i} carries a
+    # zeroed mel of the requested length plus the transcripts "unfmt {i}" /
+    # "fmt {i}", so a mock tokenizer can encode the sample index into the IDs.
+    _MEL_LENGTHS = [40, 120, 80, 200, 160, 60, 100, 180, 140, 220, 240]
 
-        # Write synthetic shard: 11 samples with varying mel lengths.
-        _MEL_LENGTHS = [40, 120, 80, 200, 160, 60, 100, 180, 140, 220, 240]
-        with _tf_mod.open(_shard, "w") as _tar:
-            for _i, _T in enumerate(_MEL_LENGTHS):
+    def _write_synthetic_shard(path: Path, mel_lengths: list[int]) -> None:
+        with _tf_mod.open(path, "w") as _tar:
+            for _i, _T in enumerate(mel_lengths):
                 _key = f"sample-{_i:04d}"
                 _mel = np.zeros((80, _T), dtype=np.float16)
                 _buf = io.BytesIO()
@@ -463,6 +556,21 @@ if __name__ == "__main__":
                     _info = _tf_mod.TarInfo(name=_name)
                     _info.size = len(_data)
                     _tar.addfile(_info, io.BytesIO(_data))
+
+    # ── build_sorted_eval_dataloader self-test ────────────────────────────────
+    with tempfile.TemporaryDirectory() as _tmp:
+        _tmp_dir = Path(_tmp)
+        _shard   = _tmp_dir / "test.tar"
+
+        # Fake tokenizer dir with minimal vocab_map.json + pruned_config.json
+        _tok_dir = _tmp_dir / "tokenizer"
+        _tok_dir.mkdir()
+        # We only need instruction IDs to be non-empty lists — mock PrunedTokenizer.
+        _IDS_UNFMT = [1, 2, 3]
+        _IDS_FMT   = [4, 5, 6, 7]
+        _VARIANTS  = ["unfmt instruction", "fmt instruction"]
+
+        _write_synthetic_shard(_shard, _MEL_LENGTHS)
 
         # Patch PrunedTokenizer to avoid needing a real tokenizer on disk.
         class _MockTokenizer:
@@ -525,4 +633,121 @@ if __name__ == "__main__":
         finally:
             globals()["PrunedTokenizer"] = _orig_cls
 
-    print("PASSED")
+    print("[OK] build_sorted_eval_dataloader")
+
+    # ── build_dataloader(paired=True) self-test ───────────────────────────────
+    with tempfile.TemporaryDirectory() as _tmp:
+        _tmp_dir = Path(_tmp)
+        _shard   = _tmp_dir / "paired.tar"
+        _tok_dir = _tmp_dir / "tokenizer"
+        _tok_dir.mkdir()
+
+        _write_synthetic_shard(_shard, _MEL_LENGTHS)
+
+        # Instruction pairs in the canonical order: index 0 unformatted, 1 formatted.
+        _PAIRS = [
+            ("unfmt instruction", "unformatted.txt"),
+            ("fmt instruction",   "formatted.txt"),
+        ]
+
+        class _PairedMockTokenizer:
+            """Encodes the sample index into the IDs so pairing is checkable.
+
+            "unfmt instruction" → [1, 2, 3]        "fmt instruction" → [4, 5, 6, 7]
+            "unfmt {i}"         → [10, i]          "fmt {i}"         → [20, i]
+            """
+            def encode(self, text: str) -> list[int]:
+                if text == "unfmt instruction":
+                    return [1, 2, 3]
+                if text == "fmt instruction":
+                    return [4, 5, 6, 7]
+                _kind, _idx = text.split()
+                return [10 if _kind == "unfmt" else 20, int(_idx)]
+
+        _orig_cls = globals()["PrunedTokenizer"]
+        globals()["PrunedTokenizer"] = type(
+            "_PatchedPairedTokenizer", (_PairedMockTokenizer,),
+            {"__init__": lambda self, p: None},
+        )
+
+        try:
+            # batch_size counts SEQUENCES: 4 → 2 audios × 2 prompt variants.
+            _loader = build_dataloader(
+                [str(_shard)],
+                tokenizer_path       = _tok_dir,
+                sep_token_id         = 40147,
+                batch_size           = 4,
+                num_workers          = 0,
+                instruction_variants = _PAIRS,
+                shuffle_buffer       = 4,
+                partial              = False,
+                paired               = True,
+            )
+            _batch = next(iter(_loader))
+            _mel, _al, _ii, _il, _ti, _tl = _batch
+
+            # Audio side keeps one row per unique audio; sequence side is 2n.
+            assert _mel.shape[0] == 2,  f"mel batch dim should be 2, got {_mel.shape[0]}"
+            assert _mel.shape[1] == 80, f"mel dim 1 should be 80, got {_mel.shape[1]}"
+            assert _al.shape == (2,),   f"audio_lengths shape should be (2,), got {_al.shape}"
+            assert _ii.shape[0] == 4,   f"instruction_ids batch dim should be 4, got {_ii.shape[0]}"
+            assert _ti.shape[0] == 4,   f"transcript_ids batch dim should be 4, got {_ti.shape[0]}"
+            assert _il.shape == (4,),   f"instruction_lengths shape, got {_il.shape}"
+            assert _tl.shape == (4,),   f"transcript_lengths shape, got {_tl.shape}"
+
+            # Rows 2i / 2i+1 are the unformatted / formatted variant of audio i.
+            for _i in range(2):
+                _u, _f = _ti[2 * _i].tolist(), _ti[2 * _i + 1].tolist()
+                assert _u[0] == 10, f"row {2*_i} should be the unformatted variant, got {_u}"
+                assert _f[0] == 20, f"row {2*_i+1} should be the formatted variant, got {_f}"
+                assert _u[1] == _f[1], (
+                    f"rows {2*_i}/{2*_i+1} must share one audio: {_u} vs {_f}"
+                )
+            # The two audios in the batch are distinct samples.
+            assert _ti[0, 1].item() != _ti[2, 1].item(), "rows 0/1 and 2/3 must differ"
+
+            # Instructions follow the same interleave (lengths 3 / 4 / 3 / 4).
+            assert _il.tolist() == [3, 4, 3, 4], f"instruction lengths: {_il.tolist()}"
+            assert _ii[0, :3].tolist() == [1, 2, 3],    _ii[0].tolist()
+            assert _ii[1, :4].tolist() == [4, 5, 6, 7], _ii[1].tolist()
+
+            # A single instruction variant cannot be paired.
+            _raised = False
+            try:
+                build_dataloader(
+                    [str(_shard)],
+                    tokenizer_path       = _tok_dir,
+                    sep_token_id         = 40147,
+                    batch_size           = 4,
+                    num_workers          = 0,
+                    instruction_variants = [_PAIRS[0]],
+                    paired               = True,
+                )
+            except ValueError as exc:
+                _raised = True
+                assert "two instruction_variants" in str(exc), str(exc)
+            assert _raised, "paired=True with one instruction variant must raise ValueError"
+
+            # Odd batch_size cannot be split into audio pairs.
+            _raised = False
+            try:
+                build_dataloader(
+                    [str(_shard)],
+                    tokenizer_path       = _tok_dir,
+                    sep_token_id         = 40147,
+                    batch_size           = 5,
+                    num_workers          = 0,
+                    instruction_variants = _PAIRS,
+                    paired               = True,
+                )
+            except ValueError as exc:
+                _raised = True
+                assert "even batch_size" in str(exc), str(exc)
+            assert _raised, "paired=True with an odd batch_size must raise ValueError"
+
+        finally:
+            globals()["PrunedTokenizer"] = _orig_cls
+
+    print("[OK] build_dataloader paired collate")
+
+    print("\nPASSED")

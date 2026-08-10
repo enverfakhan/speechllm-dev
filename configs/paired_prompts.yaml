@@ -1,0 +1,100 @@
+# paired_prompts.yaml — staged_full_stack.yaml with PAIRED-PROMPT batching.
+#
+# Identical programme to configs/staged_full_stack.yaml (four-stage cumulative
+# unfreeze, same LRs, same step budgets, same architecture); the one difference
+# is paired_prompts: true on every stage.
+#
+# What paired_prompts changes:
+#   Each audio sample contributes TWO sequences to the batch — one carrying the
+#   unformatted instruction + unformatted transcript, one the formatted pair —
+#   and both share a SINGLE encoder + bridge forward pass.  The gradient from
+#   both sequences sums back into that shared audio representation, so the
+#   bridge sees the two label variants of the same utterance in the same step
+#   instead of one variant drawn at random (the run.instruction_mode: both
+#   behaviour of staged_full_stack.yaml).
+#
+#   ⚠ batch_size still counts SEQUENCES entering Llama, exactly as before.  A
+#   stage with batch_size: 64 therefore consumes 32 unique audios per batch and
+#   builds 64 sequences from them.  Llama-side VRAM and step cost are unchanged;
+#   the encoder/bridge side halves, and the number of distinct utterances seen
+#   per step halves too.  Do NOT double batch_size to compensate — that would
+#   double the Llama batch, which is where the memory ceiling actually is.
+#
+#   Requirements (validated in stages.Stage.__init__): the stage's resolved
+#   instruction mode must be "both" — here run.instruction_mode: both, and no
+#   stage overrides it, so all four qualify — and batch_size must be even
+#   (64, 64, 64, 36 below all are).
+#
+# Every other note from staged_full_stack.yaml still applies verbatim — in
+# particular (e): stage 4's 36 × 3 is an UNTESTED VRAM placeholder, and paired
+# mode does not make it safer (the Llama batch is unchanged at 36 sequences).
+#
+# Launch with:
+#   python training.py --config configs/paired_prompts.yaml
+
+seed: 48                        # fresh run; decorrelate data order from 42-47
+model:
+  init_from:          null      # scratch — every stage inherits from the previous one
+  bridge_type:        swiglu
+  audio_adapter_r:    88
+  audio_adapter_type: swiglu
+  audio_adapter_zero_writer_layers: 0
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: paired-prompts
+checkpoint:
+  dir:        checkpoints/paired-prompts
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        22000
+  instruction_mode: both        # required for paired_prompts on every stage below
+stages:
+  - name:           bridge_only
+    trainable:      [adapter]
+    lrs:            {adapter: 1.0e-4}
+    batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
+    accum_steps:    2
+    paired_prompts: true
+    exit:           {strategy: max_steps, threshold: 4680}
+
+  - name:           audio_adapters_only
+    trainable:      [audio_adapters]
+    lrs:            {audio_adapters: 1.0e-4}
+    schedule:       {warmup_steps: 250}
+    batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
+    accum_steps:    2
+    paired_prompts: true
+    exit:           {strategy: max_steps, threshold: 4680}
+
+  - name:           bridge_plus_adapters
+    trainable:      [adapter, audio_adapters]
+    lrs:            {adapter: 5.0e-5, audio_adapters: 1.0e-4}
+    schedule:       {warmup_steps: 250}
+    batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
+    accum_steps:    2
+    paired_prompts: true
+    exit:           {strategy: max_steps, threshold: 4680}
+
+  - name:           full_stack
+    trainable:      [encoder, adapter, audio_adapters]
+    lrs:            {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
+    schedule:       {warmup_steps: 1000}
+    batch_size:     36          # PLACEHOLDER — re-verify with tools/find_max_batch.py
+    accum_steps:    3           # (see note (e) in staged_full_stack.yaml)
+    paired_prompts: true        # → 18 audios × 2 prompt variants
+    exit:           {strategy: never}

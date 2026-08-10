@@ -162,6 +162,12 @@ class StageConfig:
     accum_steps:      int             = 1
     instruction_mode: str | None      = None
     optimizer_init:   str             = "fresh"
+    # Every audio sample contributes BOTH prompt variants as two sequences that
+    # share one encoder+bridge forward.  batch_size still counts SEQUENCES, so a
+    # paired batch holds batch_size // 2 unique audios.  Requires the resolved
+    # instruction mode to be "both" and an even batch_size — validated in
+    # stages.Stage.__init__, where the run-level mode is available.
+    paired_prompts:   bool            = False
     exit:             ExitConfig      = field(default_factory=ExitConfig)
 
 
@@ -293,6 +299,7 @@ def _build_stage(d: dict, run_instruction_mode: str) -> StageConfig:
         accum_steps      = int(d.get("accum_steps", 1)),
         instruction_mode = inst_mode,
         optimizer_init   = str(d.get("optimizer_init", "fresh")),
+        paired_prompts   = bool(d.get("paired_prompts", False)),
         exit             = ExitConfig(
             strategy  = str(exit_raw.get("strategy", "max_steps")),
             threshold = exit_raw.get("threshold"),

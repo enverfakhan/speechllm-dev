@@ -163,6 +163,24 @@ class Stage:
         else:  # "both"
             self._instruction_variants = list(pairs)
 
+        # Paired prompts need both variants available and an even sequence budget.
+        # Validated here rather than in utils.config because the resolved mode is
+        # only known once the run-level default and the stage override are joined.
+        if config.paired_prompts:
+            if mode != "both":
+                raise ValueError(
+                    f"stage {config.name!r}: paired_prompts requires the resolved "
+                    f"instruction mode to be 'both' (each audio contributes one "
+                    f"sequence per variant), got {mode!r}. Set the stage's "
+                    f"instruction_mode to 'both' or drop paired_prompts."
+                )
+            if config.batch_size % 2 != 0:
+                raise ValueError(
+                    f"stage {config.name!r}: paired_prompts requires an even "
+                    f"batch_size (it counts SEQUENCES, two per audio), got "
+                    f"{config.batch_size}."
+                )
+
         self._exit_fn = _EXIT_STRATEGIES[config.exit.strategy]
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -186,6 +204,16 @@ class Stage:
     def trainable(self) -> list[str]:
         """Modules trainable in this stage."""
         return list(self._config.trainable)
+
+    @property
+    def paired_prompts(self) -> bool:
+        """Whether each audio contributes both prompt variants as two sequences.
+
+        When True the loader yields batch_size // 2 unique audios and 2 sequence
+        rows per audio; the training loop expands the audio side to match (see
+        data.build_dataloader's paired contract).
+        """
+        return self._config.paired_prompts
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -328,6 +356,10 @@ class Stage:
             DataLoader yielding 6-tuples:
             (mel, audio_lengths, instruction_ids, instruction_lengths,
              transcript_ids, transcript_lengths)
+
+            With paired_prompts the mel/audio_lengths batch dim is
+            batch_size // 2 while the instruction/transcript batch dim is
+            batch_size — see data.build_dataloader for the full contract.
         """
         ctx = self._ctx
         epoch_shards = list(ctx.shards)
@@ -341,6 +373,7 @@ class Stage:
             num_workers=ctx.num_workers,
             instruction_variants=self._instruction_variants,
             shuffle_buffer=ctx.shuffle_buffer,
+            paired=self._config.paired_prompts,
         )
 
     # ── Exit criterion ────────────────────────────────────────────────────────
@@ -628,11 +661,12 @@ if __name__ == "__main__":
 
     def _mock_build_dataloader(
         shards_arg, *, tokenizer_path, sep_token_id, batch_size,
-        num_workers, instruction_variants, shuffle_buffer,
+        num_workers, instruction_variants, shuffle_buffer, paired=False,
     ):
         captured["shards"]                = shards_arg
         captured["batch_size"]            = batch_size
         captured["instruction_variants"]  = instruction_variants
+        captured["paired"]                = paired
         return []  # dummy loader
 
     with mock.patch.object(data, "build_dataloader", side_effect=_mock_build_dataloader):
@@ -657,7 +691,57 @@ if __name__ == "__main__":
         f"  expected: {expected_shards}"
     )
 
+    # Default stage is unpaired.
+    assert captured["paired"] is False, captured["paired"]
+
     print("[OK] make_loader")
+
+    # ── Test: paired_prompts ───────────────────────────────────────────────────
+    # ctx.run_instruction_mode is "unformatted", so the stage override is what
+    # decides the resolved mode here.
+    paired_cfg = replace(
+        s0_cfg, paired_prompts=True, instruction_mode="both", batch_size=4
+    )
+    with mock.patch.object(data, "build_dataloader", side_effect=_mock_build_dataloader):
+        paired_stage = Stage(paired_cfg, ctx)
+        paired_stage.make_loader(epoch=0, stage_idx=0)
+
+    assert paired_stage.paired_prompts is True, "paired_prompts property"
+    assert captured["paired"] is True, "make_loader must forward paired=True"
+    # Both variants reach the loader — one sequence per variant, per audio.
+    assert captured["instruction_variants"] == list(ctx.instruction_pairs), (
+        f"paired stage must use both variants: {captured['instruction_variants']}"
+    )
+    assert captured["batch_size"] == 4, captured["batch_size"]
+
+    # Resolved mode other than "both" is refused.
+    _mode_raised = False
+    try:
+        Stage(replace(paired_cfg, instruction_mode="unformatted"), ctx)
+    except ValueError as exc:
+        _mode_raised = True
+        assert "both" in str(exc), str(exc)
+    assert _mode_raised, "paired_prompts with mode 'unformatted' must raise ValueError"
+
+    # A stage that inherits a non-"both" run mode is refused the same way.
+    _inherit_raised = False
+    try:
+        Stage(replace(paired_cfg, instruction_mode=None), ctx)  # ctx: "unformatted"
+    except ValueError as exc:
+        _inherit_raised = True
+        assert "both" in str(exc), str(exc)
+    assert _inherit_raised, "paired_prompts inheriting a non-'both' run mode must raise"
+
+    # Odd batch_size cannot be split into audio pairs.
+    _odd_raised = False
+    try:
+        Stage(replace(paired_cfg, batch_size=5), ctx)
+    except ValueError as exc:
+        _odd_raised = True
+        assert "even" in str(exc), str(exc)
+    assert _odd_raised, "paired_prompts with an odd batch_size must raise ValueError"
+
+    print("[OK] paired_prompts")
 
     print("\nPASSED")
     sys.exit(0)
