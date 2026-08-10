@@ -72,29 +72,29 @@ stages:
     paired_prompts: true
     exit:           {strategy: max_steps, threshold: 4680}
 
-  - name:           audio_adapters_only
-    trainable:      [audio_adapters]
-    lrs:            {audio_adapters: 1.0e-4}
-    schedule:       {warmup_steps: 250}
-    batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
-    accum_steps:    2
-    paired_prompts: true
-    exit:           {strategy: max_steps, threshold: 4680}
+  # - name:           audio_adapters_only
+  #   trainable:      [audio_adapters]
+  #   lrs:            {audio_adapters: 1.0e-4}
+  #   schedule:       {warmup_steps: 250}
+  #   batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
+  #   accum_steps:    2
+  #   paired_prompts: true
+  #   exit:           {strategy: max_steps, threshold: 4680}
 
-  - name:           bridge_plus_adapters
-    trainable:      [adapter, audio_adapters]
-    lrs:            {adapter: 5.0e-5, audio_adapters: 1.0e-4}
-    schedule:       {warmup_steps: 250}
-    batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
-    accum_steps:    2
-    paired_prompts: true
-    exit:           {strategy: max_steps, threshold: 4680}
+  # - name:           bridge_plus_adapters
+  #   trainable:      [adapter, audio_adapters]
+  #   lrs:            {adapter: 5.0e-5, audio_adapters: 1.0e-4}
+  #   schedule:       {warmup_steps: 250}
+  #   batch_size:     64          # SEQUENCES → 32 audios × 2 prompt variants
+  #   accum_steps:    2
+  #   paired_prompts: true
+  #   exit:           {strategy: max_steps, threshold: 4680}
 
-  - name:           full_stack
-    trainable:      [encoder, adapter, audio_adapters]
-    lrs:            {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
-    schedule:       {warmup_steps: 1000}
-    batch_size:     36          # PLACEHOLDER — re-verify with tools/find_max_batch.py
-    accum_steps:    3           # (see note (e) in staged_full_stack.yaml)
-    paired_prompts: true        # → 18 audios × 2 prompt variants
-    exit:           {strategy: never}
+  # - name:           full_stack
+  #   trainable:      [encoder, adapter, audio_adapters]
+  #   lrs:            {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
+  #   schedule:       {warmup_steps: 1000}
+  #   batch_size:     36          # PLACEHOLDER — re-verify with tools/find_max_batch.py
+  #   accum_steps:    3           # (see note (e) in staged_full_stack.yaml)
+  #   paired_prompts: true        # → 18 audios × 2 prompt variants
+  #   exit:           {strategy: never}
