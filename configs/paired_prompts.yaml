@@ -32,7 +32,7 @@
 # Launch with:
 #   python training.py --config configs/paired_prompts.yaml
 
-seed: 48                        # fresh run; decorrelate data order from 42-47
+seed: 42                        # fresh run; decorrelate data order from 42-47
 model:
   init_from:          null      # scratch — every stage inherits from the previous one
   bridge_type:        swiglu
