@@ -68,7 +68,8 @@ class ModelConfig:
     whisper_ckpt:           Path | None = Path("weights/whisper_small.pt")
     llama_ckpt:             Path | None = Path("weights/Llama3.1-8B/")
     adapter_pca_init:       Path | None = None
-    gradient_checkpointing: bool        = False
+    gradient_checkpointing: bool        = False   # Llama transformer layers
+    encoder_gradient_checkpointing: bool = True   # Whisper encoder blocks
     init_from:              Path | None = None
     audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
     bridge_type:            str         = "mlp"   # encoder→llama bridge: "mlp" | "swiglu"
@@ -210,6 +211,7 @@ def _build_model(d: dict) -> ModelConfig:
         llama_ckpt             = _opt_path(d.get("llama_ckpt")),
         adapter_pca_init       = _opt_path(d.get("adapter_pca_init")),
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
+        encoder_gradient_checkpointing = bool(d.get("encoder_gradient_checkpointing", True)),
         init_from              = _opt_path(d.get("init_from")),
         audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
         bridge_type            = str(d.get("bridge_type", "mlp")),
@@ -326,8 +328,10 @@ _VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
 _VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
 _VALID_BRIDGE_TYPES        = {"mlp", "swiglu"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
-_VALID_EXIT_STRATEGIES   = {"first_token_below", "eval_loss_below", "max_steps", "never"}
-_EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below"}
+_VALID_EXIT_STRATEGIES   = {
+    "first_token_below", "eval_loss_below", "max_steps", "epochs", "never",
+}
+_EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below", "epochs"}
 _VALID_METRIC_FAMILIES   = {"grads", "logits", "loss"}
 
 
@@ -472,6 +476,15 @@ def _validate(cfg: Config) -> None:
             raise ValueError(
                 f"{pfx}.exit.threshold: required when strategy is {stage.exit.strategy!r}"
             )
+        if stage.exit.strategy == "epochs" and stage.exit.threshold is not None:
+            # A count of completed passes over the shard list — fractional or
+            # zero epochs are meaningless, and 0 would end the stage instantly.
+            thr = stage.exit.threshold
+            if int(thr) != thr or int(thr) < 1:
+                raise ValueError(
+                    f"{pfx}.exit.threshold: strategy 'epochs' requires an integer "
+                    f"number of epochs >= 1, got {thr!r}"
+                )
         if stage.exit.min_steps < 0:
             raise ValueError(f"{pfx}.exit.min_steps: must be >= 0, got {stage.exit.min_steps}")
         if (stage.instruction_mode is not None
@@ -682,6 +695,20 @@ if __name__ == "__main__":
     bad_s3    = replace(cfg.stages[0], exit=bad_exit3)
     _assert_raises(replace(cfg, stages=[bad_s3]), "threshold")
     print("[OK] first_token_below with no threshold")
+
+    # epochs: threshold must be present, integer-valued and >= 1.
+    def _epochs_stage(threshold: float | None) -> StageConfig:
+        return replace(
+            cfg.stages[0],
+            exit=replace(cfg.stages[0].exit, strategy="epochs", threshold=threshold),
+        )
+
+    _assert_raises(replace(cfg, stages=[_epochs_stage(None)]), "threshold")
+    _assert_raises(replace(cfg, stages=[_epochs_stage(2.5)]),  "integer")
+    _assert_raises(replace(cfg, stages=[_epochs_stage(0)]),    "integer")
+    _validate(replace(cfg, stages=[_epochs_stage(2)]))          # valid: 2 epochs
+    _validate(replace(cfg, stages=[_epochs_stage(1.0)]))        # valid: YAML float 1.0
+    print("[OK] epochs threshold validation")
 
     # empty stages
     _assert_raises(replace(cfg, stages=[]), "stages")

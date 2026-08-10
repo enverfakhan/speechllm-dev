@@ -19,6 +19,7 @@ model:
   llama_ckpt: weights/Llama3.1-8B/Llama3.1-8B/Llama3.1-8B/
   adapter_pca_init: null
   gradient_checkpointing: true   # recompute activations during backward to reduce peak VRAM
+  encoder_gradient_checkpointing: true   # same, for the Whisper encoder blocks (no-op while the encoder is frozen)
   init_from: null                # path to checkpoint for weights-only warm-start
   bridge_type: mlp               # encoder→llama bridge: mlp (linear→gelu→linear) | swiglu
   audio_adapter_r: 0             # per-layer audio adapter width; 0 = disabled
@@ -66,6 +67,12 @@ stage_defaults:
   accum_steps: 1
   instruction_mode: null       # null = inherit run.instruction_mode
   optimizer_init: fresh
+  # strategy: first_token_below | eval_loss_below | max_steps | epochs | never
+  #   first_token_below / eval_loss_below  threshold = loss value (required)
+  #   max_steps                            threshold = stage-local step budget
+  #   epochs                               threshold = completed epochs, int >= 1
+  #                                        (checked at the epoch boundary)
+  #   never                                threshold ignored
   exit: {strategy: max_steps, threshold: null, min_steps: 0}
 
 stages: []                     # filled in by run configs

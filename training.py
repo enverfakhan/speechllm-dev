@@ -250,6 +250,7 @@ def run_stage(
     loss_ema: float | None = None
     micro_acc   = 0   # accum-boundary counter; never reset across epochs in this stage
     advanced    = False
+    micro_step_in_epoch = 0
 
     step_start    = time.perf_counter()
     step_audio_s  = 0.0
@@ -259,7 +260,24 @@ def run_stage(
 
     # ── Epoch loop ────────────────────────────────────────────────────────────
     while not advanced and (max_steps is None or run.global_step < max_steps):
-        micro_step_in_epoch = 0
+        micro_step_in_epoch = 0   # no batch of this epoch consumed yet
+
+        # ── Epoch-boundary exit check ─────────────────────────────────────────
+        # An epochs-based criterion must fire HERE, before the next loader is
+        # built, so the stage ends exactly on the boundary instead of after one
+        # stray step of the next epoch.  run.epoch is the epoch about to run, so
+        # it equals the number of completed epochs.  Metrics are empty by
+        # construction — no eval runs at a boundary — so the metric-based
+        # strategies stay inert here and fire only inside the batch loop.
+        if stage.should_advance({}, run.step_in_stage, run.epoch):
+            print(
+                f"[stage] '{stage.name}' advance criterion met at the epoch "
+                f"{run.epoch} boundary (step {run.global_step}, "
+                f"step_in_stage={run.step_in_stage})."
+            )
+            advanced = True
+            break
+
         loader = stage.make_loader(run.epoch, stage_idx)
 
         # ── Batch loop ────────────────────────────────────────────────────────
@@ -398,7 +416,7 @@ def run_stage(
                 )
 
             # ── Stage advance check ───────────────────────────────────────────
-            if stage.should_advance(eval_metrics, run.step_in_stage):
+            if stage.should_advance(eval_metrics, run.step_in_stage, run.epoch):
                 print(
                     f"[stage] '{stage.name}' advance criterion met "
                     f"at step {run.global_step} (step_in_stage={run.step_in_stage})."
@@ -412,19 +430,23 @@ def run_stage(
         # end batch loop
 
         if advanced:
-            # Stage handoff: save full checkpoint + adapter sidecar
-            _save_checkpoint(
-                ckpt_dir, stage, stage_idx,
-                run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
-                encoder, adapter, llama, optimizer, scaler, scheduler,
-                modules_dirty, cfg,
-                suffix="stage-handoff",
-            )
-            run.epoch = 0
             break
 
         run.epoch += 1
     # end epoch loop
+
+    # Stage handoff: save full checkpoint + adapter sidecar.  Lives outside the
+    # epoch loop so both advance paths reach it — the in-batch criterion above
+    # and the epoch-boundary criterion that breaks before building a loader.
+    if advanced:
+        _save_checkpoint(
+            ckpt_dir, stage, stage_idx,
+            run.global_step, run.epoch, micro_step_in_epoch, run.step_in_stage,
+            encoder, adapter, llama, optimizer, scaler, scheduler,
+            modules_dirty, cfg,
+            suffix="stage-handoff",
+        )
+        run.epoch = 0
 
     return not advanced
 

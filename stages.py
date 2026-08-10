@@ -10,10 +10,12 @@ Usage pattern (in training.py):
     stage = Stage(cfg.stages[idx], ctx)
     optimizer, scheduler = stage.setup(encoder, adapter, llama)
     for epoch in itertools.count():
+        if stage.should_advance({}, step_in_stage, epoch):   # epoch boundary
+            break
         loader = stage.make_loader(epoch, stage_idx=idx)
         for batch in loader:
             ...  # forward, backward, scaler.step, scheduler.step
-            if stage.should_advance(metrics, step_in_stage):
+            if stage.should_advance(metrics, step_in_stage, epoch):
                 break
 """
 
@@ -73,8 +75,12 @@ class StageContext:
 
 # ── Exit-criterion strategy registry ──────────────────────────────────────────
 
+# Every strategy takes the same five arguments — (metrics, step, threshold,
+# min_steps, epoch) — and ignores the ones it does not need, so the caller never
+# has to know which signal a given strategy reads.
+
 def _exit_first_token_below(
-    metrics: dict, step: int, threshold: float | None, min_steps: int
+    metrics: dict, step: int, threshold: float | None, min_steps: int, epoch: int
 ) -> bool:
     val = metrics.get("loss/eval_first_token")
     return (val is not None
@@ -84,7 +90,7 @@ def _exit_first_token_below(
 
 
 def _exit_eval_loss_below(
-    metrics: dict, step: int, threshold: float | None, min_steps: int
+    metrics: dict, step: int, threshold: float | None, min_steps: int, epoch: int
 ) -> bool:
     val = metrics.get("loss/eval_rest")
     return (val is not None
@@ -94,7 +100,7 @@ def _exit_eval_loss_below(
 
 
 def _exit_max_steps(
-    metrics: dict, step: int, threshold: float | None, min_steps: int
+    metrics: dict, step: int, threshold: float | None, min_steps: int, epoch: int
 ) -> bool:
     # threshold is the per-stage step budget; None means this criterion never fires.
     if threshold is None:
@@ -102,16 +108,33 @@ def _exit_max_steps(
     return step >= int(threshold)
 
 
+def _exit_epochs(
+    metrics: dict, step: int, threshold: float | None, min_steps: int, epoch: int
+) -> bool:
+    """End the stage after `threshold` COMPLETED passes over the shard list.
+
+    `epoch` is the 0-based index of the epoch about to run, so it equals the
+    number of epochs already completed: epoch >= threshold means the budget is
+    spent.  The training loop checks this at the epoch boundary (before the next
+    loader is built), which is what makes the exit land exactly on the boundary
+    rather than one step into the next epoch.
+    """
+    if threshold is None:
+        return False
+    return epoch >= int(threshold) and step >= min_steps
+
+
 def _exit_never(
-    metrics: dict, step: int, threshold: float | None, min_steps: int
+    metrics: dict, step: int, threshold: float | None, min_steps: int, epoch: int
 ) -> bool:
     return False
 
 
-_EXIT_STRATEGIES: dict[str, Callable[[dict, int, float | None, int], bool]] = {
+_EXIT_STRATEGIES: dict[str, Callable[[dict, int, float | None, int, int], bool]] = {
     "first_token_below": _exit_first_token_below,
     "eval_loss_below":   _exit_eval_loss_below,
     "max_steps":         _exit_max_steps,
+    "epochs":            _exit_epochs,
     "never":             _exit_never,
 }
 
@@ -322,7 +345,7 @@ class Stage:
 
     # ── Exit criterion ────────────────────────────────────────────────────────
 
-    def should_advance(self, metrics: dict, step_in_stage: int) -> bool:
+    def should_advance(self, metrics: dict, step_in_stage: int, epoch: int) -> bool:
         """Return True when this stage should end.
 
         The global run.max_steps hard cap is the loop's responsibility; this
@@ -332,13 +355,15 @@ class Stage:
             metrics:       dict of metric name → scalar value, e.g.
                            {"loss/eval_first_token": 0.65, "loss/eval_rest": 1.2}
             step_in_stage: stage-local step count (steps since this stage began)
+            epoch:         0-based stage-local epoch index — the epoch currently
+                           running, i.e. the count of epochs already completed
 
         Returns:
             True when the exit criterion fires
         """
         exit_cfg = self._config.exit
         return self._exit_fn(
-            metrics, step_in_stage, exit_cfg.threshold, exit_cfg.min_steps
+            metrics, step_in_stage, exit_cfg.threshold, exit_cfg.min_steps, epoch
         )
 
 
@@ -528,20 +553,20 @@ if __name__ == "__main__":
     s0_stage = Stage(s0_cfg, ctx)
 
     # Below min_steps: never fires regardless of metric.
-    assert not s0_stage.should_advance({"loss/eval_first_token": 0.5}, step_in_stage=0)
-    assert not s0_stage.should_advance({"loss/eval_first_token": 0.5}, step_in_stage=499)
+    assert not s0_stage.should_advance({"loss/eval_first_token": 0.5}, step_in_stage=0, epoch=0)
+    assert not s0_stage.should_advance({"loss/eval_first_token": 0.5}, step_in_stage=499, epoch=0)
 
     # Metric absent: never fires (past min_steps).
-    assert not s0_stage.should_advance({}, step_in_stage=500)
-    assert not s0_stage.should_advance({}, step_in_stage=1000)
+    assert not s0_stage.should_advance({}, step_in_stage=500, epoch=0)
+    assert not s0_stage.should_advance({}, step_in_stage=1000, epoch=3)
 
     # Metric present but above threshold: does not fire.
-    assert not s0_stage.should_advance({"loss/eval_first_token": 0.7},  step_in_stage=500)
-    assert not s0_stage.should_advance({"loss/eval_first_token": 0.75}, step_in_stage=1000)
+    assert not s0_stage.should_advance({"loss/eval_first_token": 0.7},  step_in_stage=500, epoch=0)
+    assert not s0_stage.should_advance({"loss/eval_first_token": 0.75}, step_in_stage=1000, epoch=0)
 
     # Metric present, below threshold, past min_steps: fires.
-    assert s0_stage.should_advance({"loss/eval_first_token": 0.69}, step_in_stage=500)
-    assert s0_stage.should_advance({"loss/eval_first_token": 0.0},  step_in_stage=9999)
+    assert s0_stage.should_advance({"loss/eval_first_token": 0.69}, step_in_stage=500, epoch=0)
+    assert s0_stage.should_advance({"loss/eval_first_token": 0.0},  step_in_stage=9999, epoch=0)
 
     print("[OK] should_advance: first_token_below")
 
@@ -551,11 +576,38 @@ if __name__ == "__main__":
         exit=ExitConfig(strategy="max_steps", threshold=5000.0, min_steps=0),
     )
     ms_stage = Stage(max_cfg, ctx)
-    assert not ms_stage.should_advance({}, step_in_stage=4999)
-    assert     ms_stage.should_advance({}, step_in_stage=5000)
-    assert     ms_stage.should_advance({}, step_in_stage=5001)
+    assert not ms_stage.should_advance({}, step_in_stage=4999, epoch=0)
+    assert     ms_stage.should_advance({}, step_in_stage=5000, epoch=0)
+    assert     ms_stage.should_advance({}, step_in_stage=5001, epoch=0)
 
     print("[OK] should_advance: max_steps")
+
+    # epochs stage: fires at the first check where epoch >= threshold, whatever
+    # the step count — the training loop only asks at an epoch boundary.
+    ep_cfg = replace(
+        s0_cfg,
+        exit=ExitConfig(strategy="epochs", threshold=2, min_steps=0),
+    )
+    ep_stage = Stage(ep_cfg, ctx)
+    for _epoch in (0, 1):
+        for _step in (0, 1, 12345):
+            assert not ep_stage.should_advance({}, step_in_stage=_step, epoch=_epoch), (
+                f"epochs(2) must not fire during epoch {_epoch} (step {_step})"
+            )
+    assert ep_stage.should_advance({}, step_in_stage=0, epoch=2), (
+        "epochs(2) must fire at the epoch-2 boundary even at step 0"
+    )
+    assert ep_stage.should_advance({}, step_in_stage=99, epoch=7)
+
+    # min_steps still gates it: a short epoch must not end the stage early.
+    ep_gated = Stage(
+        replace(s0_cfg, exit=ExitConfig(strategy="epochs", threshold=2, min_steps=1000)),
+        ctx,
+    )
+    assert not ep_gated.should_advance({}, step_in_stage=999,  epoch=2)
+    assert     ep_gated.should_advance({}, step_in_stage=1000, epoch=2)
+
+    print("[OK] should_advance: epochs")
 
     # never stage: always False.
     never_cfg = replace(
@@ -563,8 +615,10 @@ if __name__ == "__main__":
         exit=ExitConfig(strategy="never", threshold=None, min_steps=0),
     )
     nv_stage = Stage(never_cfg, ctx)
-    assert not nv_stage.should_advance({}, step_in_stage=0)
-    assert not nv_stage.should_advance({"loss/eval_first_token": 0.0}, step_in_stage=10**9)
+    assert not nv_stage.should_advance({}, step_in_stage=0, epoch=0)
+    assert not nv_stage.should_advance(
+        {"loss/eval_first_token": 0.0}, step_in_stage=10**9, epoch=10**6
+    )
 
     print("[OK] should_advance: never")
 
