@@ -67,7 +67,7 @@ seed: 48                        # fresh run; decorrelate data order from 42-47
 model:
   init_from:          null      # scratch — every stage inherits from the previous one
   bridge_type:        swiglu
-  audio_adapter_r:    88
+  audio_adapter_r:    128
   audio_adapter_type: swiglu
   audio_adapter_zero_writer_layers: 0
 data:
@@ -122,6 +122,6 @@ stages:
     trainable:   [encoder, adapter, audio_adapters]
     lrs:         {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
     schedule:    {warmup_steps: 1000}
-    batch_size:  36            # PLACEHOLDER — re-verify with tools/find_max_batch.py
-    accum_steps: 3             # (see note (e) above)
-    exit:        {strategy: never}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
