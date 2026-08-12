@@ -43,7 +43,12 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from data import PrunedTokenizer
 
-_VOCAB_SIZE  = 40148
+# Ground truth is data/pruned_tokenizer/pruned_config.json — build.py reads
+# vocab_size from there. This copy exists only to normalise entropy into a 0-1
+# fraction; update it whenever tools/build_vocab.py rebuilds the vocabulary.
+# (40,148 for the vocab built from the BasicTextNormalizer/spaCy labels;
+#  40,034 for the LLM-labelled corpus.)
+_VOCAB_SIZE  = 40034
 _MAX_ENTROPY = math.log(_VOCAB_SIZE)
 
 

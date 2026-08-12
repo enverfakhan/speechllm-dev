@@ -394,12 +394,14 @@ if __name__ == "__main__":
     ctx = StageContext(
         shards               = fake_shards,
         tokenizer_path       = Path("data/pruned_tokenizer/"),
-        sep_token_id         = 40147,
+        sep_token_id         = 40033,
         num_workers          = 0,
         seed                 = 42,
         instruction_pairs    = [
-            ("Transcribe the following audio without formatting.", "unformatted.txt"),
-            ("Transcribe the following audio with proper formatting.", "formatted.txt"),
+            ("Transcribe the audio exactly as spoken, in lowercase with no punctuation.",
+             "unformatted.txt"),
+            ("Transcribe the audio as written text, with capitalization, punctuation, "
+             "and numbers as digits.", "formatted.txt"),
         ],
         run_instruction_mode = "unformatted",
         betas                = (0.9, 0.999),

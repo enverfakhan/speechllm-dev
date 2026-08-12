@@ -40,6 +40,7 @@ from data import PrunedTokenizer
 def compute_baselines(
     shard_paths: list[str],
     tokenizer: PrunedTokenizer,
+    vocab_size: int,
 ) -> dict[str, float]:
     """Compute unigram, bigram, and first-token loss baselines from shards.
 
@@ -59,6 +60,8 @@ def compute_baselines(
     Args:
         shard_paths: list of .tar shard paths to scan
         tokenizer:   PrunedTokenizer for encoding transcripts
+        vocab_size:  pruned vocabulary size, from the tokenizer's
+                     pruned_config.json — sets the uniform baseline log(V)
 
     Returns:
         dict of baseline values and metadata
@@ -108,8 +111,6 @@ def compute_baselines(
 
     if total_tokens == 0:
         raise ValueError("No tokens found — check shard paths and transcript keys")
-
-    vocab_size = 40148
 
     # ── Uniform baseline ──────────────────────────────────────────────────
     uniform_loss = math.log(vocab_size)
@@ -203,7 +204,13 @@ def main() -> None:
 
     print(f"Scanning {len(shards)} shard(s) ...")
     tokenizer  = PrunedTokenizer(args.tokenizer)
-    baselines  = compute_baselines(shards, tokenizer)
+    # Read the size from the tokenizer that produced these ids rather than
+    # hardcoding it: the uniform baseline is log(vocab_size), so a stale
+    # constant silently shifts the reference line every W&B run is judged
+    # against. Rebuilding the vocab (tools/build_vocab.py) changes this number.
+    with (args.tokenizer / "pruned_config.json").open() as f:
+        vocab_size = json.load(f)["vocab_size"]
+    baselines  = compute_baselines(shards, tokenizer, vocab_size)
 
     sep = "─" * 56
     print(f"\n{sep}")

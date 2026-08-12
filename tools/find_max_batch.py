@@ -56,7 +56,7 @@ from model.whisper_encoder import WhisperEncoder
 _AUDIO_TOKS = 375   # adapter output tokens for ~30s audio (mel_t=3000)
 _INST_TOKS  = 50
 _TRANS_TOKS = 50
-_VOCAB_SIZE = 40148
+_VOCAB_SIZE = 40034   # data/pruned_tokenizer/pruned_config.json is ground truth
 _TOTAL_VRAM_GB = (
     torch.cuda.get_device_properties(0).total_memory / 1e9
     if torch.cuda.is_available() else 80.0

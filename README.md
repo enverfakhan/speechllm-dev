@@ -24,8 +24,8 @@ I wanted hands-on, end-to-end experience training a model that is state-of-the-a
 
 | Instruction | Target output |
 |---|---|
-| *"Transcribe the following audio without formatting."* | lowercase, no punctuation (LibriSpeech's native format) |
-| *"Transcribe the following audio with proper formatting."* | punctuation, sentence caps, proper-noun caps |
+| *"Transcribe the audio exactly as spoken, in lowercase with no punctuation."* | lowercase, no punctuation (LibriSpeech's native format) |
+| *"Transcribe the audio as written text, with capitalization, punctuation, and numbers as digits."* | punctuation, sentence caps, proper-noun caps, numbers as digits |
 
 LibriSpeech ships unformatted, so the formatted labels had to be created. They are generated with open-source tools (a BERT-based punctuation restorer + spaCy for proper nouns). The labels don't need to be perfect — they need to be **consistent**. The goal isn't a SOTA formatter; it's the experience of training a model to follow instructions on audio.
 

@@ -10,21 +10,33 @@ Per-sample processing:
        c. _capitalize_sentences → sentence-initial capitalisation
        d. spaCy en_core_web_sm PROPN tagger → proper nouns capitalised
 
-When --labels_file is provided (output of scripts/precompute_labels.py), steps 3 and 4
-are skipped entirely and labels are looked up from the precomputed JSONL file instead.
-This avoids loading PunctuationModel and spaCy and reduces sharding time from ~1 hour
-to a few minutes for large splits.
+When --labels_file is provided (output of tools/precompute_labels.py or of
+tools/label_formatted.py finalize), steps 3 and 4 are skipped entirely and labels
+are looked up from the precomputed JSONL file instead. This avoids loading
+PunctuationModel and spaCy and reduces sharding time from ~1 hour to a few
+minutes for large splits.
+
+A label record carrying "validation": "failed" is SKIPPED, not shipped: the
+labelling run could not align its formatted text to the reference transcript, so
+its two labels disagree about which words were spoken (FORMATTING_SPEC.md §7).
+Shipping it would train the formatted and unformatted instructions toward
+contradictory targets on the same audio. Records with no `validation` field —
+everything tools/precompute_labels.py writes — are treated as usable.
+
+To apply new labels to shards that already exist, use tools/relabel_shards.py
+instead: it swaps the label members and drops the failed samples without
+recomputing a single mel, which is minutes of I/O against hours of CPU here.
 
 Two invocation modes:
 
   Single split (--input_dir + --split):
-    python scripts/preprocess.py \\
+    python tools/preprocess.py \\
       --input_dir  data/librispeech/LibriSpeech/train-clean-100 \\
       --output_dir data/shards/ \\
       --split      train-clean-100
 
   Full dataset in one run (--librispeech_dir):
-    python scripts/preprocess.py \\
+    python tools/preprocess.py \\
       --librispeech_dir data/librispeech/LibriSpeech/ \\
       --output_dir      data/shards/ \\
       --labels_file     data/labels.jsonl \\
@@ -200,7 +212,7 @@ def _load_labels(labels_file: Path) -> dict[str, dict]:
     """Load a precomputed labels JSONL file into a key → record dict.
 
     Args:
-        labels_file: JSONL file produced by scripts/precompute_labels.py
+        labels_file: JSONL file produced by tools/precompute_labels.py
 
     Returns:
         dict mapping utterance key → {"key": ..., "unformatted": ..., "formatted": ...}
@@ -304,6 +316,7 @@ def preprocess_split(
     shard_idx          = 0
     sample_count       = 0
     skipped_long       = 0
+    skipped_failed     = 0   # label records the labelling run could not validate
     current_tar: tarfile.TarFile | None = None
     current_shard_name = ""
     shard_duration_acc = 0.0   # cumulative audio seconds in the current shard
@@ -337,6 +350,13 @@ def preprocess_split(
                 record = precomputed.get(key)
                 if record is None:
                     print(f"Warning: no precomputed label for {key} — skipping", flush=True)
+                    continue
+                # A record whose formatted text never aligned to the reference
+                # has two labels that disagree on the spoken WORDS, not just on
+                # formatting (FORMATTING_SPEC.md §7). Absent `validation` means
+                # an older labels file with no such notion — treat as usable.
+                if record.get("validation", "ok") != "ok":
+                    skipped_failed += 1
                     continue
                 unformatted = record["unformatted"]
                 formatted   = record["formatted"]
@@ -380,7 +400,12 @@ def preprocess_split(
         if current_tar is not None:
             current_tar.close()
 
-    skipped_msg = f"  ({skipped_long} skipped, duration > {max_duration_s}s)" if skipped_long else ""
+    skipped: list[str] = []
+    if skipped_long:
+        skipped.append(f"{skipped_long} duration > {max_duration_s}s")
+    if skipped_failed:
+        skipped.append(f"{skipped_failed} failed validation")
+    skipped_msg = f"  ({', '.join(skipped)} skipped)" if skipped else ""
     print(f"  {split}: {sample_count} samples → {shard_idx} shard(s){skipped_msg}", flush=True)
     return sample_count, shard_idx
 
@@ -469,12 +494,12 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  # Full dataset (recommended):\n"
-            "  python scripts/preprocess.py \\\n"
+            "  python tools/preprocess.py \\\n"
             "    --librispeech_dir data/librispeech/LibriSpeech/ \\\n"
             "    --output_dir data/shards/ \\\n"
             "    --labels_file data/labels.jsonl --seed 42\n\n"
             "  # Single split:\n"
-            "  python scripts/preprocess.py \\\n"
+            "  python tools/preprocess.py \\\n"
             "    --input_dir data/librispeech/LibriSpeech/train-clean-100 \\\n"
             "    --output_dir data/shards/ --split train-clean-100 --seed 42\n"
         ),
@@ -532,7 +557,7 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "JSONL file from scripts/precompute_labels.py; skips loading "
+            "JSONL file from tools/precompute_labels.py; skips loading "
             "PunctuationModel and spaCy — labels are looked up by key"
         ),
     )

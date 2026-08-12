@@ -51,9 +51,15 @@ import torch.utils.data
 import webdataset as wds
 
 
+# The canonical two prompt strings. tools/build_vocab.py keeps its own copy and
+# MUST be updated in lockstep, then the vocabulary rebuilt: instruction tokens are
+# part of the pruned vocabulary, and PrunedTokenizer.encode silently DROPS ids it
+# has no mapping for. An instruction word absent from the vocab therefore does not
+# raise — it vanishes from the prompt the model is conditioned on. " lowercase"
+# is exactly such a word: it occurs nowhere in the LibriSpeech labels.
 INSTRUCTION_VARIANTS: list[str] = [
-    "Transcribe the following audio without formatting.",
-    "Transcribe the following audio with proper formatting.",
+    "Transcribe the audio exactly as spoken, in lowercase with no punctuation.",
+    "Transcribe the audio as written text, with capitalization, punctuation, and numbers as digits.",
 ]
 
 
@@ -431,6 +437,24 @@ if __name__ == "__main__":
     if not _args.self_test:
         _p.print_help()
         sys.exit(0)
+
+    # ── Instruction-string drift guard ────────────────────────────────────────
+    # tools/build_vocab.py holds its own copy of these strings and tokenizes them
+    # into the pruned vocabulary. If the two drift apart, nothing raises: the
+    # vocabulary simply lacks an id the prompt needs, and PrunedTokenizer.encode
+    # drops it, so training silently conditions on a mangled instruction. Catch
+    # that here instead. (Checked by import, not by rebuilding anything — the
+    # tool's module-level imports are stdlib only.)
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+    import build_vocab as _bv
+
+    assert _bv.INSTRUCTION_VARIANTS == INSTRUCTION_VARIANTS, (
+        "tools/build_vocab.py INSTRUCTION_VARIANTS have drifted from data.py:\n"
+        f"  data.py:       {INSTRUCTION_VARIANTS}\n"
+        f"  build_vocab.py {_bv.INSTRUCTION_VARIANTS}\n"
+        "Update both, then rebuild the vocabulary from the labels file."
+    )
+    print("  instruction variants match build_vocab.py   ok")
 
     # ── build_sorted_eval_dataloader self-test ────────────────────────────────
     with tempfile.TemporaryDirectory() as _tmp:

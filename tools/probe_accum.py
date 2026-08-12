@@ -38,8 +38,8 @@ from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_VOCAB_SIZE = 40148
-_INST_TOKS  = 14     # "Transcribe the following audio without formatting."
+_VOCAB_SIZE = 40034   # data/pruned_tokenizer/pruned_config.json is ground truth
+_INST_TOKS  = 19     # the longer of data.py's two INSTRUCTION_VARIANTS
 _TRANS_TOKS = 50     # representative transcript length
 _SEP_ID     = _VOCAB_SIZE - 1
 

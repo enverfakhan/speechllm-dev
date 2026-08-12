@@ -34,8 +34,8 @@ LibriSpeech 960h — `train-clean-100`, `train-clean-360`, `train-other-500`, pl
 
 This is where the project's core idea becomes a data engineering task. The model is trained on two instructions:
 
-- *"Transcribe the following audio without formatting."* → lowercase, no punctuation
-- *"Transcribe the following audio with proper formatting."* → punctuation, sentence caps, proper-noun caps
+- *"Transcribe the audio exactly as spoken, in lowercase with no punctuation."* → lowercase, no punctuation
+- *"Transcribe the audio as written text, with capitalization, punctuation, and numbers as digits."* → punctuation, sentence caps, proper-noun caps, numbers as digits
 
 LibriSpeech transcripts are natively unformatted (all-caps, no punctuation), so the **unformatted** target is a one-liner: Whisper's `BasicTextNormalizer`. The **formatted** target has to be manufactured. The pipeline is four passes:
 
