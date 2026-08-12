@@ -45,11 +45,12 @@
 #     default true — a no-op in stages 1-3, where the encoder is frozen and no
 #     autograd graph is built) AND the in-layer adapter parameters in the
 #     optimizer.  No earlier VRAM probe covers that combination.
-#     Re-verify before the run reaches stage 4 — but note tools/find_max_batch.py
-#     as it stands builds a DIFFERENT stack: hardcoded MLP bridge (AudioAdapter),
-#     no in-layer adapters (LlamaConfig without audio_adapter_r) and
-#     enable_gradient_checkpointing() on Llama only.  Point it at this config's
-#     architecture first, or its stage-3 answer will be for the wrong model.
+#     Re-verify before the run reaches stage 4:
+#         python tools/find_max_batch.py --config configs/staged_full_stack.yaml \
+#             --stage 4
+#     find_max_batch.py is config-driven — it builds this file's architecture
+#     through build_models() and this stage's param groups through Stage.setup(),
+#     so the number it reports is for the model this stage actually trains.
 #
 # (f) Each stage handoff checkpoint (step*-stage-handoff.pt) is a WER measurement
 #     point — the cumulative ablation is
