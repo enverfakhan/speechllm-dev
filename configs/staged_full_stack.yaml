@@ -74,10 +74,10 @@ data:
   diag_shard:  data/full-eval-test-dev-clean-other.tar
   num_workers: 32
   eval:
-    dev_clean:  data/eval_subset/dev-clean-480.tar
-    dev_other:  data/eval_subset/dev-other-480.tar
-    test_clean: data/eval_subset/test-clean-480.tar
-    test_other: data/eval_subset/test-other-480.tar
+    dev_clean:  data/eval_subset_shards/dev-clean-480.tar
+    dev_other:  data/eval_subset_shards/dev-other-480.tar
+    test_clean: data/eval_subset_shards/test-clean-480.tar
+    test_other: data/eval_subset_shards/test-other-480.tar
 logging:
   wandb:    true
   project:  speechllm-auto-stage
