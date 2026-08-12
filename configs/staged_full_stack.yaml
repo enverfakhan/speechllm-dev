@@ -1,0 +1,126 @@
+# staged_full_stack.yaml — four-stage cumulative unfreeze, from scratch
+# One run that walks the whole stack open, one module at a time:
+#
+#   1 bridge_only           SwiGLU bridge alone                    4680 steps
+#   2 audio_adapters_only   in-layer SwiGLU adapters alone         4680 steps
+#   3 bridge_plus_adapters  both together                          4680 steps
+#   4 full_stack            + the Whisper encoder                  to max_steps
+#
+# NO WARM START (model.init_from: null) — every stage's weights come from the
+# stage before it, so the run is self-contained and the four handoff checkpoints
+# form a clean cumulative ablation.
+#
+# (a) Stage 1 IS the E2 recipe, only with a SwiGLU bridge instead of the MLP one
+#     (adapter-only, lr 1e-4, batch 64 × accum 2).  Its loss curve should track
+#     the earlier stage-1 curves: the in-layer adapters exist from step 0 but are
+#     frozen AND exact no-ops at init (zero gate_proj → silu(0)=0 → the branch
+#     adds exactly 0.0 to the residual), so stage 1 sees the bridge-only model.
+#     Any divergence from the prior stage-1 curve is a bridge-variant effect
+#     (SwiGLU vs MLP), not an adapter effect.
+#
+# (b) ⚠ The BRIDGE writer (down_proj) is NEAR-zero at init, never exactly zero,
+#     and its gate_proj is NEVER zeroed.  The bridge output is the entire content
+#     of the audio positions and Llama is bias-free, so exactly-zero embeddings
+#     stay zero through all 32 layers; every RMSNorm on that dead stream adds a
+#     1/sqrt(eps) ≈ 316× backward gain, the gradient reaching the bridge hits
+#     ~1e7, fp16 overflows and GradScaler skips every step — the model never
+#     leaves the degenerate state.  See the AudioSwiGLUBridge docstring in
+#     model/adapter.py ("Why near-zero and not EXACTLY zero").  The in-layer
+#     adapters are the opposite case and CAN zero a tensor: they add to an
+#     already-live residual stream.
+#
+# (c) In-layer adapters use the v3 scheme on ALL layers
+#     (audio_adapter_zero_writer_layers: 0): zero gate_proj, writer (down_proj)
+#     at GPT-2 scale std 0.02/sqrt(32).  Exactly ONE tensor per adapter is zero;
+#     zeroing a second would make every gradient in that branch identically zero.
+#
+# (d) warmup_steps count INSIDE each stage's 4680-step budget — stage 2 spends
+#     its first 250 steps ramping, leaving 4430 at peak LR.  The exit criterion
+#     is stage-local (max_steps → step_in_stage >= threshold), so warmup does not
+#     extend the stage.
+#
+# (e) ⚠ Stage 4's batch_size/accum_steps (36 × 3) is an UNTESTED PLACEHOLDER.
+#     It is the first configuration that has the encoder trainable, encoder
+#     gradient checkpointing active (model.encoder_gradient_checkpointing, base
+#     default true — a no-op in stages 1-3, where the encoder is frozen and no
+#     autograd graph is built) AND the in-layer adapter parameters in the
+#     optimizer.  No earlier VRAM probe covers that combination.
+#     Re-verify before the run reaches stage 4 — but note tools/find_max_batch.py
+#     as it stands builds a DIFFERENT stack: hardcoded MLP bridge (AudioAdapter),
+#     no in-layer adapters (LlamaConfig without audio_adapter_r) and
+#     enable_gradient_checkpointing() on Llama only.  Point it at this config's
+#     architecture first, or its stage-3 answer will be for the wrong model.
+#
+# (f) Each stage handoff checkpoint (step*-stage-handoff.pt) is a WER measurement
+#     point — the cumulative ablation is
+#         bridge → +adapters → +joint → +encoder
+#     Sweep them together afterwards:
+#         python tools/run_wer.py --config configs/staged_full_stack.yaml \
+#             --checkpoints 'checkpoints/staged-full-stack/*stage-handoff.pt' \
+#             --output results/staged_full_stack_wer.csv --full
+#
+# Launch with:
+#   python training.py --config configs/staged_full_stack.yaml
+
+seed: 48                        # fresh run; decorrelate data order from 42-47
+model:
+  init_from:          null      # scratch — every stage inherits from the previous one
+  bridge_type:        swiglu
+  audio_adapter_r:    88
+  audio_adapter_type: swiglu
+  audio_adapter_zero_writer_layers: 0
+data:
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset/dev-clean-480.tar
+    dev_other:  data/eval_subset/dev-other-480.tar
+    test_clean: data/eval_subset/test-clean-480.tar
+    test_other: data/eval_subset/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: staged-full-stack
+checkpoint:
+  dir:        checkpoints/staged-full-stack
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        22000
+  instruction_mode: both
+stages:
+  - name:        bridge_only
+    trainable:   [adapter]
+    lrs:         {adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
+
+  - name:        audio_adapters_only
+    trainable:   [audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4}
+    schedule:    {warmup_steps: 250}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
+
+  - name:        bridge_plus_adapters
+    trainable:   [adapter, audio_adapters]
+    lrs:         {adapter: 5.0e-5, audio_adapters: 1.0e-4}
+    schedule:    {warmup_steps: 250}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
+
+  - name:        full_stack
+    trainable:   [encoder, adapter, audio_adapters]
+    lrs:         {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
+    schedule:    {warmup_steps: 1000}
+    batch_size:  36            # PLACEHOLDER — re-verify with tools/find_max_batch.py
+    accum_steps: 3             # (see note (e) above)
+    exit:        {strategy: never}
