@@ -91,7 +91,7 @@ metrics:
   eval_batches:    10
   eval_batch_size: 64
 run:
-  max_steps:        14040        # 3 × 4680
+  max_steps:        15040        # 3 × 4680 + 1000
   instruction_mode: both
 stages:
   - name:        bridge_only
@@ -113,6 +113,6 @@ stages:
     trainable:   [encoder, adapter, audio_adapters]
     lrs:         {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
     schedule:    {warmup_steps: 1000}
-    batch_size:  60              # ⚠ untested placeholder — see (f)
+    batch_size:  60              
     accum_steps: 2
-    exit:        {strategy: max_steps, threshold: 4680}
+    exit:        {strategy: max_steps, threshold: 5680}
