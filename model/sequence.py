@@ -45,6 +45,19 @@ import torch.nn.functional as F
 # Valid cfg.model.input_convention values; utils/config.py mirrors this set.
 INPUT_CONVENTIONS: frozenset[str] = frozenset({"flat", "chat"})
 
+# The ordinary (non-special) text the chat scaffold is built from.  Named here,
+# in the module that assembles the sequence, because tools/build_vocab.py must
+# put exactly these strings in the pruned vocabulary and check exactly these
+# splice boundaries — a second hardcoded copy over there would be a drift risk.
+CHAT_ROLE_USER      = "user"
+CHAT_ROLE_ASSISTANT = "assistant"
+CHAT_HEADER_TAIL    = "\n\n"   # follows [end_header_id] in both turns
+CHAT_AUDIO_TAIL     = "\n"     # separates AUDIO_EOS from the instruction
+
+CHAT_SCAFFOLD_TEXTS: tuple[str, ...] = (
+    CHAT_ROLE_USER, CHAT_ROLE_ASSISTANT, CHAT_HEADER_TAIL, CHAT_AUDIO_TAIL,
+)
+
 
 def prepare_input(
     adapter_out: torch.Tensor,
@@ -252,10 +265,12 @@ class ChatTemplate:
             specials["end_header_id"], specials["eot_token_id"],
         )
         return cls(
-            seg_pre_audio       = (bos, start) + _encode("user") + (end,) + _encode("\n\n"),
+            seg_pre_audio       = ((bos, start) + _encode(CHAT_ROLE_USER) + (end,)
+                                   + _encode(CHAT_HEADER_TAIL)),
             # Separates AUDIO_EOS from the instruction text inside the user turn.
-            seg_pre_instruction = _encode("\n"),
-            seg_pre_transcript  = (eot, start) + _encode("assistant") + (end,) + _encode("\n\n"),
+            seg_pre_instruction = _encode(CHAT_AUDIO_TAIL),
+            seg_pre_transcript  = ((eot, start) + _encode(CHAT_ROLE_ASSISTANT) + (end,)
+                                   + _encode(CHAT_HEADER_TAIL)),
             eot_token_id        = eot,
         )
 

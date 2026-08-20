@@ -41,8 +41,15 @@ Steps:
      FORCE IN the four Llama 3.1 chat specials by their canonical ids
      (<|begin_of_text|> 128000, <|start_header_id|> 128006,
       <|end_header_id|> 128007, <|eot_id|> 128009).
-  5. Verify the assembled chat scaffold against the tokenizer's own
-     apply_chat_template rendering (see _verify_chat_scaffold).
+  5. Verify the assembled chat scaffold:
+       _verify_scaffold_boundaries  ALWAYS — no BPE merge crosses a splice
+                                    boundary, checked against real corpus text.
+                                    Needs no chat template.
+       _verify_chat_scaffold        when the tokenizer has a chat_template —
+                                    additionally cross-checks the turn layout
+                                    against apply_chat_template.  A Meta-format
+                                    checkpoint directory ships no template, so
+                                    this one is skipped with a notice.
   6. Save vocab_map.json, pruned_config.json, and tokenizer files to --output_dir.
 
 Why the specials are forced in by ID rather than looked up by name: a Meta-format
@@ -96,7 +103,12 @@ from typing import Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model.sequence import ChatTemplate
+from model.sequence import (
+    ChatTemplate,
+    CHAT_AUDIO_TAIL,
+    CHAT_HEADER_TAIL,
+    CHAT_SCAFFOLD_TEXTS,
+)
 
 
 # The two instruction variants — must match data.py verbatim. These strings are
@@ -110,12 +122,12 @@ INSTRUCTION_VARIANTS: list[str] = [
 
 _WEIGHT_SUFFIXES = frozenset({".pth", ".safetensors", ".bin", ".gguf", ".pt"})
 
-# Ordinary (non-special) text the chat scaffold is made of.  Every one of these
-# MUST survive pruning or ChatTemplate.from_tokenizer would assemble a scaffold
-# with a silently missing header word — PrunedTokenizer.encode drops unmapped ids
-# without raising.  "user"/"assistant" happen to occur in LibriSpeech anyway;
-# the newline runs do not.
-CHAT_SCAFFOLD_TEXTS: tuple[str, ...] = ("user", "assistant", "\n\n", "\n")
+# CHAT_SCAFFOLD_TEXTS is imported from model/sequence.py, which assembles the
+# scaffold: every one of those strings MUST survive pruning or
+# ChatTemplate.from_tokenizer would build a scaffold with a silently missing
+# header word — PrunedTokenizer.encode drops unmapped ids without raising.
+# ("user"/"assistant" happen to occur in LibriSpeech anyway; the newline runs
+# do not.)
 
 # The four Llama 3.1 chat specials, by pruned_config.json key → (token, canonical
 # original id).  Forced in BY ID: a Meta-format tokenizer directory loads through
@@ -175,6 +187,88 @@ def _find_subsequence(haystack: list[int], needle: tuple[int, ...]) -> int:
     return -1
 
 
+def _chat_in_original_space(tokenizer, special_ids: dict[str, int]) -> ChatTemplate:
+    """Assemble the scaffold in ORIGINAL id space, straight off the HF tokenizer.
+
+    ChatTemplate is id-space agnostic (see model/sequence.py), so the same class
+    that builds the training-time scaffold in pruned space builds the reference
+    here — the checks below therefore test the real assembly code, not a
+    re-implementation of it.
+    """
+
+    class _OriginalSpaceTokenizer:
+        bos_token_id    = special_ids["bos_token_id"]
+        start_header_id = special_ids["start_header_id"]
+        end_header_id   = special_ids["end_header_id"]
+        eot_token_id    = special_ids["eot_token_id"]
+
+        @staticmethod
+        def encode(text: str) -> list[int]:
+            return tokenizer.encode(text, add_special_tokens=False)
+
+    return ChatTemplate.from_tokenizer(_OriginalSpaceTokenizer())
+
+
+def _verify_scaffold_boundaries(tokenizer, sample_transcripts: list[str]) -> None:
+    """Check that no BPE merge crosses a splice boundary.  Needs NO chat template.
+
+    We assemble the sequence segment by segment — scaffold text encoded on its
+    own, instruction and transcript encoded on their own by the dataloader — and
+    concatenate the ids.  A real chat rendering tokenizes each turn as ONE
+    stream.  The two agree only if every boundary we splice at is also a
+    tokenizer boundary; if some merge spans one, the model trains on ids that no
+    natural tokenization of that text would ever produce.
+
+    Only boundaries where two runs of TEXT meet can merge, and there are exactly
+    two of them:
+
+        "\n"   -> instruction     (after AUDIO_EOS, inside the user turn)
+        "\n\n" -> transcript       (after the assistant header)
+
+    Everywhere else an atomic special token (<|end_header_id|>, <|eot_id|>) or a
+    marker VECTOR (AUDIO_BOS/AUDIO_EOS, which occupy no id at all) sits between
+    the two runs, so no merge is possible by construction.
+
+    This is the substantive half of scaffold verification and it works against a
+    Meta-format tokenizer directory, which carries no chat template.
+
+    Args:
+        tokenizer:          HuggingFace tokenizer from the Llama directory
+        sample_transcripts: real label strings from the corpus, so the check runs
+                            against text the model will actually be trained on
+
+    Raises:
+        ValueError: when segment-wise and joint tokenization disagree
+    """
+    def _enc(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    cases: list[tuple[str, str, str]] = [
+        (CHAT_AUDIO_TAIL, instruction, "audio tail -> instruction")
+        for instruction in INSTRUCTION_VARIANTS
+    ] + [
+        (CHAT_HEADER_TAIL, transcript, "assistant header -> transcript")
+        for transcript in sample_transcripts
+    ]
+
+    for prefix, follower, label in cases:
+        segmented = _enc(prefix) + _enc(follower)
+        joint     = _enc(prefix + follower)
+        if segmented != joint:
+            raise ValueError(
+                f"chat scaffold boundary [{label}] is not a tokenizer boundary: "
+                f"encoding {prefix!r} and {follower[:40]!r} separately gives "
+                f"{segmented[:8]}… but encoding them together gives {joint[:8]}…. "
+                "Segment-wise assembly would feed the model ids no natural "
+                "tokenization produces — do NOT train against this vocabulary."
+            )
+
+    print(f"  splice boundaries verified: {len(cases)} cases "
+          f"({len(INSTRUCTION_VARIANTS)} instruction, "
+          f"{len(sample_transcripts)} corpus transcript) tokenize identically "
+          "segment-wise and jointly")
+
+
 def _verify_chat_scaffold(tokenizer, special_ids: dict[str, int]) -> None:
     """Anchor our assembled scaffold against the tokenizer's apply_chat_template.
 
@@ -188,6 +282,11 @@ def _verify_chat_scaffold(tokenizer, special_ids: dict[str, int]) -> None:
     today's date, which our convention deliberately omits.  What must match is
     every boundary the audio and the transcript are spliced between.
 
+    This check needs the tokenizer's chat template and is therefore SKIPPED for a
+    Meta-format checkpoint directory, which ships none.  _verify_scaffold_boundaries
+    always runs and covers the tokenization half; what only this check adds is
+    confirmation that our turn LAYOUT matches Meta's own template.
+
     Args:
         tokenizer:   HuggingFace tokenizer from the Llama directory
         special_ids: ORIGINAL-space ids from _resolve_special_ids
@@ -195,19 +294,10 @@ def _verify_chat_scaffold(tokenizer, special_ids: dict[str, int]) -> None:
     Raises:
         ValueError: when a segment is not present, contiguous, in the reference
     """
-    class _OriginalSpaceTokenizer:
-        """ChatTemplate source in ORIGINAL id space (see model/sequence.py)."""
+    chat = _chat_in_original_space(tokenizer, special_ids)
 
-        bos_token_id    = special_ids["bos_token_id"]
-        start_header_id = special_ids["start_header_id"]
-        end_header_id   = special_ids["end_header_id"]
-        eot_token_id    = special_ids["eot_token_id"]
-
-        @staticmethod
-        def encode(text: str) -> list[int]:
-            return tokenizer.encode(text, add_special_tokens=False)
-
-    chat = ChatTemplate.from_tokenizer(_OriginalSpaceTokenizer())
+    def _enc(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
 
     placeholder = "AUDIO"
     instruction = INSTRUCTION_VARIANTS[0]
@@ -221,7 +311,7 @@ def _verify_chat_scaffold(tokenizer, special_ids: dict[str, int]) -> None:
         add_generation_prompt = False,
     )
 
-    enc = _OriginalSpaceTokenizer.encode
+    enc = _enc
     eot = special_ids["eot_token_id"]
 
     checks: list[tuple[str, tuple[int, ...]]] = [
@@ -306,11 +396,27 @@ def _iter_label_texts(labels_file: Path) -> Iterator[str]:
     print(f"  {n_ok:,} usable records, {n_failed:,} failed records skipped")
 
 
-def _collect_ids(tokenizer, texts: Iterator[str], chunk_size: int) -> set[int]:
+def _collect_ids(
+    tokenizer,
+    texts: Iterator[str],
+    chunk_size: int,
+    sample_out: list[str] | None = None,
+    n_sample: int = 200,
+) -> set[int]:
     """Union of token ids over a stream of strings.
 
     Tokenizes in batches rather than one string at a time: the fast tokenizer
     parallelises a batch, and this runs over ~584k strings.
+
+    Args:
+        tokenizer:  HuggingFace tokenizer
+        texts:      stream of label strings
+        chunk_size: strings per tokenizer batch
+        sample_out: if given, the first n_sample strings are appended to it, so
+                    _verify_scaffold_boundaries can run against REAL corpus text
+                    rather than invented examples (both label variants appear,
+                    since the iterator yields them in pairs)
+        n_sample:   how many strings to retain
     """
     used_ids: set[int] = set()
     n_done = 0
@@ -328,6 +434,8 @@ def _collect_ids(tokenizer, texts: Iterator[str], chunk_size: int) -> set[int]:
         batch.clear()
 
     for text in texts:
+        if sample_out is not None and len(sample_out) < n_sample:
+            sample_out.append(text)
         batch.append(text)
         if len(batch) >= chunk_size:
             _flush()
@@ -490,7 +598,6 @@ def build_vocab(
     librispeech_dir: Path | None = None,
     labels_file: Path | None = None,
     chunk_size: int = 512,
-    allow_missing_chat_template: bool = False,
 ) -> None:
     """Prune the Llama tokenizer and save the result.
 
@@ -505,9 +612,6 @@ def build_vocab(
                          BasicTextNormalizer / PunctuationModel / spaCy pipeline
         labels_file:     labels JSONL to read the label text from directly
         chunk_size:      strings processed per batch (for memory control)
-        allow_missing_chat_template: build even when the tokenizer has no chat
-                         template to anchor the scaffold against (prints a
-                         warning instead of raising)
     """
     from transformers import AutoTokenizer
 
@@ -526,7 +630,8 @@ def build_vocab(
     else:
         texts = _corpus_label_texts(librispeech_dir, chunk_size)
 
-    used_ids = _collect_ids(tokenizer, texts, chunk_size)
+    label_sample: list[str] = []
+    used_ids = _collect_ids(tokenizer, texts, chunk_size, sample_out=label_sample)
 
     # ── Tokenize both instruction strings ─────────────────────────────────
     for variant in INSTRUCTION_VARIANTS:
@@ -545,20 +650,25 @@ def build_vocab(
     special_ids = _resolve_special_ids(tokenizer)
     used_ids.update(special_ids.values())
 
-    # Anchor our assembly against the tokenizer's own rendering BEFORE writing
-    # anything: a scaffold that disagrees must not reach a training run.
+    # Verify the scaffold BEFORE writing anything: one that disagrees with the
+    # tokenizer must not reach a training run.
+    #
+    # The boundary check is the one that matters and it always runs.  The
+    # template-anchored check is a bonus that needs a chat_template, which a
+    # Meta-format checkpoint directory does not ship — that is expected, not an
+    # error, so it degrades to a notice.  What it would add is confirmation that
+    # our turn LAYOUT matches Meta's template; that layout is a published spec
+    # and this project deliberately omits the template's system/date block
+    # anyway, so the check can only ever compare local windows.
+    _verify_scaffold_boundaries(tokenizer, label_sample)
+
     if getattr(tokenizer, "chat_template", None) is None:
-        message = (
-            f"the tokenizer in {llama_dir} carries no chat_template, so the "
-            "assembled chat scaffold cannot be anchored against "
-            "apply_chat_template.  Point --llama_dir at the Instruct model's "
-            "HuggingFace directory (its tokenizer_config.json carries the "
-            "template), or pass --allow_missing_chat_template to build the "
-            "vocabulary unverified."
+        print(
+            f"  note: {llama_dir} carries no chat_template (a Meta-format "
+            "checkpoint directory never does), so the turn layout was not "
+            "cross-checked against apply_chat_template. The splice boundaries "
+            "above were verified; see _verify_chat_scaffold for what this skips."
         )
-        if not allow_missing_chat_template:
-            raise ValueError(message)
-        print(f"  WARNING: {message}")
     else:
         _verify_chat_scaffold(tokenizer, special_ids)
 
@@ -673,14 +783,6 @@ def main() -> None:
         default=512,
         help="strings per processing batch (default: 512)",
     )
-    parser.add_argument(
-        "--allow_missing_chat_template",
-        action="store_true",
-        help=(
-            "build even when the tokenizer directory has no chat template to "
-            "anchor the assembled scaffold against (warns instead of raising)"
-        ),
-    )
     args = parser.parse_args()
 
     build_vocab(
@@ -689,7 +791,6 @@ def main() -> None:
         librispeech_dir=args.librispeech_dir,
         labels_file=args.labels_file,
         chunk_size=args.chunk_size,
-        allow_missing_chat_template=args.allow_missing_chat_template,
     )
 
 
@@ -710,6 +811,7 @@ def _self_test() -> None:
         "AUDIO": [104], "the quick brown fox": [105, 106, 107],
         "system": [108], "Cutting Knowledge": [109],
         INSTRUCTION_VARIANTS[0]: [110, 111, 112],
+        INSTRUCTION_VARIANTS[1]: [113, 114],
     }
     _BOS, _START, _END, _EOT = (
         LLAMA_CHAT_SPECIALS[k][1]
@@ -726,9 +828,19 @@ def _self_test() -> None:
             return None
 
         def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
-            if text not in _WORDS:
-                raise KeyError(f"fake tokenizer has no entry for {text!r}")
-            return list(_WORDS[text])
+            # Greedy longest-match over the word table.  Deliberately NOT a dict
+            # lookup: the boundary check tokenizes concatenations, and a faithful
+            # tokenizer must render "a" + "b" exactly as it renders "ab".
+            ids: list[int] = []
+            while text:
+                for word in sorted(_WORDS, key=len, reverse=True):
+                    if text.startswith(word):
+                        ids += _WORDS[word]
+                        text = text[len(word):]
+                        break
+                else:
+                    raise KeyError(f"fake tokenizer cannot encode {text!r}")
+            return ids
 
         def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
             # The real template always emits a system block first; our convention
@@ -797,6 +909,30 @@ def _self_test() -> None:
     else:
         raise AssertionError("a drifted chat template must be rejected")
     print("[OK] scaffold verification rejects a drifted template")
+
+    # ── _verify_scaffold_boundaries: the template-free check ─────────────────
+    # The fake tokenizer above is greedy-longest-match over _WORDS, so
+    # concatenations tokenize as the concatenation of their parts — a faithful
+    # tokenizer, which must pass.
+    _verify_scaffold_boundaries(tok, ["the quick brown fox"])
+    print("[OK] splice-boundary check passes on a tokenizer that never merges")
+
+    # A tokenizer that DOES merge across the "\n\n" -> transcript boundary must be
+    # caught: this is the failure the check exists for, and the only one that can
+    # happen without a chat template to compare against.
+    class _MergingTokenizer(_FakeTokenizer):
+        def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+            if text.startswith("\n\n") and len(text) > 2:
+                return [999]          # one fused token instead of "\n\n" + rest
+            return super().encode(text, add_special_tokens)
+
+    try:
+        _verify_scaffold_boundaries(_MergingTokenizer(), ["the quick brown fox"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a merge across a splice boundary must be rejected")
+    print("[OK] splice-boundary check rejects a merge across the boundary")
 
     # ── ChatTemplate offsets, in original id space ───────────────────────────
     class _Shim:
