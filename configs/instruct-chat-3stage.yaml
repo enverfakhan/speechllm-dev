@@ -113,6 +113,6 @@ stages:
     trainable:   [encoder, adapter, audio_adapters]
     lrs:         {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
     schedule:    {warmup_steps: 1000}
-    batch_size:  64              # ⚠ untested placeholder — see (f)
+    batch_size:  60              # ⚠ untested placeholder — see (f)
     accum_steps: 2
     exit:        {strategy: max_steps, threshold: 4680}
