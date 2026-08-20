@@ -61,7 +61,7 @@
 seed: 49                        # fresh line; decorrelate data order from 42-48
 model:
   init_from:          null      # scratch — see (d)
-  llama_ckpt:         weights/Llama3.1-8B-Instruct/
+  llama_ckpt:         /workspace/.llama/checkpoints/Llama3.1-8B-Instruct/
   input_convention:   chat
   bridge_type:        swiglu
   audio_adapter_r:    128
