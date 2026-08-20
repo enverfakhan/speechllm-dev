@@ -35,7 +35,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build import build_models
-from data import INSTRUCTION_VARIANTS, PrunedTokenizer, build_sorted_eval_dataloader
+from data import (
+    build_sorted_eval_dataloader,
+    load_pruned_config,
+    INSTRUCTION_VARIANTS,
+    PrunedTokenizer,
+)
+from model.sequence import ChatTemplate
 from utils.checkpoint import load_weights
 from utils.config import load_config
 from utils.evaluate import evaluate_all_splits
@@ -133,11 +139,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Device: {device}")
 
-    # ── Tokenizer + sep_token_id ──────────────────────────────────────────────
-    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
-        pc = json.load(f)
-    sep_token_id = pc["sep_token_id"]
-    tokenizer    = PrunedTokenizer(cfg.data.tokenizer)
+    # ── Tokenizer + terminator + input convention ─────────────────────────────
+    terminator_id = load_pruned_config(cfg.data.tokenizer).terminator_id
+    tokenizer     = PrunedTokenizer(cfg.data.tokenizer)
+
+    # Decoding must use the SAME sequence convention the checkpoints were trained
+    # under, or every hypothesis is generated from a prompt the model never saw.
+    chat: ChatTemplate | None = None
+    if cfg.model.input_convention == "chat":
+        chat = ChatTemplate.from_tokenizer(tokenizer)
+        print(f"Chat convention: audio offset {chat.audio_offset}, "
+              f"stop token <|eot_id|> = {chat.eot_token_id}")
 
     # ── Eval loaders (one per configured split) ───────────────────────────────
     eval_cfg = cfg.data.eval
@@ -254,12 +266,13 @@ def main(argv: list[str] | None = None) -> None:
             split_wer, split_samples = evaluate_all_splits(
                 encoder, adapter, llama,
                 {split_name: loader},
-                tokenizer, sep_token_id, device,
+                tokenizer, terminator_id, device,
                 max_batches       = max_batches,
                 n_samples         = n_samples,
                 sample_seed       = step,
                 formats           = args.formats,
                 progress_interval = progress_interval,
+                chat              = chat,
             )
             ckpt_wer_results.update(split_wer)
 

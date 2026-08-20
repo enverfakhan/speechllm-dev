@@ -23,10 +23,16 @@ import torch
 import torch.nn as nn
 
 from build import build_models
-from data import build_dataloader, list_shards, PrunedTokenizer, INSTRUCTION_VARIANTS
+from data import (
+    build_dataloader,
+    list_shards,
+    load_pruned_config,
+    INSTRUCTION_VARIANTS,
+    PrunedTokenizer,
+)
 from model.adapter import BridgeAdapter
 from model.llama import Llama
-from model.sequence import prepare_input
+from model.sequence import assemble_inputs, ChatTemplate
 from model.whisper_encoder import WhisperEncoder
 from metrics import MetricCollector, render
 from stages import Stage, StageContext
@@ -80,6 +86,15 @@ class RunState:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _marker(adapter: BridgeAdapter, chat: ChatTemplate | None, name: str):
+    """The bridge's audio_bos / audio_eos parameter, or None under the flat convention.
+
+    Keeps the "which convention are we in" branch in exactly one place instead of
+    at every assembly call site.
+    """
+    return getattr(adapter, name) if chat is not None else None
+
+
 def run_eval_pass(
     encoder:      WhisperEncoder,
     adapter:      BridgeAdapter,
@@ -87,10 +102,11 @@ def run_eval_pass(
     diag_loader:  torch.utils.data.DataLoader,
     diag_iter:    Any,
     metrics:      MetricCollector,
-    sep_token_id: int,
+    terminator_id: int,
     device:       torch.device,
     n_batches:    int,
     global_step:  int,
+    chat:         ChatTemplate | None = None,
 ) -> tuple[dict, list, Any]:
     """Run n_batches of teacher-forced eval on the diag shard.
 
@@ -117,13 +133,17 @@ def run_eval_pass(
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             d_enc  = encoder(d_mel)
             d_ada  = adapter(d_enc)
-            d_inp, d_lbl = prepare_input(
+            d_inp, d_lbl, d_mask = assemble_inputs(
                 d_ada, d_audio_len,
                 d_inst_ids, d_inst_lens,
                 d_trans_ids, d_trans_lens,
-                llama.embed_tokens, sep_token_id,
+                llama.embed_tokens, terminator_id,
+                chat=chat, audio_bos=_marker(adapter, chat, "audio_bos"),
+                audio_eos=_marker(adapter, chat, "audio_eos"),
             )
-            d_logits, d_loss = llama(d_inp, d_lbl, audio_lengths=d_audio_len)
+            d_logits, d_loss = llama(
+                d_inp, d_lbl, audio_lengths=d_audio_len, audio_mask=d_mask,
+            )
 
         metrics.observe("eval", global_step, logits=d_logits, labels=d_lbl, loss=d_loss.detach())
         retained.append((d_mel, d_audio_len, d_inst_ids, d_inst_lens, d_trans_ids, d_trans_lens))
@@ -145,9 +165,10 @@ def maybe_run_wer(
     adapter:      BridgeAdapter,
     llama:        Llama,
     tokenizer:    PrunedTokenizer,
-    sep_token_id: int,
+    terminator_id: int,
     device:       torch.device,
     use_wandb:    bool,
+    chat:         ChatTemplate | None = None,
 ) -> dict:
     """Optionally run greedy WER decode on retained eval batches.
 
@@ -177,7 +198,8 @@ def maybe_run_wer(
         gen_ids = greedy_generate(
             encoder, adapter, llama,
             mel, audio_lengths, inst_ids, inst_lens,
-            sep_token_id,
+            terminator_id,
+            chat=chat,
         )
         for i in range(len(gen_ids)):
             hyp = tokenizer.decode(gen_ids[i])
@@ -229,8 +251,9 @@ def run_stage(
     run:          RunState,
     cfg:          Config,
     device:       torch.device,
-    sep_token_id: int,
+    terminator_id: int,
     use_wandb:    bool,
+    chat:         ChatTemplate | None,
     ckpt_dir:     Path,
     baselines_data: dict,
     train_start:  float,
@@ -294,7 +317,7 @@ def run_stage(
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out     = encoder(mel)
                 adapter_out = adapter(enc_out)
-                inputs, labels = prepare_input(
+                inputs, labels, audio_mask = assemble_inputs(
                     adapter_out,
                     audio_lengths,
                     instruction_ids,
@@ -302,9 +325,18 @@ def run_stage(
                     transcript_ids,
                     transcript_lengths,
                     llama.embed_tokens,
-                    sep_token_id,
+                    terminator_id,
+                    chat      = chat,
+                    audio_bos = _marker(adapter, chat, "audio_bos"),
+                    audio_eos = _marker(adapter, chat, "audio_eos"),
                 )
-                logits, loss = llama(inputs, labels, audio_lengths=audio_lengths)
+                # audio_mask is None under the flat convention, where
+                # audio_lengths describes the layout on its own.
+                logits, loss = llama(
+                    inputs, labels,
+                    audio_lengths = audio_lengths,
+                    audio_mask    = audio_mask,
+                )
 
             metrics.observe("train", run.global_step, logits=logits, labels=labels)
             scaler.scale(loss / stage.accum_steps).backward()
@@ -362,14 +394,16 @@ def run_stage(
                 eval_metrics, eval_subset, diag_iter = run_eval_pass(
                     encoder, adapter, llama,
                     diag_loader, diag_iter,
-                    metrics, sep_token_id, device,
+                    metrics, terminator_id, device,
                     cfg.metrics.eval_batches,
                     run.global_step,
+                    chat=chat,
                 )
                 wer_metrics = maybe_run_wer(
                     cfg, eval_metrics, run.global_step, eval_subset,
                     encoder, adapter, llama, tokenizer,
-                    sep_token_id, device, use_wandb,
+                    terminator_id, device, use_wandb,
+                    chat=chat,
                 )
 
             # ── Train metrics flush ───────────────────────────────────────────
@@ -464,10 +498,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Device: {device}")
 
     # ── Pruned vocab ──────────────────────────────────────────────────────────
-    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
-        _pc         = json.load(f)
-    sep_token_id = _pc["sep_token_id"]
-    print(f"Pruned vocab: {_pc['vocab_size']} tokens  SEP id: {sep_token_id}")
+    pruned_cfg    = load_pruned_config(cfg.data.tokenizer)
+    terminator_id = pruned_cfg.terminator_id
+    print(
+        f"Pruned vocab: {pruned_cfg.vocab_size} tokens  "
+        f"terminator id: {terminator_id}  "
+        f"input_convention: {cfg.model.input_convention}"
+    )
 
     # ── Baselines (for W&B reference lines) ───────────────────────────────────
     baseline_path = Path("baselines.json")
@@ -488,13 +525,31 @@ def main(argv: list[str] | None = None) -> None:
     # ── Persistent scaler (shared across all stages) ──────────────────────────
     scaler = torch.amp.GradScaler("cuda")
 
-    # ── Tokenizer + MetricCollector ───────────────────────────────────────────
+    # ── Tokenizer + chat template + MetricCollector ───────────────────────────
     tokenizer = PrunedTokenizer(cfg.data.tokenizer)
+
+    # Built once per run: the scaffold segments are fixed, and building them per
+    # batch would re-tokenize the same four strings thousands of times.
+    chat: ChatTemplate | None = None
+    if cfg.model.input_convention == "chat":
+        chat = ChatTemplate.from_tokenizer(tokenizer)
+        if terminator_id != chat.eot_token_id:
+            raise ValueError(
+                f"terminator id {terminator_id} != <|eot_id|> {chat.eot_token_id}; "
+                "rebuild the vocabulary with tools/build_vocab.py"
+            )
+        print(
+            f"Chat convention: audio starts at offset {chat.audio_offset}, "
+            f"scaffold {len(chat.seg_pre_audio)}+{len(chat.seg_pre_instruction)}"
+            f"+{len(chat.seg_pre_transcript)}+1 tokens, eot id {chat.eot_token_id}"
+        )
+
     metrics   = MetricCollector(
-        tokenizer    = tokenizer,
-        sep_token_id = sep_token_id,
-        log_every    = cfg.metrics.eval_every,
-        top_k        = 5,
+        tokenizer     = tokenizer,
+        terminator_id = terminator_id,
+        vocab_size    = pruned_cfg.vocab_size,
+        log_every     = cfg.metrics.eval_every,
+        top_k         = 5,
     )
 
     # ── Shard list ────────────────────────────────────────────────────────────
@@ -526,7 +581,7 @@ def main(argv: list[str] | None = None) -> None:
         _diag_loader = build_dataloader(
             [str(cfg.data.diag_shard)],
             tokenizer_path        = cfg.data.tokenizer,
-            sep_token_id          = sep_token_id,
+            terminator_id         = terminator_id,
             batch_size            = cfg.metrics.eval_batch_size,
             num_workers           = 0,
             instruction_variants  = diag_instruction_pairs,
@@ -540,7 +595,7 @@ def main(argv: list[str] | None = None) -> None:
     ctx = StageContext(
         shards               = all_shards,
         tokenizer_path       = cfg.data.tokenizer,
-        sep_token_id         = sep_token_id,
+        terminator_id        = terminator_id,
         num_workers          = cfg.data.num_workers,
         seed                 = cfg.seed,
         instruction_pairs    = list(_INSTRUCTION_PAIRS),
@@ -569,6 +624,7 @@ def main(argv: list[str] | None = None) -> None:
                 "seed":                    cfg.seed,
                 "n_stages":                len(cfg.stages),
                 "instruction_mode":        cfg.run.instruction_mode,
+                "input_convention":        cfg.model.input_convention,
                 "stub":                    cfg.model.stub,
                 "gradient_checkpointing":  cfg.model.gradient_checkpointing,
                 "resume":                  str(cfg.resume) if cfg.resume else None,
@@ -640,7 +696,7 @@ def main(argv: list[str] | None = None) -> None:
             metrics, tokenizer,
             _diag_loader, _diag_iter,
             stage, stage_idx, run,
-            cfg, device, sep_token_id, use_wandb,
+            cfg, device, terminator_id, use_wandb, chat,
             ckpt_dir, baselines_data, train_start,
             modules_dirty,
         )

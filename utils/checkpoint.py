@@ -109,6 +109,40 @@ def _load_llama_state_tolerant(llama: nn.Module, state: dict) -> None:
         )
 
 
+# The two learned audio delimiter vectors the chat convention splices around the
+# audio (model/adapter.py).  Bridges built before the chat convention existed have
+# neither, so their checkpoints legitimately lack these two keys.
+_BRIDGE_MARKER_KEYS = ("audio_bos", "audio_eos")
+
+
+def _load_bridge_state_tolerant(adapter: nn.Module, state: dict) -> None:
+    """load_state_dict for the bridge, tolerating ONLY missing marker keys.
+
+    Same contract as _load_llama_state_tolerant: a checkpoint written before the
+    audio markers existed keeps its fresh (normal-init) markers and prints one
+    message; any OTHER missing key, or any unexpected key, stays a hard error.
+    A blanket strict=False would swallow a real bridge-variant mismatch — which
+    is exactly the mlp↔swiglu confusion this project wants to fail loudly.
+    """
+    result     = adapter.load_state_dict(state, strict=False)
+    missing    = list(result.missing_keys)
+    unexpected = list(result.unexpected_keys)
+
+    marker_missing = [k for k in missing if k in _BRIDGE_MARKER_KEYS]
+    other_missing  = [k for k in missing if k not in _BRIDGE_MARKER_KEYS]
+
+    if other_missing or unexpected:
+        raise RuntimeError(
+            f"Bridge checkpoint load failed: "
+            f"missing keys {other_missing}, unexpected keys {unexpected}"
+        )
+    if marker_missing:
+        print(
+            f"[load] audio marker(s) {marker_missing} not found in checkpoint "
+            "— keeping fresh init (pre-chat-convention bridge)"
+        )
+
+
 def _collect_audio_adapters(llama: nn.Module) -> dict[str, torch.Tensor]:
     """Return {param_name: cpu_tensor} for every gated audio-adapter parameter.
 
@@ -311,6 +345,9 @@ def load_weights(
             if key == "llama":
                 # Tolerate legacy llama state_dicts missing audio_adapter keys.
                 _load_llama_state_tolerant(module, ckpt[key])
+            elif key == "adapter":
+                # …and legacy bridges missing the audio marker vectors.
+                _load_bridge_state_tolerant(module, ckpt[key])
             else:
                 module.load_state_dict(ckpt[key])
             loaded.append(key)
@@ -389,7 +426,7 @@ def apply_full_checkpoint(
     """
     if encoder is not None and "encoder" in ckpt:
         encoder.load_state_dict(ckpt["encoder"])
-    adapter.load_state_dict(ckpt["adapter"])
+    _load_bridge_state_tolerant(adapter, ckpt["adapter"])
     if llama is not None and "llama" in ckpt:
         # Tolerate resuming a checkpoint written before audio adapters existed.
         _load_llama_state_tolerant(llama, ckpt["llama"])

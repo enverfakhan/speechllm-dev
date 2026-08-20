@@ -26,6 +26,8 @@ model:
   audio_adapter_type: mlp        # mlp (down→gelu→up) | swiglu (SwiGLU bottleneck)
   audio_adapter_zero_writer_layers: 0   # swiglu only: first N layers zero down_proj
                                         # instead of gate_proj (0 = none)
+  input_convention: flat         # flat ([audio][SEP][instruction][SEP][transcript][SEP])
+                                 # | chat (Llama 3.1 Instruct chat template, <|eot_id|> EOS)
 
 optim:
   betas: [0.9, 0.999]

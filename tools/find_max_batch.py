@@ -50,8 +50,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build import build_models
-from data import INSTRUCTION_VARIANTS
-from model.sequence import prepare_input
+from data import INSTRUCTION_VARIANTS, load_pruned_config
+from model.sequence import assemble_inputs, ChatTemplate
 from stages import Stage, StageContext
 from utils.config import Config, load_config
 
@@ -98,13 +98,26 @@ def _parse_args() -> argparse.Namespace:
 # ── Config plumbing ───────────────────────────────────────────────────────────
 
 def _vocab_meta(cfg: Config) -> tuple[int, int]:
-    """Read (vocab_size, sep_token_id) from the pruned tokenizer — ground truth."""
-    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
-        pruned = json.load(f)
-    return int(pruned["vocab_size"]), int(pruned["sep_token_id"])
+    """Read (vocab_size, terminator_id) from the pruned tokenizer — ground truth."""
+    pruned = load_pruned_config(cfg.data.tokenizer)
+    return pruned.vocab_size, pruned.terminator_id
 
 
-def _stage_context(cfg: Config, sep_token_id: int) -> StageContext:
+def _chat_template(cfg: Config) -> ChatTemplate | None:
+    """Build the run's ChatTemplate, or None under the flat convention.
+
+    The probe MUST assemble sequences the way the run will: the chat scaffold adds
+    fixed tokens per sample and the whole point of this tool is the sequence
+    length that fits in VRAM.  Loading the tokenizer is the only reason this tool
+    touches transformers, so it happens lazily, here.
+    """
+    if cfg.model.input_convention != "chat":
+        return None
+    from data import PrunedTokenizer
+    return ChatTemplate.from_tokenizer(PrunedTokenizer(cfg.data.tokenizer))
+
+
+def _stage_context(cfg: Config, terminator_id: int) -> StageContext:
     """Minimal StageContext for Stage.setup().
 
     Only betas/weight_decay reach the optimizer; the data fields exist because
@@ -115,7 +128,7 @@ def _stage_context(cfg: Config, sep_token_id: int) -> StageContext:
     return StageContext(
         shards               = [],
         tokenizer_path       = cfg.data.tokenizer,
-        sep_token_id         = sep_token_id,
+        terminator_id        = terminator_id,
         num_workers          = 0,
         seed                 = cfg.seed,
         instruction_pairs    = [
@@ -184,8 +197,9 @@ def _try_batch(
     batch_size:   int,
     accum_steps:  int,
     vocab_size:   int,
-    sep_token_id: int,
+    terminator_id: int,
     mel_frames:   int = _MEL_FRAMES,
+    chat:         ChatTemplate | None = None,
 ) -> tuple[bool, float, float]:
     """One training step: accum_steps micro-batches + clip + optimizer step.
 
@@ -209,16 +223,19 @@ def _try_batch(
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out = encoder(mel)
                 adp_out = adapter(enc_out)
-                inputs, labels = prepare_input(
+                inputs, labels, a_mask = assemble_inputs(
                     adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
-                    llama.embed_tokens, sep_token_id,
+                    llama.embed_tokens, terminator_id,
+                    chat      = chat,
+                    audio_bos = adapter.audio_bos if chat is not None else None,
+                    audio_eos = adapter.audio_eos if chat is not None else None,
                 )
-                _, loss = llama(inputs, labels, audio_lengths=a_lens)
+                _, loss = llama(inputs, labels, audio_lengths=a_lens, audio_mask=a_mask)
 
             (loss / accum_steps).backward()
 
             del mel, a_lens, inst_ids, inst_lens, tr_ids, tr_lens
-            del enc_out, adp_out, inputs, labels, loss
+            del enc_out, adp_out, inputs, labels, a_mask, loss
 
         if cfg.optim.grad_clip.enabled:
             torch.nn.utils.clip_grad_norm_(
@@ -248,7 +265,8 @@ def _try_batch_eval(
     llama:        torch.nn.Module,
     batch_size:   int,
     vocab_size:   int,
-    sep_token_id: int,
+    terminator_id: int,
+    chat:         ChatTemplate | None = None,
 ) -> tuple[bool, float, float]:
     """Forward-only pass under torch.no_grad().  Returns (fits, alloc_gb, reserved_gb)."""
     device = torch.device("cuda")
@@ -261,11 +279,14 @@ def _try_batch_eval(
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             enc_out = encoder(mel)
             adp_out = adapter(enc_out)
-            inputs, labels = prepare_input(
+            inputs, labels, a_mask = assemble_inputs(
                 adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
-                llama.embed_tokens, sep_token_id,
+                llama.embed_tokens, terminator_id,
+                chat      = chat,
+                audio_bos = adapter.audio_bos if chat is not None else None,
+                audio_eos = adapter.audio_eos if chat is not None else None,
             )
-            llama(inputs, labels, audio_lengths=a_lens)
+            llama(inputs, labels, audio_lengths=a_lens, audio_mask=a_mask)
 
         return (True,
                 torch.cuda.max_memory_allocated(device) / 1e9,
@@ -289,7 +310,8 @@ def _warmup_optimizer(
     llama:        torch.nn.Module,
     optimizer:    torch.optim.Optimizer,
     vocab_size:   int,
-    sep_token_id: int,
+    terminator_id: int,
+    chat:         ChatTemplate | None = None,
     n_steps:      int = 4,
 ) -> None:
     """Run n_steps real optimizer steps at batch=1 to materialise bnb 8-bit state.
@@ -302,8 +324,8 @@ def _warmup_optimizer(
         ok, _, _ = _try_batch(
             cfg, encoder, adapter, llama, optimizer,
             batch_size=1, accum_steps=1,
-            vocab_size=vocab_size, sep_token_id=sep_token_id,
-            mel_frames=_WARMUP_MEL,
+            vocab_size=vocab_size, terminator_id=terminator_id,
+            mel_frames=_WARMUP_MEL, chat=chat,
         )
         if not ok:
             raise SystemExit(
@@ -380,12 +402,20 @@ def main() -> None:
         sys.exit(1)
 
     cfg = load_config(args.config)
-    vocab_size, sep_token_id = _vocab_meta(cfg)
+    vocab_size, terminator_id = _vocab_meta(cfg)
+    chat = _chat_template(cfg)
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Total VRAM: {_TOTAL_VRAM_GB:.1f} GB")
     print(f"Config: {args.config}")
-    print(f"Vocab: {vocab_size} tokens  SEP id: {sep_token_id}")
+    print(f"Vocab: {vocab_size} tokens  terminator id: {terminator_id}")
+    _scaffold = (
+        0 if chat is None
+        else len(chat.seg_pre_audio) + 2 + len(chat.seg_pre_instruction)
+             + len(chat.seg_pre_transcript) + 1
+    )
+    print(f"Convention: {cfg.model.input_convention}"
+          + (f"  (+{_scaffold} scaffold/marker positions per sample)" if chat else ""))
     print(f"Sequence: {_MEL_FRAMES} mel frames → {_audio_tokens(_MEL_FRAMES)} audio tokens "
           f"+ {_INST_TOKS} instruction + {_TRANS_TOKS} transcript")
 
@@ -402,7 +432,7 @@ def main() -> None:
         print()
         best, alloc, reserved = _search(
             lambda bs: _try_batch_eval(
-                encoder, adapter, llama, bs, vocab_size, sep_token_id
+                encoder, adapter, llama, bs, vocab_size, terminator_id, chat
             ),
             args.min_batch, args.max_batch,
         )
@@ -433,11 +463,13 @@ def main() -> None:
     encoder, adapter, llama, _ = build_models(
         cfg, device, train=True, apply_init_from=False
     )
-    stage = Stage(stage_cfg, _stage_context(cfg, sep_token_id))
+    stage = Stage(stage_cfg, _stage_context(cfg, terminator_id))
     optimizer, _ = stage.setup(encoder, adapter, llama)   # prints the stage header
 
     print(f"Pre-warming optimizer (4 steps at batch=1, mel_t={_WARMUP_MEL}) …")
-    _warmup_optimizer(cfg, encoder, adapter, llama, optimizer, vocab_size, sep_token_id)
+    _warmup_optimizer(
+        cfg, encoder, adapter, llama, optimizer, vocab_size, terminator_id, chat,
+    )
     n_total = sum(len(g["params"]) for g in optimizer.param_groups)
     print(f"  bnb state = {_optimizer_state_gb(optimizer):.2f} GB  "
           f"entries = {len(optimizer.state)}/{n_total}")
@@ -450,7 +482,7 @@ def main() -> None:
         best, alloc, reserved = _search(
             lambda bs, _a=accum: _try_batch(
                 cfg, encoder, adapter, llama, optimizer, bs, _a,
-                vocab_size, sep_token_id,
+                vocab_size, terminator_id, chat=chat,
             ),
             args.min_batch, args.max_batch,
         )

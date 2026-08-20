@@ -582,18 +582,29 @@ class Llama(nn.Module):
         inputs_embeds: torch.Tensor,
         labels:        torch.Tensor | None = None,
         audio_lengths: torch.Tensor | None = None,
+        audio_mask:    torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a forward pass and optionally compute next-token-prediction loss.
+
+        Two ways to tell the gated audio adapters where the audio is; an explicit
+        audio_mask wins when both are given:
+
+          audio_mask     the authoritative (B, S, 1) mask, built by the caller
+                         that assembled the sequence (prepare_input_chat /
+                         EvalPrefixBatch).  Required under the chat convention,
+                         where the audio sits at a scaffold-dependent offset this
+                         module cannot know.
+          audio_lengths  the flat convention's shorthand: audio is the per-sample
+                         prefix [0, audio_lengths[i]), so the mask is derivable here.
 
         Args:
             inputs_embeds: (B, S, d_model) — full embedded sequence from prepare_input()
             labels:        (B, S) — -100 at masked positions; true token IDs at transcript
-            audio_lengths: (B,) — per-sample audio-token count; audio occupies
-                           positions [0, audio_lengths[i]).  When provided (and the
-                           model has audio adapters) it builds the audio mask so the
-                           adapters fire only at audio positions.  When None,
-                           the adapters stay inactive — text-only and stub self-test
-                           paths behave exactly as before.
+            audio_lengths: (B,) — per-sample audio-token count for the flat layout;
+                           ignored when audio_mask is given.  When both are None
+                           the adapters stay inactive — text-only and stub
+                           self-test paths behave exactly as before.
+            audio_mask:    (B, S, 1) — 1.0 at audio-content positions, 0.0 elsewhere
 
         Returns:
             logits: (B, S, vocab_size)
@@ -608,8 +619,14 @@ class Llama(nn.Module):
         # full-sequence branch output is the legible choice: audio lengths vary
         # across the batch, and audio dominates sequence length anyway, so
         # per-sample slicing would buy nothing but complexity.
-        audio_mask: torch.Tensor | None = None
-        if audio_lengths is not None and self._has_audio_adapters:
+        if audio_mask is not None:
+            if audio_mask.shape != (inputs_embeds.shape[0], S, 1):
+                raise ValueError(
+                    f"audio_mask shape {tuple(audio_mask.shape)} != expected "
+                    f"{(inputs_embeds.shape[0], S, 1)}"
+                )
+            audio_mask = audio_mask.to(inputs_embeds.dtype)
+        elif audio_lengths is not None and self._has_audio_adapters:
             positions  = torch.arange(S, device=inputs_embeds.device)
             audio_mask = (
                 (positions[None, :] < audio_lengths[:, None])   # (B, S) bool
@@ -782,6 +799,7 @@ class Llama(nn.Module):
         own_params = dict(self.named_parameters())
 
         loaded, skipped = 0, 0
+        loaded_keys: set[str] = set()
         for ckpt_key, tensor in state.items():
             our_key = _remap(ckpt_key)
             if our_key is None or our_key not in own_params:
@@ -804,6 +822,7 @@ class Llama(nn.Module):
                         with torch.no_grad():
                             param.copy_(pruned)
                         loaded += 1
+                        loaded_keys.add(our_key)
                         print(
                             f"[load_meta_weights] embed_tokens.weight initialised from "
                             f"pretrained rows (checkpoint {tuple(tensor.shape)} → "
@@ -824,12 +843,25 @@ class Llama(nn.Module):
             with torch.no_grad():
                 param.copy_(tensor)
             loaded += 1
+            loaded_keys.add(our_key)
 
         if loaded == 0:
             raise RuntimeError(
                 f"No parameters were loaded from '{checkpoint_dir}'. "
                 "Check that the checkpoint format is supported and the directory "
                 "contains the expected files."
+            )
+
+        # A caller that supplied vocab_map asked for a pretrained embedding.  If
+        # the checkpoint's key naming meant we never reached embed_tokens, the
+        # model would silently keep its random rows — including the chat
+        # specials, whose pretrained values are the reason they were forced into
+        # the vocabulary at all.  Fail instead.
+        if vocab_map is not None and "embed_tokens.weight" not in loaded_keys:
+            raise RuntimeError(
+                f"vocab_map was supplied but no embedding was loaded from "
+                f"'{checkpoint_dir}' — the token embedding would stay randomly "
+                "initialised. Check the checkpoint format/key names."
             )
 
 
@@ -910,6 +942,52 @@ if __name__ == "__main__":
         )
     print("[OK] mask correctness: only audio positions change when the branch is live")
 
+    # ── Test: explicit audio_mask argument (chat convention) ───────────────────
+    # Under the chat convention the audio sits at a constant SCAFFOLD offset, not
+    # at [0, T).  Llama.forward must use a caller-supplied mask verbatim, and an
+    # offset mask must reproduce what shifting the audio would produce — which is
+    # what proves the adapters fire where the mask says and nowhere else.
+    mask_model = Llama(cfg_on)
+    mask_model.eval()
+    for layer in mask_model.layers:
+        if layer.audio_adapter is not None:
+            layer.audio_adapter.up_proj.weight.data.normal_(mean=0.0, std=0.05)
+
+    OFFSET      = 3
+    lens        = torch.tensor([4, 2])
+    shifted     = torch.arange(S)[None, :]
+    offset_mask = (
+        ((shifted >= OFFSET) & (shifted < OFFSET + lens[:, None])).unsqueeze(-1).float()
+    )
+    with torch.no_grad():
+        by_mask, _    = mask_model(inputs, audio_mask=offset_mask)
+        by_lengths, _ = mask_model(inputs, audio_lengths=lens)
+        # An explicit mask WINS over audio_lengths when both are passed.
+        both, _       = mask_model(inputs, audio_lengths=lens, audio_mask=offset_mask)
+    assert torch.equal(by_mask, both), "explicit audio_mask must override audio_lengths"
+    assert not torch.allclose(by_mask, by_lengths, atol=1e-6), (
+        "an offset mask must differ from the [0, L) construction — otherwise the "
+        "mask argument is being ignored"
+    )
+
+    # The flat [0, L) construction must be reproducible through the explicit
+    # argument: same mask in, same logits out (regression guard on the flat path).
+    flat_mask = (torch.arange(S)[None, :] < lens[:, None]).unsqueeze(-1).float()
+    with torch.no_grad():
+        by_flat_mask, _ = mask_model(inputs, audio_mask=flat_mask)
+    assert torch.equal(by_flat_mask, by_lengths), (
+        "explicit [0, L) mask must match the audio_lengths path exactly"
+    )
+
+    # Wrong shape fails loudly rather than broadcasting into silence.
+    try:
+        mask_model(inputs, audio_mask=offset_mask.squeeze(-1))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a mis-shaped audio_mask must raise ValueError")
+    print("[OK] explicit audio_mask: honoured, overrides audio_lengths, shape-checked")
+
     # ── Test: gradient-checkpointing path, adapter-only training regime ─────────
     # Mirrors the real stage: pretrained params frozen, inputs_embeds require no
     # grad (frozen adapter/embed), only the audio adapters train.  use_reentrant
@@ -928,7 +1006,12 @@ if __name__ == "__main__":
     gc_inputs = torch.randn(B, S, D)                        # requires_grad=False (frozen upstream)
     gc_labels = torch.full((B, S), -100, dtype=torch.long)
     gc_labels[:, 7:] = torch.randint(0, cfg_on.vocab_size, (B, S - 7))
-    _, gc_loss = gc_model(gc_inputs, gc_labels, audio_lengths=audio_lengths)
+    # Pass the mask explicitly: it must survive the gradient-checkpointed layer
+    # calls exactly as the derived one does (this is the chat-convention path).
+    gc_mask = (
+        (torch.arange(S)[None, :] < audio_lengths[:, None]).unsqueeze(-1).float()
+    )
+    _, gc_loss = gc_model(gc_inputs, gc_labels, audio_mask=gc_mask)
     gc_loss.backward()
 
     aa_params = gc_model.audio_adapter_parameters()
