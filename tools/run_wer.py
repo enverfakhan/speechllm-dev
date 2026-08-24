@@ -55,7 +55,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build import build_models
-from data import INSTRUCTION_VARIANTS, PrunedTokenizer, build_sorted_eval_dataloader
+from data import (
+    build_sorted_eval_dataloader,
+    load_pruned_config,
+    INSTRUCTION_VARIANTS,
+    PrunedTokenizer,
+)
+from model.sequence import ChatTemplate
 from utils.checkpoint import apply_weights, read_checkpoint
 from utils.config import Config, load_config
 from utils.evaluate import compute_wer, evaluate_all_splits
@@ -262,11 +268,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Device: {device}")
 
-    # ── Tokenizer + sep_token_id ──────────────────────────────────────────────
-    with (cfg.data.tokenizer / "pruned_config.json").open() as f:
-        pc = json.load(f)
-    sep_token_id = pc["sep_token_id"]
-    tokenizer    = PrunedTokenizer(cfg.data.tokenizer)
+    # ── Tokenizer + terminator + input convention ─────────────────────────────
+    terminator_id = load_pruned_config(cfg.data.tokenizer).terminator_id
+    tokenizer     = PrunedTokenizer(cfg.data.tokenizer)
+
+    # Decoding must use the SAME sequence convention the checkpoints were trained
+    # under, or every hypothesis is generated from a prompt the model never saw.
+    chat: ChatTemplate | None = None
+    if cfg.model.input_convention == "chat":
+        chat = ChatTemplate.from_tokenizer(tokenizer)
+        print(f"Chat convention: audio offset {chat.audio_offset}, "
+              f"stop token <|eot_id|> = {chat.eot_token_id}")
 
     # ── Eval loaders (one per configured split) ───────────────────────────────
     eval_cfg = cfg.data.eval
@@ -405,12 +417,13 @@ def main(argv: list[str] | None = None) -> None:
             split_wer, split_samples, split_all = evaluate_all_splits(
                 encoder, adapter, llama,
                 {split_name: loader},
-                tokenizer, sep_token_id, device,
+                tokenizer, terminator_id, device,
                 max_batches       = max_batches,
                 n_samples         = n_samples,
                 sample_seed       = step,
                 formats           = args.formats,
                 progress_interval = progress_interval,
+                chat                      = chat,
                 return_all_transcriptions = True,
             )
             ckpt_wer_results.update(split_wer)
@@ -570,7 +583,9 @@ def _self_test() -> None:
         tmp     = Path(_td)
         tok_dir = tmp / "tokenizer"
         tok_dir.mkdir()
-        (tok_dir / "pruned_config.json").write_text(json.dumps({"sep_token_id": 40033}))
+        (tok_dir / "pruned_config.json").write_text(
+            json.dumps({"vocab_size": 40034, "sep_token_id": 40033})
+        )
 
         shard_dir = tmp / "shards"
         shard_dir.mkdir()
@@ -602,10 +617,14 @@ def _self_test() -> None:
         # Two utterances per (split, format) so the sampled cap (2) and the full
         # dump (4 rows per split) are distinguishable.
         def _fake_evaluate(   # mirrors evaluate_all_splits' signature
-            encoder, adapter, llama, eval_loaders, tokenizer, sep_token_id, device,
+            encoder, adapter, llama, eval_loaders, tokenizer, terminator_id, device,
             max_batches=None, n_samples=20, sample_seed=0, formats=None,
-            progress_interval=None, return_all_transcriptions=False,
+            progress_interval=None, chat=None, return_all_transcriptions=False,
         ):
+            # The fake config leaves input_convention at its "flat" default, so
+            # the tool must pass chat=None; a chat run is covered end-to-end by
+            # the stub smoke test instead.
+            assert chat is None, "flat config must not build a ChatTemplate"
             split = next(iter(eval_loaders))
             requested_splits.append(split)
             wer_dict, rows = {}, []

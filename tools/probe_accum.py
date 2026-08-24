@@ -38,10 +38,13 @@ from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_VOCAB_SIZE = 40034   # data/pruned_tokenizer/pruned_config.json is ground truth
+# data/pruned_tokenizer/pruned_config.json is ground truth; this standalone probe
+# hardcodes it (it builds a stub model, never a real tokenizer).  Update on every
+# tools/build_vocab.py rebuild — 40,039 for the chat-specials vocabulary.
+_VOCAB_SIZE = 40039
 _INST_TOKS  = 19     # the longer of data.py's two INSTRUCTION_VARIANTS
 _TRANS_TOKS = 50     # representative transcript length
-_SEP_ID     = _VOCAB_SIZE - 1
+_SEP_ID     = _VOCAB_SIZE - 1   # the terminator (<|eot_id|>) is the last row
 
 # GradScaler._unscale_ calls _amp_foreach_non_finite_check_and_unscale_cuda,
 # which is not implemented for BFloat16 even in PyTorch 2.8.  Use a fixed

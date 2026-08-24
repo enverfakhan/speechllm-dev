@@ -62,7 +62,7 @@ class StageContext:
     """
     shards:               list[str]
     tokenizer_path:       Path
-    sep_token_id:         int
+    terminator_id:        int   # EOS target: SEP (flat) or <|eot_id|> (chat)
     num_workers:          int
     seed:                 int
     # Both variants: [(unfmt_text, "unformatted.txt"), (fmt_text, "formatted.txt")]
@@ -336,7 +336,7 @@ class Stage:
         return data.build_dataloader(
             epoch_shards,
             tokenizer_path=ctx.tokenizer_path,
-            sep_token_id=ctx.sep_token_id,
+            terminator_id=ctx.terminator_id,
             batch_size=self._config.batch_size,
             num_workers=ctx.num_workers,
             instruction_variants=self._instruction_variants,
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     ctx = StageContext(
         shards               = fake_shards,
         tokenizer_path       = Path("data/pruned_tokenizer/"),
-        sep_token_id         = 40033,
+        terminator_id        = 40033,
         num_workers          = 0,
         seed                 = 42,
         instruction_pairs    = [
@@ -629,7 +629,7 @@ if __name__ == "__main__":
     captured: dict = {}
 
     def _mock_build_dataloader(
-        shards_arg, *, tokenizer_path, sep_token_id, batch_size,
+        shards_arg, *, tokenizer_path, terminator_id, batch_size,
         num_workers, instruction_variants, shuffle_buffer,
     ):
         captured["shards"]                = shards_arg

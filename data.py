@@ -42,6 +42,7 @@ import math
 import random
 import re
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,74 @@ INSTRUCTION_VARIANTS: list[str] = [
 ]
 
 
+@dataclass(frozen=True)
+class PrunedConfig:
+    """Contents of pruned_config.json — the vocabulary's ground truth.
+
+    tools/build_vocab.py writes it; build.py, training.py and the tools read it
+    instead of hardcoding sizes or ids.
+
+    The four chat special ids are None for a vocabulary built before the chat
+    convention existed (those files carry only ``sep_token_id``).  Such a
+    vocabulary can still run the flat convention — ``terminator_id`` resolves to
+    whichever EOS target the file defines — but not the chat one, which needs all
+    four (ChatTemplate.from_tokenizer says so loudly).
+    """
+
+    vocab_size:      int
+    terminator_id:   int          # the EOS target: eot under chat, SEP under flat
+    sep_token_id:    int | None = None
+    bos_token_id:    int | None = None
+    start_header_id: int | None = None
+    end_header_id:   int | None = None
+    eot_token_id:    int | None = None
+
+    @property
+    def chat_special_ids(self) -> dict[str, int | None]:
+        """The four chat scaffold specials, by pruned_config key name."""
+        return {
+            "bos_token_id":    self.bos_token_id,
+            "start_header_id": self.start_header_id,
+            "end_header_id":   self.end_header_id,
+            "eot_token_id":    self.eot_token_id,
+        }
+
+
+def load_pruned_config(tokenizer_path: Path | str) -> PrunedConfig:
+    """Read pruned_config.json from a pruned-tokenizer directory.
+
+    Args:
+        tokenizer_path: directory produced by tools/build_vocab.py
+
+    Returns:
+        PrunedConfig; terminator_id is eot_token_id when the vocabulary defines
+        it, else the legacy sep_token_id.
+
+    Raises:
+        ValueError: when the file defines neither terminator.
+    """
+    with (Path(tokenizer_path) / "pruned_config.json").open(encoding="utf-8") as f:
+        raw = json.load(f)
+
+    eot = raw.get("eot_token_id")
+    sep = raw.get("sep_token_id")
+    if eot is None and sep is None:
+        raise ValueError(
+            f"{tokenizer_path}/pruned_config.json defines no terminator "
+            "(needs eot_token_id, or sep_token_id for a legacy flat vocabulary)"
+        )
+
+    return PrunedConfig(
+        vocab_size      = int(raw["vocab_size"]),
+        terminator_id   = int(eot if eot is not None else sep),
+        sep_token_id    = sep,
+        bos_token_id    = raw.get("bos_token_id"),
+        start_header_id = raw.get("start_header_id"),
+        end_header_id   = raw.get("end_header_id"),
+        eot_token_id    = eot,
+    )
+
+
 class PrunedTokenizer:
     """Loads a HuggingFace tokenizer and remaps IDs to the pruned vocabulary space.
 
@@ -71,11 +140,12 @@ class PrunedTokenizer:
     """
 
     def __init__(self, tokenizer_path: Path) -> None:
-        """Load tokenizer files and vocab_map from tokenizer_path.
+        """Load tokenizer files, vocab_map and pruned_config from tokenizer_path.
 
         Args:
-            tokenizer_path: directory produced by scripts/build_vocab.py, containing
+            tokenizer_path: directory produced by tools/build_vocab.py, containing
                             the original Llama tokenizer files plus vocab_map.json
+                            and pruned_config.json
         """
         from transformers import AutoTokenizer
 
@@ -87,6 +157,29 @@ class PrunedTokenizer:
         self._vocab_map: dict[int, int] = {int(k): v for k, v in raw.items()}
         # Reverse map for decode(): pruned_id → original_id
         self._reverse_map: dict[int, int] = {v: k for k, v in self._vocab_map.items()}
+
+        # Vocabulary metadata, exposed as attributes so ChatTemplate.from_tokenizer
+        # (model/sequence.py) can read the four chat special ids straight off the
+        # tokenizer without importing anything from data.py.
+        self.config = load_pruned_config(tokenizer_path)
+        self.vocab_size:      int       = self.config.vocab_size
+        self.terminator_id:   int       = self.config.terminator_id
+        self.bos_token_id:    int | None = self.config.bos_token_id
+        self.start_header_id: int | None = self.config.start_header_id
+        self.end_header_id:   int | None = self.config.end_header_id
+        self.eot_token_id:    int | None = self.config.eot_token_id
+        # Never decoded back to text: these are scaffold, not transcript.  The
+        # tokenizer object itself may not even know them (a Meta-format
+        # tokenizer.model loaded through the TikToken fallback exposes no
+        # specials at all), so filter them here rather than relying on
+        # skip_special_tokens.
+        self._non_text_ids: frozenset[int] = frozenset(
+            i for i in (
+                self.config.terminator_id,
+                self.config.sep_token_id,
+                *self.config.chat_special_ids.values(),
+            ) if i is not None
+        )
 
     def encode(self, text: str) -> list[int]:
         """Tokenize text and remap to pruned vocabulary IDs.
@@ -107,8 +200,8 @@ class PrunedTokenizer:
     def decode(self, pruned_ids: list[int]) -> str:
         """Convert pruned vocabulary IDs back to a text string.
 
-        Silently skips any ID not present in the reverse map (e.g. the SEP
-        token 40147, which is never a valid transcript token).
+        Silently skips any ID not present in the reverse map, and every scaffold
+        id (SEP / the four chat specials), which is never valid transcript text.
 
         Args:
             pruned_ids: list of token IDs in the pruned vocabulary space
@@ -116,7 +209,10 @@ class PrunedTokenizer:
         Returns:
             decoded text string
         """
-        old_ids = [self._reverse_map[i] for i in pruned_ids if i in self._reverse_map]
+        old_ids = [
+            self._reverse_map[i] for i in pruned_ids
+            if i in self._reverse_map and i not in self._non_text_ids
+        ]
         return self._tok.decode(old_ids, skip_special_tokens=True)
 
 
@@ -150,7 +246,7 @@ def list_shards(pattern: str) -> list[str]:
 def build_dataloader(
     shard_pattern: str | list[str],
     tokenizer_path: Path,
-    sep_token_id: int,
+    terminator_id: int,
     batch_size: int,
     num_workers: int,
     instruction_variants: list[tuple[str, str]],
@@ -167,8 +263,12 @@ def build_dataloader(
         shard_pattern:        brace/glob pattern string, or an explicit list of
                               shard paths already in the desired consumption order
         tokenizer_path:       path to pruned tokenizer directory (build_vocab.py output)
-        sep_token_id:         SEP token ID in the pruned vocabulary; stored in
-                              pruned_config.json and forwarded to prepare_input()
+        terminator_id:        EOS token ID in the pruned vocabulary (SEP under the
+                              flat convention, <|eot_id|> under chat).  Not used for
+                              collation — the batch carries bare transcript ids and
+                              model/sequence.py appends the terminator during
+                              assembly — but kept here so a loader and the sequences
+                              built from it are configured from one place
         batch_size:           samples per batch; incomplete final batches are dropped
         num_workers:          DataLoader worker processes
         instruction_variants: list of (instruction_text, transcript_key) pairs.
@@ -468,6 +568,61 @@ if __name__ == "__main__":
         "Update both, then rebuild the vocabulary from the labels file."
     )
     print("  instruction variants match build_vocab.py   ok")
+
+    # ── load_pruned_config: chat vocabulary and legacy vocabulary ─────────────
+    import json as _json
+    import tempfile as _tf
+
+    from model.sequence import ChatTemplate as _ChatTemplate
+
+    with _tf.TemporaryDirectory() as _d:
+        _dir = Path(_d)
+        _chat_cfg = {
+            "vocab_size": 40039, "eot_token_id": 40038, "sep_token_id": 40038,
+            "bos_token_id": 40035, "start_header_id": 40036, "end_header_id": 40037,
+        }
+        (_dir / "pruned_config.json").write_text(_json.dumps(_chat_cfg))
+        _pc = load_pruned_config(_dir)
+        assert _pc.vocab_size == 40039
+        assert _pc.terminator_id == _pc.eot_token_id == 40038
+        assert all(v is not None for v in _pc.chat_special_ids.values())
+
+        # A vocabulary built before the chat convention: terminator falls back to
+        # SEP and the chat ids stay None, so the flat convention still runs and
+        # the chat one refuses loudly (rather than assembling a broken scaffold).
+        (_dir / "pruned_config.json").write_text(
+            _json.dumps({"vocab_size": 40034, "sep_token_id": 40033})
+        )
+        _legacy = load_pruned_config(_dir)
+        assert _legacy.terminator_id == 40033 and _legacy.eot_token_id is None
+
+        (_dir / "pruned_config.json").write_text(_json.dumps({"vocab_size": 10}))
+        try:
+            load_pruned_config(_dir)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a config with no terminator must raise")
+    print("  load_pruned_config: chat / legacy / terminator-less   ok")
+
+    # ── ChatTemplate reads its ids straight off a PrunedTokenizer ─────────────
+    # The attribute names are the contract between data.py and model/sequence.py;
+    # this catches a rename on either side.
+    class _MockChatTokenizer:
+        bos_token_id, start_header_id, end_header_id, eot_token_id = 1, 2, 3, 4
+
+        def encode(self, text: str) -> list[int]:
+            return {"user": [5], "assistant": [6], "\n\n": [7], "\n": [8]}[text]
+
+    _ct = _ChatTemplate.from_tokenizer(_MockChatTokenizer())
+    assert _ct.seg_pre_audio == (1, 2, 5, 3, 7), _ct.seg_pre_audio
+    assert _ct.eot_token_id == 4
+    for _attr in ("bos_token_id", "start_header_id", "end_header_id",
+                  "eot_token_id", "encode", "decode", "vocab_size", "terminator_id"):
+        assert hasattr(PrunedTokenizer, _attr) or _attr in PrunedTokenizer.__init__.__code__.co_names, (
+            f"PrunedTokenizer must expose {_attr} for ChatTemplate.from_tokenizer"
+        )
+    print("  PrunedTokenizer exposes the chat special ids   ok")
 
     # ── build_sorted_eval_dataloader self-test ────────────────────────────────
     with tempfile.TemporaryDirectory() as _tmp:

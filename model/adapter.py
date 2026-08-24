@@ -9,6 +9,10 @@ cfg.model.bridge_type via :func:`build_bridge_adapter`:
 
 Both start with a (near-)zero output projection so the audio embeddings entering
 Llama are ~zero at step 0.
+
+Both also carry the two learned audio delimiter vectors ``audio_bos`` /
+``audio_eos`` used by the chat input convention (model/sequence.py).  They ride
+in the bridge's parameter group and state_dict; the flat convention ignores them.
 """
 
 from __future__ import annotations
@@ -43,6 +47,38 @@ def _pool_time(encoder_out: torch.Tensor) -> torch.Tensor:
         encoder_out = F.pad(encoder_out, (0, 0, 0, _POOL_FACTOR - remainder))
         T = encoder_out.shape[1]
     return encoder_out.reshape(B, T // _POOL_FACTOR, _POOL_FACTOR, D).mean(dim=2)
+
+
+# Learned audio delimiter vectors (chat convention, model/sequence.py).  They are
+# input-only embeddings — deliberately NOT vocabulary tokens, so they own no
+# logit row and can never be generated.
+_MARKER_INIT_STD = 0.02
+
+
+def _init_audio_markers(module: nn.Module, llama_dim: int) -> None:
+    """Give *module* the two learned AUDIO_BOS / AUDIO_EOS marker vectors.
+
+    Shared by both bridge variants so the two stay identical in this respect.
+    The markers live on the bridge (not on Llama) for two reasons: they are part
+    of the audio-injection interface, and it puts them in the existing "adapter"
+    parameter group and the always-saved adapter state_dict for free — no new
+    module name in stages._MODULE_ORDER, no checkpoint-delta change.
+
+    Init is an ordinary normal(0, 0.02) — the near-zero rule that governs the
+    bridge's output projection does NOT apply here.  That rule exists because the
+    bridge output is the ENTIRE content of the audio positions, so an exactly-zero
+    write leaves a dead residual stream through a bias-free Llama.  The markers
+    are two positions among live scaffold embeddings, so they are never the whole
+    stream; normal init just matches the scale of the token embeddings beside them.
+
+    Args:
+        module:    the bridge to attach the markers to
+        llama_dim: Llama d_model — the marker vectors' dimension
+    """
+    module.audio_bos = nn.Parameter(torch.empty(llama_dim))
+    module.audio_eos = nn.Parameter(torch.empty(llama_dim))
+    nn.init.normal_(module.audio_bos, mean=0.0, std=_MARKER_INIT_STD)
+    nn.init.normal_(module.audio_eos, mean=0.0, std=_MARKER_INIT_STD)
 
 
 class AudioAdapter(nn.Module):
@@ -80,6 +116,10 @@ class AudioAdapter(nn.Module):
         # initialise output projection to near-zero so adapter starts as identity-ish
         nn.init.normal_(self.mlp[2].weight, mean=0.0, std=0.02 / math.sqrt(6))
         nn.init.zeros_(self.mlp[2].bias)
+
+        # Chat-convention audio delimiters; unused (but harmless) under the flat
+        # convention.  See _init_audio_markers for why plain normal init is safe.
+        _init_audio_markers(self, llama_dim)
 
         if pca_init_path is not None:
             self._load_pca_init(pca_init_path)
@@ -182,6 +222,10 @@ class AudioSwiGLUBridge(nn.Module):
         # class docstring before changing this to zeros_.
         nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02 / math.sqrt(6))
         nn.init.zeros_(self.down_proj.bias)
+
+        # Chat-convention audio delimiters; unused (but harmless) under the flat
+        # convention.  See _init_audio_markers for why plain normal init is safe.
+        _init_audio_markers(self, llama_dim)
 
         if pca_init_path is not None:
             self._load_pca_init(pca_init_path)
@@ -317,11 +361,41 @@ if __name__ == "__main__":
         out    = module(torch.randn(B, T, _ENCODER_DIM))
         target = torch.randn_like(out)
         (out - target).pow(2).mean().backward()
-        return {n: p.grad.abs().sum().item() for n, p in module.named_parameters()}
+        # grad is None for the marker vectors: bridge.forward never touches them
+        # (prepare_input splices them into the sequence).  Report them as 0.0
+        # rather than crashing; the caller filters them out.
+        return {
+            n: (p.grad.abs().sum().item() if p.grad is not None else 0.0)
+            for n, p in module.named_parameters()
+        }
 
-    g0 = _grads(sw_bridge)
+    # The markers are spliced by prepare_input, not by bridge.forward, so they
+    # legitimately get no gradient from this projection-only backward — they are
+    # exercised in the marker test below instead.
+    g0 = {n: v for n, v in _grads(sw_bridge).items() if "audio_" not in n}
     assert all(v > 0 for v in g0.values()), f"every bridge param must train at step 0: {g0}"
-    print("[OK] swiglu bridge: every parameter receives gradient at step 0")
+    print("[OK] swiglu bridge: every projection parameter receives gradient at step 0")
+
+    # ── Test: audio marker vectors ────────────────────────────────────────────
+    # They must exist on BOTH variants, be non-zero (they sit among live scaffold
+    # embeddings — the near-zero rule does not apply), train, and be captured by
+    # state_dict() so save_adapter_checkpoint carries them.
+    for name, bridge in [("mlp", mlp_bridge), ("swiglu", sw_bridge)]:
+        for marker in ("audio_bos", "audio_eos"):
+            vec = getattr(bridge, marker)
+            assert isinstance(vec, nn.Parameter),      f"{name}.{marker} must be a Parameter"
+            assert vec.shape == (LLAMA_DIM,),          f"{name}.{marker}: {tuple(vec.shape)}"
+            assert torch.count_nonzero(vec) > 0,       f"{name}.{marker} must not be zero-init"
+            assert marker in bridge.state_dict(),      f"{name}.{marker} missing from state_dict"
+    # Not the same vector: two distinct delimiters, independently initialised.
+    assert not torch.equal(sw_bridge.audio_bos, sw_bridge.audio_eos)
+
+    # Gradient reaches them when they are used (as prepare_input uses them).
+    sw_bridge.zero_grad(set_to_none=True)
+    (sw_bridge.audio_bos.sum() * 2 + sw_bridge.audio_eos.pow(2).sum()).backward()
+    assert sw_bridge.audio_bos.grad is not None and sw_bridge.audio_bos.grad.abs().sum() > 0
+    assert sw_bridge.audio_eos.grad is not None and sw_bridge.audio_eos.grad.abs().sum() > 0
+    print("[OK] both bridges: audio_bos/audio_eos exist, train, and are in state_dict()")
 
     # ── Test: unknown bridge type is rejected ─────────────────────────────────
     try:

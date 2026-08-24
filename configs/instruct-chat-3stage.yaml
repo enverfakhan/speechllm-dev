@@ -1,0 +1,118 @@
+# instruct-chat-3stage.yaml — Llama 3.1 8B INSTRUCT backbone + chat template
+#
+# A NEW EXPERIMENT LINE, not a fix of the D1 line.  Two changes from
+# staged_full_stack.yaml (Series D, banked at dev-clean/other 5.1 / 11.9):
+#
+#   1. The frozen LLM is Llama 3.1 8B *Instruct* instead of base.
+#   2. model.input_convention: chat — the sequence is assembled with the
+#      Instruct chat template instead of the flat [audio][SEP]… layout:
+#
+#        [bos][start_header]"user"[end_header]"\n\n"
+#            AUDIO_BOS [audio] AUDIO_EOS "\n" {instruction}
+#        [eot]
+#        [start_header]"assistant"[end_header]"\n\n"
+#            {transcript}
+#        [eot]                                   <- the EOS target
+#
+# (a) <|eot_id|> is now the ONLY terminator, retiring the accidental SEP: the
+#     old vocabulary picked id 127999 ("锦", an ordinary CJK token) because a
+#     Meta-format tokenizer exposes no specials to scan.  <|eot_id|> arrives
+#     with a real termination prior from Instruct post-training, and the model
+#     runs inside the assistant-response frame it was fine-tuned for.
+#     REQUIRES a rebuilt vocabulary — tools/build_vocab.py now forces the four
+#     chat specials in and writes their pruned ids into pruned_config.json.
+#     Point data.tokenizer at that rebuild, NOT at the base-model line's dir.
+#
+# (b) AUDIO_BOS / AUDIO_EOS are two learned vectors on the bridge, spliced as
+#     embeddings.  They are deliberately NOT vocabulary tokens: no logit row,
+#     so they can never be generated.  They train in stage 1 and stage 3 (they
+#     sit in the "adapter" param group) and ride in the adapter checkpoint.
+#
+# (c) Audio-first inside the user turn makes the audio start at a CONSTANT
+#     offset in every sample, which is what lets prepare_input_chat hand the
+#     in-layer adapters an exact mask.  Under this convention the audio is NOT
+#     at [0, audio_lengths[i]) — see model/sequence.py.
+#
+# (d) NO WARM START (model.init_from: null).  The D1 checkpoints were trained
+#     against the base backbone, the old vocabulary and the flat layout; every
+#     one of those three would be wrong here.  Bridge, in-layer adapters and
+#     markers all start fresh.  Early loss is therefore NOT comparable to D1's
+#     step-for-step — compare endpoints (WER at the stage handoffs).
+#
+# (e) THREE stages, not four: the joint bridge+adapters stage (old stage 3) is
+#     dropped per Finding D-iii.  LRs are otherwise the staged_full_stack ones.
+#
+# (f) ⚠ Stage 3's batch_size/accum_steps (64 × 2) is an UNTESTED PLACEHOLDER,
+#     copied from the base-model line.  The chat scaffold lengthens every
+#     sequence and the Instruct embedding table is a different tensor, so no
+#     earlier probe covers this.  find_max_batch.py assembles sequences under
+#     this file's input_convention, so re-probe BEFORE the run reaches stage 3:
+#         python tools/find_max_batch.py \
+#             --config configs/instruct-chat-3stage.yaml --stage 3
+#
+# (g) Each stage handoff (step*-stage-handoff.pt) is a WER measurement point:
+#         python tools/run_wer.py --config configs/instruct-chat-3stage.yaml \
+#             --checkpoints 'checkpoints/instruct-chat-3stage/*stage-handoff.pt' \
+#             --output results/instruct_chat_3stage_wer.csv --full
+#
+# Launch with:
+#   python training.py --config configs/instruct-chat-3stage.yaml
+
+seed: 49                        # fresh line; decorrelate data order from 42-48
+model:
+  init_from:          null      # scratch — see (d)
+  llama_ckpt:         /workspace/.llama/checkpoints/Llama3.1-8B-Instruct/
+  input_convention:   chat
+  bridge_type:        swiglu
+  audio_adapter_r:    128
+  audio_adapter_type: swiglu
+  audio_adapter_zero_writer_layers: 0
+data:
+  # ⚠ must be the vocabulary rebuilt WITH the chat specials
+  tokenizer:   data/pruned_tokenizer_chat/
+  shards_file: data/full_training_shards.txt
+  diag_shard:  data/full-eval-test-dev-clean-other.tar
+  num_workers: 32
+  eval:
+    dev_clean:  data/eval_subset_shards/dev-clean-480.tar
+    dev_other:  data/eval_subset_shards/dev-other-480.tar
+    test_clean: data/eval_subset_shards/test-clean-480.tar
+    test_other: data/eval_subset_shards/test-other-480.tar
+logging:
+  wandb:    true
+  project:  speechllm-auto-stage
+  run_name: instruct-chat-3stage
+checkpoint:
+  dir:        checkpoints/instruct-chat-3stage
+  save_every: 360
+metrics:
+  train_periods: {grads: 1, logits: 90, loss: 1}
+  eval_every:      90
+  eval_batches:    10
+  eval_batch_size: 64
+run:
+  max_steps:        15040        # 3 × 4680 + 1000
+  instruction_mode: both
+stages:
+  - name:        bridge_only
+    trainable:   [adapter]       # bridge + AUDIO_BOS/AUDIO_EOS markers
+    lrs:         {adapter: 1.0e-4}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
+
+  - name:        audio_adapters_only
+    trainable:   [audio_adapters]
+    lrs:         {audio_adapters: 1.0e-4}
+    schedule:    {warmup_steps: 250}
+    batch_size:  64
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 4680}
+
+  - name:        full_stack
+    trainable:   [encoder, adapter, audio_adapters]
+    lrs:         {encoder: 1.0e-5, adapter: 5.0e-5, audio_adapters: 5.0e-5}
+    schedule:    {warmup_steps: 1000}
+    batch_size:  60              
+    accum_steps: 2
+    exit:        {strategy: max_steps, threshold: 5680}
