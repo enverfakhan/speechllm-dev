@@ -109,6 +109,40 @@ def _load_llama_state_tolerant(llama: nn.Module, state: dict) -> None:
         )
 
 
+# The two learned audio delimiter vectors the chat convention splices around the
+# audio (model/adapter.py).  Bridges built before the chat convention existed have
+# neither, so their checkpoints legitimately lack these two keys.
+_BRIDGE_MARKER_KEYS = ("audio_bos", "audio_eos")
+
+
+def _load_bridge_state_tolerant(adapter: nn.Module, state: dict) -> None:
+    """load_state_dict for the bridge, tolerating ONLY missing marker keys.
+
+    Same contract as _load_llama_state_tolerant: a checkpoint written before the
+    audio markers existed keeps its fresh (normal-init) markers and prints one
+    message; any OTHER missing key, or any unexpected key, stays a hard error.
+    A blanket strict=False would swallow a real bridge-variant mismatch — which
+    is exactly the mlp↔swiglu confusion this project wants to fail loudly.
+    """
+    result     = adapter.load_state_dict(state, strict=False)
+    missing    = list(result.missing_keys)
+    unexpected = list(result.unexpected_keys)
+
+    marker_missing = [k for k in missing if k in _BRIDGE_MARKER_KEYS]
+    other_missing  = [k for k in missing if k not in _BRIDGE_MARKER_KEYS]
+
+    if other_missing or unexpected:
+        raise RuntimeError(
+            f"Bridge checkpoint load failed: "
+            f"missing keys {other_missing}, unexpected keys {unexpected}"
+        )
+    if marker_missing:
+        print(
+            f"[load] audio marker(s) {marker_missing} not found in checkpoint "
+            "— keeping fresh init (pre-chat-convention bridge)"
+        )
+
+
 def _collect_audio_adapters(llama: nn.Module) -> dict[str, torch.Tensor]:
     """Return {param_name: cpu_tensor} for every gated audio-adapter parameter.
 
@@ -295,6 +329,10 @@ def load_weights(
     Only loads state_dicts for the three model modules (encoder, adapter, llama).
     Optimizer, scaler, scheduler, step, epoch, etc. are silently skipped.
 
+    Thin wrapper over read_checkpoint + apply_weights.  A caller that also wants
+    the metadata (step / stage_index / kind / …) should use those two directly
+    so the file is read once — checkpoints run to tens of gigabytes.
+
     Args:
         path:    checkpoint file path
         encoder: WhisperEncoder module, or None to skip
@@ -304,13 +342,43 @@ def load_weights(
     Returns:
         list of module names that were actually loaded, in encoder→adapter→llama order
     """
-    ckpt = torch.load(path, map_location="cpu")
+    return apply_weights(
+        read_checkpoint(path), encoder=encoder, adapter=adapter, llama=llama,
+    )
+
+
+def apply_weights(
+    ckpt: dict,
+    *,
+    encoder: nn.Module | None = None,
+    adapter: nn.Module | None = None,
+    llama:   nn.Module | None = None,
+) -> list[str]:
+    """Overlay the weight keys of an already-loaded checkpoint dict onto modules.
+
+    Identical to load_weights but takes the dict instead of a path, so a caller
+    that needs checkpoint metadata (step, epoch, step_in_stage, stage_index,
+    kind, modules_dirty) can read the file once and use both halves — see
+    tools/run_wer.py, which tags every summary row with those fields.
+
+    Args:
+        ckpt:    checkpoint dict from read_checkpoint()
+        encoder: WhisperEncoder module, or None to skip
+        adapter: bridge adapter module, or None to skip
+        llama:   Llama module, or None to skip
+
+    Returns:
+        list of module names that were actually loaded, in encoder→adapter→llama order
+    """
     loaded: list[str] = []
     for key, module in [("encoder", encoder), ("adapter", adapter), ("llama", llama)]:
         if module is not None and key in ckpt:
             if key == "llama":
                 # Tolerate legacy llama state_dicts missing audio_adapter keys.
                 _load_llama_state_tolerant(module, ckpt[key])
+            elif key == "adapter":
+                # …and legacy bridges missing the audio marker vectors.
+                _load_bridge_state_tolerant(module, ckpt[key])
             else:
                 module.load_state_dict(ckpt[key])
             loaded.append(key)
@@ -389,7 +457,7 @@ def apply_full_checkpoint(
     """
     if encoder is not None and "encoder" in ckpt:
         encoder.load_state_dict(ckpt["encoder"])
-    adapter.load_state_dict(ckpt["adapter"])
+    _load_bridge_state_tolerant(adapter, ckpt["adapter"])
     if llama is not None and "llama" in ckpt:
         # Tolerate resuming a checkpoint written before audio adapters existed.
         _load_llama_state_tolerant(llama, ckpt["llama"])
@@ -689,6 +757,19 @@ if __name__ == "__main__":
         assert loaded_lw2 == ["adapter"], f"Expected ['adapter'], got {loaded_lw2}"
         assert torch.allclose(ada_t2.weight.data, ada_lw.weight.data), "adapter weight mismatch"
         print("  [OK] load_weights: only provided modules considered")
+
+        # ── 6b. apply_weights: same overlay from an already-read dict ─────────
+        # The one-read path used by tools/run_wer.py, which needs the metadata
+        # (step / stage_index / kind) alongside the weights.
+        raw_lw   = read_checkpoint(lw_path)
+        ada_t3   = nn.Linear(4, 4)
+        enc_t3   = nn.Linear(4, 4)
+        loaded_lw3 = apply_weights(raw_lw, encoder=enc_t3, adapter=ada_t3)
+        assert loaded_lw3 == loaded_lw, f"apply_weights disagrees with load_weights: {loaded_lw3}"
+        assert torch.allclose(enc_t3.weight.data, enc_lw.weight.data), "encoder weight mismatch"
+        assert torch.allclose(ada_t3.weight.data, ada_lw.weight.data), "adapter weight mismatch"
+        assert raw_lw["step"] == 99 and raw_lw["stage_index"] == 0, "metadata from the same read"
+        print("  [OK] apply_weights: dict overlay matches load_weights, metadata intact")
 
         # ── 7. audio-adapter back-compat: legacy llama ckpt → adapter-enabled model ──
         # Save a full checkpoint carrying a llama state_dict written BEFORE audio

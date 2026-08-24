@@ -77,6 +77,11 @@ class ModelConfig:
     # swiglu only: first N adapter layers zero their writer (down_proj) instead
     # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
     audio_adapter_zero_writer_layers: int = 0
+    # Sequence layout fed to Llama (see model/sequence.py):
+    #   "flat"  [audio] [SEP] [instruction] [SEP] [transcript] [SEP]
+    #   "chat"  the Llama 3.1 Instruct chat template, audio spliced into the user
+    #           turn between two learned marker vectors, <|eot_id|> as the EOS target
+    input_convention:       str         = "flat"
 
 
 @dataclass(frozen=True)
@@ -217,6 +222,7 @@ def _build_model(d: dict) -> ModelConfig:
         bridge_type            = str(d.get("bridge_type", "mlp")),
         audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
         audio_adapter_zero_writer_layers = int(d.get("audio_adapter_zero_writer_layers", 0)),
+        input_convention       = str(d.get("input_convention", "flat")),
     )
 
 
@@ -327,6 +333,8 @@ _VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
 # validate a YAML file).
 _VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
 _VALID_BRIDGE_TYPES        = {"mlp", "swiglu"}
+# Mirror model.sequence.INPUT_CONVENTIONS (same import-light reason as above).
+_VALID_INPUT_CONVENTIONS   = {"flat", "chat"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {
     "first_token_below", "eval_loss_below", "max_steps", "epochs", "never",
@@ -369,6 +377,11 @@ def _validate(cfg: Config) -> None:
         raise ValueError(
             f"model.audio_adapter_zero_writer_layers: must be >= 0, "
             f"got {cfg.model.audio_adapter_zero_writer_layers}"
+        )
+    if cfg.model.input_convention not in _VALID_INPUT_CONVENTIONS:
+        raise ValueError(
+            f"model.input_convention: must be one of "
+            f"{sorted(_VALID_INPUT_CONVENTIONS)}, got {cfg.model.input_convention!r}"
         )
     if cfg.model.audio_adapter_zero_writer_layers > 0 and cfg.model.audio_adapter_type != "swiglu":
         # The mlp variant already zeroes its writer in every layer, so the split
