@@ -295,6 +295,10 @@ def load_weights(
     Only loads state_dicts for the three model modules (encoder, adapter, llama).
     Optimizer, scaler, scheduler, step, epoch, etc. are silently skipped.
 
+    Thin wrapper over read_checkpoint + apply_weights.  A caller that also wants
+    the metadata (step / stage_index / kind / …) should use those two directly
+    so the file is read once — checkpoints run to tens of gigabytes.
+
     Args:
         path:    checkpoint file path
         encoder: WhisperEncoder module, or None to skip
@@ -304,7 +308,34 @@ def load_weights(
     Returns:
         list of module names that were actually loaded, in encoder→adapter→llama order
     """
-    ckpt = torch.load(path, map_location="cpu")
+    return apply_weights(
+        read_checkpoint(path), encoder=encoder, adapter=adapter, llama=llama,
+    )
+
+
+def apply_weights(
+    ckpt: dict,
+    *,
+    encoder: nn.Module | None = None,
+    adapter: nn.Module | None = None,
+    llama:   nn.Module | None = None,
+) -> list[str]:
+    """Overlay the weight keys of an already-loaded checkpoint dict onto modules.
+
+    Identical to load_weights but takes the dict instead of a path, so a caller
+    that needs checkpoint metadata (step, epoch, step_in_stage, stage_index,
+    kind, modules_dirty) can read the file once and use both halves — see
+    tools/run_wer.py, which tags every summary row with those fields.
+
+    Args:
+        ckpt:    checkpoint dict from read_checkpoint()
+        encoder: WhisperEncoder module, or None to skip
+        adapter: bridge adapter module, or None to skip
+        llama:   Llama module, or None to skip
+
+    Returns:
+        list of module names that were actually loaded, in encoder→adapter→llama order
+    """
     loaded: list[str] = []
     for key, module in [("encoder", encoder), ("adapter", adapter), ("llama", llama)]:
         if module is not None and key in ckpt:
@@ -689,6 +720,19 @@ if __name__ == "__main__":
         assert loaded_lw2 == ["adapter"], f"Expected ['adapter'], got {loaded_lw2}"
         assert torch.allclose(ada_t2.weight.data, ada_lw.weight.data), "adapter weight mismatch"
         print("  [OK] load_weights: only provided modules considered")
+
+        # ── 6b. apply_weights: same overlay from an already-read dict ─────────
+        # The one-read path used by tools/run_wer.py, which needs the metadata
+        # (step / stage_index / kind) alongside the weights.
+        raw_lw   = read_checkpoint(lw_path)
+        ada_t3   = nn.Linear(4, 4)
+        enc_t3   = nn.Linear(4, 4)
+        loaded_lw3 = apply_weights(raw_lw, encoder=enc_t3, adapter=ada_t3)
+        assert loaded_lw3 == loaded_lw, f"apply_weights disagrees with load_weights: {loaded_lw3}"
+        assert torch.allclose(enc_t3.weight.data, enc_lw.weight.data), "encoder weight mismatch"
+        assert torch.allclose(ada_t3.weight.data, ada_lw.weight.data), "adapter weight mismatch"
+        assert raw_lw["step"] == 99 and raw_lw["stage_index"] == 0, "metadata from the same read"
+        print("  [OK] apply_weights: dict overlay matches load_weights, metadata intact")
 
         # ── 7. audio-adapter back-compat: legacy llama ckpt → adapter-enabled model ──
         # Save a full checkpoint carrying a llama state_dict written BEFORE audio

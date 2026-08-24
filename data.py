@@ -257,18 +257,23 @@ def build_dataloader(
 
 
 def _eval_collate_batch(samples: list[tuple]) -> tuple:
-    """Collate a list of eval samples into a single 8-tuple batch.
+    """Collate a list of eval samples into a single 9-tuple batch.
 
-    Each sample is (mel_arr, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt) where
-    mel_arr is a float32 np.ndarray of shape (80, T).  Used by both
-    build_eval_dataloader and build_sorted_eval_dataloader so the two produce
-    identical tensor layouts.
+    Each sample is (mel_arr, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt, key) where
+    mel_arr is a float32 np.ndarray of shape (80, T) and key is the shard member
+    key (the LibriSpeech utterance id).  Used by both build_eval_dataloader and
+    build_sorted_eval_dataloader so the two produce identical tensor layouts.
+
+    The key rides along so post-hoc tools can attribute an individual
+    (reference, hypothesis) pair back to its utterance — WER alone cannot say
+    WHICH samples a checkpoint got wrong.  It is the last element so the
+    positional prefix stays what it always was.
 
     Returns:
         (mel, audio_lengths, unfmt_ids, unfmt_lens,
-         fmt_ids, fmt_lens, refs_unfmt, refs_fmt)
+         fmt_ids, fmt_lens, refs_unfmt, refs_fmt, keys)
     """
-    mels, unfmt_lists, fmt_lists, refs_unfmt, refs_fmt = zip(*samples)
+    mels, unfmt_lists, fmt_lists, refs_unfmt, refs_fmt, keys = zip(*samples)
     B = len(mels)
 
     T_list = [m.shape[1] for m in mels]
@@ -298,6 +303,7 @@ def _eval_collate_batch(samples: list[tuple]) -> tuple:
         unfmt_ids, unfmt_lens,
         fmt_ids,   fmt_lens,
         list(refs_unfmt), list(refs_fmt),
+        list(keys),
     )
 
 
@@ -322,12 +328,13 @@ def build_eval_dataloader(
         num_workers:          DataLoader worker processes
 
     Returns:
-        DataLoader yielding 8-tuples:
+        DataLoader yielding 9-tuples:
             (mel, audio_lengths,
              unformatted_ids, unformatted_lens,
              formatted_ids,   formatted_lens,
-             refs_unformatted, refs_formatted)
-        where refs_* are list[str] of raw reference transcripts
+             refs_unformatted, refs_formatted, keys)
+        where refs_* are list[str] of raw reference transcripts and keys is
+        list[str] of shard member keys (utterance ids)
     """
     tokenizer = PrunedTokenizer(tokenizer_path)
     ids_unfmt = tokenizer.encode(instruction_variants[0])
@@ -337,7 +344,7 @@ def build_eval_dataloader(
         mel       = np.load(io.BytesIO(sample["mel.npy"])).astype(np.float32)
         ref_unfmt = sample["unformatted.txt"].decode("utf-8")
         ref_fmt   = sample["formatted.txt"].decode("utf-8")
-        return (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt)
+        return (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt, sample["__key__"])
 
     dataset = (
         wds.WebDataset(str(shard_path), shardshuffle=False, nodesplitter=wds.split_by_node)
@@ -372,11 +379,12 @@ def build_sorted_eval_dataloader(
         batch_size:           samples per batch; final partial batch is included
 
     Returns:
-        List of 8-tuples in the same format as build_eval_dataloader:
+        List of 9-tuples in the same format as build_eval_dataloader:
             (mel, audio_lengths,
              unformatted_ids, unformatted_lens,
              formatted_ids,   formatted_lens,
-             refs_unformatted: list[str], refs_formatted: list[str])
+             refs_unformatted: list[str], refs_formatted: list[str],
+             keys: list[str])
         Batches are sorted ascending by audio_length; CPU tensors.
     """
     tokenizer = PrunedTokenizer(tokenizer_path)
@@ -401,15 +409,20 @@ def build_sorted_eval_dataloader(
     complete = {k: v for k, v in groups.items() if _REQUIRED <= set(v.keys())}
 
     # Decode mel arrays and compute audio_lengths; sort ascending.
-    raw: list[tuple[int, Any, str, str]] = []  # (audio_len, mel_arr, ref_unfmt, ref_fmt)
-    for members in complete.values():
+    # (audio_len, mel_arr, ref_unfmt, ref_fmt, key)
+    raw: list[tuple[int, Any, str, str, str]] = []
+    for key, members in complete.items():
         mel = np.load(io.BytesIO(members["mel.npy"])).astype(np.float32)
         T   = mel.shape[1]
         raw.append(
             ((T // 2 + 3) // 4, mel,
              members["unformatted.txt"].decode("utf-8"),
-             members["formatted.txt"].decode("utf-8")),
+             members["formatted.txt"].decode("utf-8"),
+             key),
         )
+    # Python's sort is stable and tarfile member order is fixed for a given
+    # file, so equal-length samples keep shard order — the batching (and hence
+    # every downstream per-sample position) is reproducible across runs.
     raw.sort(key=lambda x: x[0])
 
     # Chunk into contiguous batches and collate each one.
@@ -417,8 +430,8 @@ def build_sorted_eval_dataloader(
     for start in range(0, len(raw), batch_size):
         chunk = raw[start : start + batch_size]
         samples = [
-            (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt)
-            for (_, mel, ref_unfmt, ref_fmt) in chunk
+            (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt, key)
+            for (_, mel, ref_unfmt, ref_fmt, key) in chunk
         ]
         batches.append(_eval_collate_batch(samples))
 
@@ -524,9 +537,9 @@ if __name__ == "__main__":
                 f"Last batch should be partial (3), got {batches[-1][0].shape[0]}"
             )
 
-            # Check 8-tuple structure.
+            # Check 9-tuple structure.
             for _b in batches:
-                _mel, _al, _ui, _ul, _fi, _fl, _ru, _rf = _b
+                _mel, _al, _ui, _ul, _fi, _fl, _ru, _rf, _keys = _b
                 _B = _mel.shape[0]
                 assert _mel.shape[1] == 80,               "mel dim 1 should be 80"
                 assert _al.shape == (_B,),                "audio_lengths shape"
@@ -536,15 +549,24 @@ if __name__ == "__main__":
                 assert _fl.shape == (_B,),                "fmt_lens shape"
                 assert len(_ru) == _B,                    "refs_unfmt length"
                 assert len(_rf) == _B,                    "refs_fmt length"
+                assert len(_keys) == _B,                  "keys length"
 
             # Reference strings match what was written.
             _all_unfmt = []
             _all_fmt   = []
+            _all_keys  = []
             for _b in batches:
                 _all_unfmt.extend(_b[6])
                 _all_fmt.extend(_b[7])
+                _all_keys.extend(_b[8])
             assert all(_s.startswith("unfmt ") for _s in _all_unfmt), "unfmt refs wrong"
             assert all(_s.startswith("fmt ")   for _s in _all_fmt),   "fmt refs wrong"
+
+            # Keys survive the sort: every utterance id appears exactly once and
+            # each one still sits next to its own reference text.
+            assert sorted(_all_keys) == [f"sample-{_i:04d}" for _i in range(11)], _all_keys
+            for _k, _ru_s in zip(_all_keys, _all_unfmt):
+                assert _ru_s == f"unfmt {int(_k.split('-')[1])}", f"{_k} paired with {_ru_s!r}"
 
         finally:
             globals()["PrunedTokenizer"] = _orig_cls
