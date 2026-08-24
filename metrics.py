@@ -43,13 +43,14 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from data import PrunedTokenizer
 
-# Ground truth is data/pruned_tokenizer/pruned_config.json — build.py reads
-# vocab_size from there. This copy exists only to normalise entropy into a 0-1
-# fraction; update it whenever tools/build_vocab.py rebuilds the vocabulary.
-# (40,148 for the vocab built from the BasicTextNormalizer/spaCy labels;
-#  40,034 for the LLM-labelled corpus.)
-_VOCAB_SIZE  = 40034
-_MAX_ENTROPY = math.log(_VOCAB_SIZE)
+# Ground truth is data/pruned_tokenizer/pruned_config.json. MetricCollector takes
+# vocab_size as an argument (training.py passes what it read from that file), so
+# this constant is only the FALLBACK/self-test default — entropy normalisation is
+# no longer silently wrong when the vocabulary is rebuilt.
+# (40,148  BasicTextNormalizer/spaCy labels;
+#  40,034  LLM-labelled corpus, flat convention with the 锦 SEP;
+#  40,039  LLM-labelled corpus + the four Llama 3.1 chat specials.)
+_VOCAB_SIZE  = 40039
 
 
 # ── Shared intermediates for the logits family ────────────────────────────────
@@ -334,17 +335,21 @@ class FirstTokenVotesMetric(_Metric):
 
     def __init__(
         self,
-        phase:        str,
-        emit_period:  int,
-        top_k:        int,
-        tokenizer:    "PrunedTokenizer",
-        sep_token_id: int,
+        phase:         str,
+        emit_period:   int,
+        top_k:         int,
+        tokenizer:     "PrunedTokenizer",
+        terminator_id: int,
     ) -> None:
         self.phases      = {phase}
         self.emit_period = emit_period
         self._top_k      = top_k
         self._tok        = tokenizer
-        self._sep_id     = sep_token_id
+        # The EOS target: <|eot_id|> under the chat convention, SEP under the
+        # flat one.  The W&B key keeps its "sep_fraction" name for dashboard
+        # continuity — the signal (how often the model wants to terminate
+        # instead of transcribing) is unchanged.
+        self._sep_id     = terminator_id
         _s               = "train" if phase == "train" else "eval"
         _p               = "diag"  if phase == "train" else "diag_eval"
         self._k_top5     = f"{_p}/first_token_top5"
@@ -372,7 +377,9 @@ class FirstTokenVotesMetric(_Metric):
         top = sorted(self._votes.items(), key=lambda kv: kv[1], reverse=True)[: self._top_k]
         parts = []
         for tid, count in top:
-            tok_text = self._tok.decode([tid]) if tid != self._sep_id else "<SEP>"
+            # The terminator has no printable text (and PrunedTokenizer.decode
+            # filters it), so label it rather than showing an empty string.
+            tok_text = self._tok.decode([tid]) if tid != self._sep_id else "<EOS>"
             frac     = count / max(self._micros, 1)
             parts.append(f"'{tok_text}'({frac:.0%})")
         sep_frac = self._votes.get(self._sep_id, 0) / max(sum(self._votes.values()), 1)
@@ -392,7 +399,7 @@ class EntropyMetric(_Metric):
     input_family         = "logits"
     compute_only_on_emit = False
 
-    def __init__(self, phase: str, emit_period: int) -> None:
+    def __init__(self, phase: str, emit_period: int, vocab_size: int = _VOCAB_SIZE) -> None:
         self.phases      = {phase}
         self.emit_period = emit_period
         _s               = "train" if phase == "train" else "eval"
@@ -400,6 +407,9 @@ class EntropyMetric(_Metric):
         self.name        = [self._key]
         self._sum: float = 0.0
         self._n:   int   = 0
+        # Per-run normaliser: log(V) for THIS vocabulary, so the fraction stays
+        # comparable across runs after a vocabulary rebuild.
+        self._max_entropy = math.log(vocab_size)
 
     def update(self, *, inter: _LogitsInter) -> None:
         if inter.n_unmasked > 0:
@@ -409,7 +419,7 @@ class EntropyMetric(_Metric):
     def compute(self) -> dict[str, float | str]:
         if self._n == 0:
             return {}
-        return {self._key: (self._sum / self._n) / _MAX_ENTROPY}
+        return {self._key: (self._sum / self._n) / self._max_entropy}
 
     def reset(self) -> None:
         self._sum = 0.0
@@ -456,11 +466,12 @@ class GenEntropyMetric(_Metric):
     phases               = {"train"}
     compute_only_on_emit = False
 
-    def __init__(self, emit_period: int) -> None:
+    def __init__(self, emit_period: int, vocab_size: int = _VOCAB_SIZE) -> None:
         self.emit_period = emit_period
         self.name        = ["diag/gen_entropy", "diag/gen_entropy_fraction"]
         self._sum: float = 0.0
         self._n:   int   = 0
+        self._max_entropy = math.log(vocab_size)
 
     def update(
         self,
@@ -484,7 +495,7 @@ class GenEntropyMetric(_Metric):
         ge = self._sum / self._n
         return {
             "diag/gen_entropy":          ge,
-            "diag/gen_entropy_fraction": ge / _MAX_ENTROPY,
+            "diag/gen_entropy_fraction": ge / self._max_entropy,
         }
 
     def reset(self) -> None:
@@ -502,7 +513,7 @@ class MetricCollector:
 
     Typical usage::
 
-        collector = MetricCollector(tokenizer, sep_token_id, log_every=10)
+        collector = MetricCollector(tokenizer, terminator_id, vocab_size, log_every=10)
 
         # micro-step loop, after forward + backward:
         collector.observe("train", step, logits=logits, labels=labels)
@@ -523,10 +534,11 @@ class MetricCollector:
 
     def __init__(
         self,
-        tokenizer:    "PrunedTokenizer",
-        sep_token_id: int,
-        log_every:    int = 10,
-        top_k:        int = 5,
+        tokenizer:     "PrunedTokenizer",
+        terminator_id: int,
+        vocab_size:    int = _VOCAB_SIZE,
+        log_every:     int = 10,
+        top_k:         int = 5,
     ) -> None:
         self._log_every = log_every
 
@@ -536,16 +548,16 @@ class MetricCollector:
             # ── logits: train, emit every log_every steps ─────────────────────
             TokenBudgetMetric("train",   log_every),
             LossDecompositionMetric("train", log_every),
-            FirstTokenVotesMetric("train", log_every, top_k, tokenizer, sep_token_id),
-            EntropyMetric("train",        log_every),
+            FirstTokenVotesMetric("train", log_every, top_k, tokenizer, terminator_id),
+            EntropyMetric("train",        log_every, vocab_size),
             MaxLogitMetric("train",       log_every),
             # ── generation entropy: train, same cadence as logits metrics ──────
-            GenEntropyMetric(log_every),
+            GenEntropyMetric(log_every, vocab_size),
             # ── logits: eval, emit every eval pass ────────────────────────────
             TokenBudgetMetric("eval",    1),
             LossDecompositionMetric("eval",  1),
-            FirstTokenVotesMetric("eval",  1, top_k, tokenizer, sep_token_id),
-            EntropyMetric("eval",         1),
+            FirstTokenVotesMetric("eval",  1, top_k, tokenizer, terminator_id),
+            EntropyMetric("eval",         1, vocab_size),
             MaxLogitMetric("eval",        1),
         ]
 
@@ -757,15 +769,16 @@ if __name__ == "__main__":
         def decode(self, ids: list[int]) -> str:
             return f"w{ids[0]}"
 
-    SEP_ID    = _VOCAB_SIZE - 1
+    SEP_ID    = _VOCAB_SIZE - 1   # stands in for the terminator (eot / SEP)
     LOG_EVERY = 10
     B, L, V   = 3, 60, _VOCAB_SIZE
 
     collector = MetricCollector(
-        tokenizer    = _FakeTok(),
-        sep_token_id = SEP_ID,
-        log_every    = LOG_EVERY,
-        top_k        = 5,
+        tokenizer     = _FakeTok(),
+        terminator_id = SEP_ID,
+        vocab_size    = _VOCAB_SIZE,
+        log_every     = LOG_EVERY,
+        top_k         = 5,
     )
 
     # ── Synthetic data ────────────────────────────────────────────────────────
