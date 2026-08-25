@@ -17,6 +17,12 @@ Usage:
     python tools/run_wer.py --config ... --checkpoints ... --output ... \\
         --splits dev-clean dev-other
 
+    # Out-of-distribution sets (shards outside cfg.data.eval)
+    python tools/run_wer.py --config ... --checkpoints ... \\
+        --eval-tar tedlium3-test-le41=data/ood_shards/tedlium3-test/tedlium3-test-le41.tar \\
+        --dataset tedlium3-test-le41 --formats unformatted --full \\
+        --output results/ood/wer.csv
+
     # W&B logging
     python tools/run_wer.py --config ... --checkpoints ... --output ... --wandb
 
@@ -110,6 +116,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "colliding with this one's outputs.",
     )
     parser.add_argument(
+        "--eval-tar", nargs="+", default=None, dest="eval_tars", metavar="NAME=PATH",
+        help="Evaluate arbitrary eval shard .tar files instead of the four splits "
+             "in cfg.data.eval — the out-of-distribution protocol (TED-LIUM, "
+             "Common Voice, Earnings-22) points here.  NAME replaces the split "
+             "name on every summary and JSONL row, and names the per-checkpoint "
+             "JSONL ({step:07d}_{NAME}.jsonl), so an OOD sweep never collides "
+             "with a LibriSpeech one.  Mutually exclusive with --splits.",
+    )
+    parser.add_argument(
+        "--dataset", type=str, default=None, metavar="TAG",
+        help="Dataset tag written onto every summary and JSONL row.  Lets one "
+             "analysis read several corpora's dumps without inferring the corpus "
+             "from a filename.",
+    )
+    parser.add_argument(
         "--formats", nargs="+", choices=["unformatted", "formatted"],
         default=None, metavar="FORMAT",
         help="Instruction variant(s) to evaluate: 'unformatted', 'formatted', or both "
@@ -130,6 +151,42 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Torch device string (default: cuda if available, else cpu).",
     )
     return parser.parse_args(argv)
+
+
+def _parse_eval_tars(specs: list[str]) -> list[tuple[str, Path]]:
+    """Parse --eval-tar NAME=PATH arguments into (name, path) pairs.
+
+    The name is not cosmetic: it lands on every summary and JSONL row and names
+    the output files, so a typo that silently became a path stem would attribute
+    a corpus's results to the wrong dataset.  Hence the explicit form and the
+    loud failure.
+
+    Args:
+        specs: raw "NAME=PATH" strings
+
+    Returns:
+        (name, path) pairs, in the order given
+
+    Raises:
+        ValueError: a spec is missing "=", names a duplicate, or points nowhere
+    """
+    pairs: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for spec in specs:
+        name, sep, raw = spec.partition("=")
+        if not sep or not name or not raw:
+            raise ValueError(
+                f"--eval-tar expects NAME=PATH, got {spec!r} "
+                "(e.g. tedlium3-test=data/ood_shards/tedlium3-test/tedlium3-test-le41.tar)"
+            )
+        if name in seen:
+            raise ValueError(f"--eval-tar name {name!r} given twice")
+        path = Path(raw)
+        if not path.exists():
+            raise ValueError(f"--eval-tar {name}: {path} does not exist")
+        seen.add(name)
+        pairs.append((name, path))
+    return pairs
 
 
 def _expand_checkpoints(patterns: list[str]) -> list[Path]:
@@ -233,6 +290,7 @@ def _sample_wer(reference: str, hypothesis: str) -> float:
 
 def _write_transcriptions(
     path: Path, rows: list[dict], checkpoint: str, step: int,
+    dataset: str | None = None,
 ) -> None:
     """Write one JSONL row per evaluated sample per format.
 
@@ -246,6 +304,8 @@ def _write_transcriptions(
                         return_all_transcriptions=True)
         checkpoint: checkpoint path string, recorded on every row
         step:       global optimizer step of that checkpoint
+        dataset:    optional corpus tag (--dataset), recorded on every row so an
+                    analysis spanning several corpora need not parse filenames
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
@@ -253,6 +313,7 @@ def _write_transcriptions(
             f.write(json.dumps({
                 "checkpoint": checkpoint,
                 "step":       step,
+                **({"dataset": dataset} if dataset else {}),
                 **row,
                 "wer":        _sample_wer(row["reference"], row["hypothesis"]),
             }) + "\n")
@@ -280,18 +341,28 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Chat convention: audio offset {chat.audio_offset}, "
               f"stop token <|eot_id|> = {chat.eot_token_id}")
 
-    # ── Eval loaders (one per configured split) ───────────────────────────────
-    eval_cfg = cfg.data.eval
-    eval_shard_map: list[tuple[str, Path]] = [
-        ("dev-clean",  eval_cfg.dev_clean),
-        ("dev-other",  eval_cfg.dev_other),
-        ("test-clean", eval_cfg.test_clean),
-        ("test-other", eval_cfg.test_other),
-    ]
-    if args.splits is not None:
-        requested = set(args.splits)
-        eval_shard_map = [(n, p) for n, p in eval_shard_map if n in requested]
-        print(f"Splits restricted to: {', '.join(n for n, _ in eval_shard_map)}")
+    # ── Eval loaders (one per configured split, or per --eval-tar) ────────────
+    eval_shard_map: list[tuple[str, Path]]
+    if args.eval_tars:
+        if args.splits is not None:
+            print("[error] --eval-tar and --splits are mutually exclusive: --splits "
+                  "names the configured LibriSpeech splits, which --eval-tar replaces.")
+            sys.exit(1)
+        eval_shard_map = _parse_eval_tars(args.eval_tars)
+        print("Eval sets from --eval-tar: "
+              + ", ".join(f"{n} → {p}" for n, p in eval_shard_map))
+    else:
+        eval_cfg = cfg.data.eval
+        eval_shard_map = [
+            ("dev-clean",  eval_cfg.dev_clean),
+            ("dev-other",  eval_cfg.dev_other),
+            ("test-clean", eval_cfg.test_clean),
+            ("test-other", eval_cfg.test_other),
+        ]
+        if args.splits is not None:
+            requested = set(args.splits)
+            eval_shard_map = [(n, p) for n, p in eval_shard_map if n in requested]
+            print(f"Splits restricted to: {', '.join(n for n, _ in eval_shard_map)}")
 
     eval_loaders: dict[str, list[tuple]] = {}
     for split_name, shard_path in eval_shard_map:
@@ -431,7 +502,8 @@ def main(argv: list[str] | None = None) -> None:
             # Write EVERY transcription for this (step, split) immediately, so a
             # sweep that dies at checkpoint 9 still leaves 8 usable dumps behind.
             trans_path = args.output.parent / f"{step:07d}_{split_name}.jsonl"
-            _write_transcriptions(trans_path, split_all, str(ckpt_path), step)
+            _write_transcriptions(trans_path, split_all, str(ckpt_path), step,
+                                  dataset=args.dataset)
             print(f"  transcriptions → {trans_path.name}  ({len(split_all)} rows)")
 
             # The sampled subset stays capped at n_samples: it feeds a W&B table.
@@ -443,6 +515,7 @@ def main(argv: list[str] | None = None) -> None:
             all_rows.append({
                 "checkpoint": str(ckpt_path),
                 "step":       step,
+                **({"dataset": args.dataset} if args.dataset else {}),
                 "split":      split,
                 "format":     fmt,
                 "wer":        wer_val,
@@ -541,6 +614,36 @@ def _self_test() -> None:
             "step0000360.pt", "step0004680-stage-handoff.pt"
         ], explicit
         print("  [OK] _expand_checkpoints accepts explicit non-sidecar paths")
+
+    # ── 1b. --eval-tar parsing ────────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as _td:
+        tar_a = Path(_td) / "a.tar"
+        tar_b = Path(_td) / "b.tar"
+        tar_a.touch()
+        tar_b.touch()
+
+        pairs = _parse_eval_tars([f"ted={tar_a}", f"cv={tar_b}"])
+        assert pairs == [("ted", tar_a), ("cv", tar_b)], pairs
+
+        for spec, why in (
+            (f"{tar_a}",          "no NAME= prefix"),
+            ("ted=",              "empty path"),
+            (f"=/{tar_a}",        "empty name"),
+            ("ted=/nope/x.tar",   "path does not exist"),
+        ):
+            try:
+                _parse_eval_tars([spec])
+            except ValueError:
+                continue
+            raise AssertionError(f"_parse_eval_tars accepted {why}: {spec!r}")
+
+        try:
+            _parse_eval_tars([f"ted={tar_a}", f"ted={tar_b}"])
+        except ValueError as exc:
+            assert "twice" in str(exc), exc
+        else:
+            raise AssertionError("_parse_eval_tars accepted a duplicate name")
+        print("  [OK] _parse_eval_tars: pairs, and fails loudly on every malformed spec")
 
     # ── 2. Checkpoint metadata → summary columns ──────────────────────────────
     cfg_stages = [StageConfig(name=n) for n in
@@ -714,6 +817,47 @@ def _self_test() -> None:
             unfmt = next(g for g in groups if g.fmt == "unformatted")
             assert unfmt.counts["truncation"] == 1, unfmt.counts
             print("  [OK] count_degeneracies.py consumes the new JSONL unchanged")
+
+            # ── --eval-tar + --dataset: the out-of-distribution path ─────────
+            ood_tar = tmp / "tedlium3-test-le41.tar"
+            ood_tar.touch()
+            requested_splits.clear()
+            ood_csv = tmp / "ood" / "wer.csv"
+            main(argv=[
+                "--config", "unused.yaml",
+                "--checkpoints", str(ckpt_paths[0]),
+                "--eval-tar", f"tedlium3-test={ood_tar}",
+                "--dataset", "tedlium3-test",
+                "--formats", "unformatted",
+                "--output", str(ood_csv),
+                "--device", "cpu",
+                "--progress-interval", "0",
+            ])
+            assert requested_splits == ["tedlium3-test"], requested_splits
+            ood_jsonl = tmp / "ood" / "0004680_tedlium3-test.jsonl"
+            assert ood_jsonl.exists(), sorted((tmp / "ood").iterdir())
+            ood_rows = [json.loads(l) for l in ood_jsonl.read_text().splitlines()]
+            assert all(r["dataset"] == "tedlium3-test" for r in ood_rows), ood_rows[0]
+            assert all(r["split"] == "tedlium3-test" for r in ood_rows), ood_rows[0]
+            with ood_csv.open() as f:
+                ood_summary = list(csv.DictReader(f))
+            assert all(r["dataset"] == "tedlium3-test" for r in ood_summary), ood_summary
+            print("  [OK] --eval-tar names the loader, the JSONL and the dataset column")
+
+            # --eval-tar and --splits must not be combined: one replaces the other.
+            try:
+                main(argv=[
+                    "--config", "unused.yaml",
+                    "--checkpoints", str(ckpt_paths[0]),
+                    "--eval-tar", f"x={ood_tar}", "--splits", "dev-clean",
+                    "--output", str(tmp / "ood" / "x.csv"),
+                    "--device", "cpu", "--progress-interval", "0",
+                ])
+            except SystemExit as exc:
+                assert exc.code == 1, exc
+            else:
+                raise AssertionError("--eval-tar with --splits must exit")
+            print("  [OK] --eval-tar refuses to be combined with --splits")
         finally:
             globals().update(globals_backup)
 
