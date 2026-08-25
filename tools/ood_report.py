@@ -61,7 +61,13 @@ USAGE
         --ours    commonvoice-en-test=results/ood/0015040_commonvoice-en-test.jsonl \\
         --control commonvoice-en-test=out/ood-commonvoice-whisper.jsonl \\
         --coverage out/ood-vocab-coverage.json \\
+        --vocab    data/pruned_tokenizer/ \\
         --out-md out/ood-report.md --out-json out/ood-report.json
+
+``--vocab`` is optional and adds the fully-covered-utterances slice: the same
+table re-scored over the utterances whose reference the pruned vocabulary can
+actually emit, which is the only subset where our WER is a statement about the
+model rather than about Decision 005.
 
 ``--ours`` may be omitted while the model decode is still pending; the table is
 then a control-only baseline with the model columns left as "—".
@@ -164,6 +170,42 @@ def digit_keys(rows: list[dict], mode: str) -> frozenset[str]:
     )
 
 
+def uncovered_keys(rows: list[dict], mode: str, reach) -> frozenset[str]:
+    """Keys whose REFERENCE contains a token the pruned vocabulary cannot emit.
+
+    Unlike digit_keys this is a property of the reference alone, so both systems
+    necessarily produce the same set — but it is still collected per system and
+    unioned by the caller, for the same reason: an utterance that leaves one side
+    of the comparison must leave the other or the pairing breaks.
+
+    Reachability is decided by check_vocab_coverage.FullTokenizer, which OWNS the
+    definition — measuring it a second time here would let the subset drift away
+    from the coverage percentage printed beside it in the same table.  The test
+    is on the whole reference string, matching that tool's n_utterances_full.
+
+    Args:
+        rows:  per-utterance JSONL rows from either system
+        mode:  "unformatted" | "formatted"
+        reach: FullTokenizer over the vocabulary the model was trained on
+
+    Returns:
+        frozenset of utterance keys that are NOT fully reachable
+    """
+    out: set[str] = set()
+    memo: dict[str, bool] = {}
+    for row in rows:
+        if row.get("type") != mode or row.get("key") is None:
+            continue
+        ref = row["reference"]
+        full = memo.get(ref)
+        if full is None:
+            full = not reach.unreachable(ref)
+            memo[ref] = full
+        if not full:
+            out.add(row["key"])
+    return frozenset(out)
+
+
 def coverage_for(coverage: dict, dataset: str, mode: str) -> dict | None:
     """Find the coverage row for a dataset tag, allowing a shard-variant suffix.
 
@@ -188,8 +230,14 @@ def build_report(
     ours: dict[str, list[dict]],
     control: dict[str, list[dict]],
     coverage: dict,
+    reach=None,
 ) -> list[dict]:
-    """One record per (dataset, mode) present in either system's decodes."""
+    """One record per (dataset, mode) present in either system's decodes.
+
+    Args:
+        reach: optional FullTokenizer; when given, every record also carries a
+               "covered_only" slice scored over the fully-reachable utterances
+    """
     records: list[dict] = []
     for dataset in sorted(set(ours) | set(control)):
         our_rows  = ours.get(dataset, [])
@@ -247,6 +295,31 @@ def build_report(
                     "ours_wer":    our_df,
                     "control_wer": ctl_df,
                     "delta":       df_delta,
+                }
+
+            # The fully-covered subset: drop every utterance whose reference
+            # contains a word the model CANNOT emit.  On those the WER measures
+            # the vocabulary, not the model — a perfect transcription still
+            # scores an error — so this is the cleanest read of the two systems.
+            # It cuts both ways: the control has the full Llama-free vocabulary
+            # and pays no such floor, so restricting to covered utterances takes
+            # away OUR handicap, and the Δ here is the honest one.
+            if reach is not None:
+                skip = uncovered_keys(our_rows, mode, reach) | uncovered_keys(ctl_rows, mode, reach)
+                if common is not None:
+                    skip &= common
+                our_cv, our_cn = score(our_rows, mode, normalise, skip, common) if our_rows else (None, 0)
+                ctl_cv, ctl_cn = score(ctl_rows, mode, normalise, skip, common) if ctl_rows else (None, 0)
+                cv_delta = ((our_cv - ctl_cv)
+                            if (our_cv is not None and ctl_cv is not None) else None)
+                if cv_delta is not None and cv_delta != cv_delta:
+                    cv_delta = None
+                rec["covered_only"] = {
+                    "n":           our_cn or ctl_cn,
+                    "n_dropped":   len(skip),
+                    "ours_wer":    our_cv,
+                    "control_wer": ctl_cv,
+                    "delta":       cv_delta,
                 }
 
             rec["house_convention"] = {
@@ -330,6 +403,40 @@ def render_md(records: list[dict], coverage: dict) -> str:
             f"{_fmt_pct(df['ours_wer'])} | {_fmt_pct(df['control_wer'])} | "
             f"{'—' if delta is None else f'{delta:+.2%}'} |"
         )
+
+    if any(r.get("covered_only") for r in records):
+        out += [
+            "",
+            "### Fully-covered utterances only",
+            "",
+            "An utterance whose reference contains a word the pruned vocabulary "
+            "cannot emit is unscoreable for us at any model quality — a perfect "
+            "transcription still takes the error. The control carries no such "
+            "floor, so those rows measure Decision 005, not the model. Re-scored "
+            "over the utterances whose reference is fully reachable, with the "
+            "same utterances excluded from both systems:",
+            "",
+            "| dataset | mode | n (covered) | dropped | ours | whisper-small | Δ |",
+            "|---|---|---:|---:|---:|---:|---:|",
+        ]
+        for r in records:
+            cv = r.get("covered_only")
+            if not cv:
+                continue
+            delta = cv["delta"]
+            out.append(
+                f"| {r['dataset']} | {r['mode']} | {cv['n']:,} | {cv['n_dropped']:,} | "
+                f"{_fmt_pct(cv['ours_wer'])} | {_fmt_pct(cv['control_wer'])} | "
+                f"{'—' if delta is None else f'{delta:+.2%}'} |"
+            )
+        out += [
+            "",
+            "This slice removes the pruning floor, not the domain shift, and it is "
+            "independent of the digit-free slice above — verbatim rows here still "
+            "carry the numeral asymmetry. Note also that it is not a random subset: "
+            "unreachable words cluster in the long, topical, modern-vocabulary "
+            "utterances, so what survives is easier for both systems.",
+        ]
 
     flagged = [r for r in records if r.get("flag")]
     if flagged:
@@ -468,6 +575,30 @@ def _self_test() -> None:
     assert "+nan" not in render_md(none_mode, {}), render_md(none_mode, {})
     print("  [OK] unequal key sets score over the intersection; no NaN deltas render")
 
+    # Fully-covered slice, with a stub reachability oracle: "sixty" is the only
+    # unreachable word, so key "1" leaves BOTH systems and key "0" survives.
+    class _StubReach:
+        def unreachable(self, text: str) -> list[int]:
+            return [1] if "sixty" in text else []
+
+    cov_recs = build_report({"tedlium3-test-le41": ours}, {"tedlium3-test-le41": ctl},
+                            coverage, _StubReach())
+    cv = cov_recs[0]["covered_only"]
+    assert cv["n"] == 1 and cv["n_dropped"] == 1, cv
+    # The dropped utterance was the control's only error, so the covered-only Δ
+    # flips against us — the slice must be able to move the sign either way.
+    assert cv["control_wer"] == 0.0 and cv["delta"] > 0, cv
+    # Reference-derived, so it must not matter which system is asked.
+    assert (uncovered_keys(ours, "unformatted", _StubReach())
+            == uncovered_keys(ctl, "unformatted", _StubReach()) == {"1"})
+    # The formatted mode gets the slice too (digit_free is verbatim-only).
+    fmt = build_report({"d": [dict(r, type="formatted") for r in ours]}, {}, {}, _StubReach())[0]
+    assert "covered_only" in fmt and "digit_free" not in fmt, fmt
+    assert "Fully-covered utterances only" in render_md(cov_recs, coverage)
+    # Without --vocab the section stays out entirely.
+    assert "Fully-covered" not in render_md(recs, coverage)
+    print("  [OK] covered-only slice: same drops both sides, both modes, opt-in")
+
     md = render_md(recs, coverage)
     for needle in ("Whisper-small", "tedlium3-test-le41", "verbatim", "Digit rendering"):
         assert needle in md, needle
@@ -487,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Whisper-small control JSONL per dataset; repeatable.")
     p.add_argument("--coverage", type=Path, default=None,
                    help="tools/check_vocab_coverage.py --out-json output.")
+    p.add_argument("--vocab", type=Path, default=None,
+                   help="Pruned tokenizer dir (data/pruned_tokenizer/). When given, "
+                        "the report adds a WER slice over fully-reachable utterances.")
     p.add_argument("--out-md", type=Path, default=None, dest="out_md")
     p.add_argument("--out-json", type=Path, default=None, dest="out_json")
     p.add_argument("--self-test", action="store_true")
@@ -502,7 +636,12 @@ def main(argv: list[str] | None = None) -> int:
     control  = _parse_pairs(args.control)
     coverage = json.loads(args.coverage.read_text()) if args.coverage else {}
 
-    records = build_report(ours, control, coverage)
+    reach = None
+    if args.vocab:
+        from check_vocab_coverage import FullTokenizer
+        reach = FullTokenizer(args.vocab)
+
+    records = build_report(ours, control, coverage, reach)
     md = render_md(records, coverage)
     print(md)
 

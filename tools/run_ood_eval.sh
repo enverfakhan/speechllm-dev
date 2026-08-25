@@ -22,7 +22,8 @@
 #                    (PrunedTokenizer.encode drops ids it does not have)
 #   1. smoke       — one batch per set through the identical code path
 #   2. decode      — three run_wer.py invocations (see the note on grouping)
-#   3. report      — ood_report.py against the banked Whisper-small control
+#   3. report      — ood_report.py against the banked Whisper-small control,
+#                    including the fully-covered-utterances slice (--vocab)
 #   4. slices      — analyze_slices.py + count_degeneracies.py per set
 #
 # USAGE
@@ -203,6 +204,18 @@ else:
     print("  [ok] tokenizer, convention and backbone agree")
 PY
 
+# The vocabulary the decode actually ran under, taken from the SAME config the
+# preflight just validated rather than hardcoded — the chat line reads a
+# different tokenizer dir, and the covered-only slice must judge reachability
+# against the vocabulary the model was trained on, not against a default path.
+TOKENIZER_DIR="$(python -c "
+import sys; sys.path.insert(0, '.')
+from pathlib import Path
+from utils.config import load_config
+print(load_config(Path('$CONFIG')).data.tokenizer)
+")"
+echo "  vocabulary for the covered-only slice: $TOKENIZER_DIR"
+
 [[ $DRY_RUN -eq 0 ]] && mkdir -p "$OUT_DIR" "$REPORT_DIR"
 
 # ── Decode helper ────────────────────────────────────────────────────────────
@@ -294,10 +307,22 @@ else
   echo "       build it with tools/check_vocab_coverage.py."
 fi
 
+# The pruned tokenizer also drives the fully-covered-utterances slice: the same
+# table re-scored over references the vocabulary can actually emit.  Read it as
+# the model-only number, but read its n too — unreachable words cluster in the
+# LONG utterances, so the surviving subset is shorter and need not be easier.
+VOCAB_ARG_REPORT=()
+if [[ -d "$TOKENIZER_DIR" ]]; then
+  VOCAB_ARG_REPORT=(--vocab "$TOKENIZER_DIR")
+else
+  echo "[warn] $TOKENIZER_DIR not found — no fully-covered-utterances slice."
+fi
+
 run python tools/ood_report.py \
   --ours "${OURS_ARGS[@]}" \
   ${CONTROL_ARGS[0]+--control} "${CONTROL_ARGS[@]}" \
   "${COVERAGE_ARG[@]}" \
+  "${VOCAB_ARG_REPORT[@]}" \
   --out-md   "$REPORT_DIR/ood-$TAG-report.md" \
   --out-json "$REPORT_DIR/ood-$TAG-report.json"
 
@@ -337,4 +362,9 @@ Read the digit-free rows in the report on Earnings-22 (20.7% of its segments
 carry digits, and FORMATTING_SPEC §6 does not expand them), and read every WER
 next to its coverage column — at 49.7% utterance coverage the Earnings-22
 formatted row is not a model result.
+
+The "Fully-covered utterances only" table removes that pruning floor from both
+systems. It is NOT automatically the flattering number: unreachable words sit in
+the long utterances, so the surviving subset skews short, and short far-domain
+utterances are where this model loops instead of stopping.
 EOM
