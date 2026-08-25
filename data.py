@@ -460,6 +460,71 @@ def build_eval_dataloader(
     )
 
 
+@dataclass(frozen=True)
+class EvalSample:
+    """One utterance read out of an eval shard, before any batching.
+
+    ``audio_length`` is the adapter-token count of Decision 007
+    (``(T_mel // 2 + 3) // 4``) — encoder stride-2 floor, then pool-4 ceiling —
+    precomputed here because both consumers sort or budget by it.
+    """
+
+    key:             str          # shard member key = LibriSpeech utterance id
+    mel:             np.ndarray   # (80, T) float32
+    audio_length:    int
+    ref_unformatted: str
+    ref_formatted:   str
+
+
+def read_eval_shard(shard_path: str | Path) -> list[EvalSample]:
+    """Read every complete sample out of one eval .tar shard, in member order.
+
+    Uses stdlib tarfile rather than webdataset: deterministic, finite, and it
+    never loops.  Members are grouped by key (the text before the first "."),
+    and a key missing any of the three required members is skipped rather than
+    half-loaded.
+
+    The returned order is tarfile member order, which is fixed for a given file.
+    build_sorted_eval_dataloader relies on that for reproducible batching, and
+    tools/run_longform.py relies on it only through its own explicit sort.
+
+    Args:
+        shard_path: path to a single .tar shard
+
+    Returns:
+        list of EvalSample, in shard member order
+    """
+    groups: dict[str, dict[str, bytes]] = {}
+    with tarfile.open(Path(shard_path), "r") as tf:
+        for member in tf.getmembers():
+            dot = member.name.find(".")
+            if dot < 0:
+                continue
+            key = member.name[:dot]
+            ext = member.name[dot + 1:]
+            fobj = tf.extractfile(member)
+            if fobj is None:
+                continue
+            groups.setdefault(key, {})[ext] = fobj.read()
+
+    required = {"mel.npy", "unformatted.txt", "formatted.txt"}
+
+    out: list[EvalSample] = []
+    for key, members in groups.items():
+        if not required <= set(members.keys()):
+            continue
+        mel = np.load(io.BytesIO(members["mel.npy"])).astype(np.float32)
+        T   = mel.shape[1]
+        out.append(EvalSample(
+            key             = key,
+            mel             = mel,
+            audio_length    = (T // 2 + 3) // 4,
+            ref_unformatted = members["unformatted.txt"].decode("utf-8"),
+            ref_formatted   = members["formatted.txt"].decode("utf-8"),
+        ))
+    return out
+
+
 def build_sorted_eval_dataloader(
     shard_path: str | Path,
     tokenizer_path: Path,
@@ -491,47 +556,19 @@ def build_sorted_eval_dataloader(
     ids_unfmt = tokenizer.encode(instruction_variants[0])
     ids_fmt   = tokenizer.encode(instruction_variants[1])
 
-    # Read every member of the shard and group by key (split on first ".").
-    groups: dict[str, dict[str, bytes]] = {}
-    with tarfile.open(Path(shard_path), "r") as tf:
-        for member in tf.getmembers():
-            dot = member.name.find(".")
-            if dot < 0:
-                continue
-            key = member.name[:dot]
-            ext = member.name[dot + 1:]
-            fobj = tf.extractfile(member)
-            if fobj is None:
-                continue
-            groups.setdefault(key, {})[ext] = fobj.read()
-
-    _REQUIRED = {"mel.npy", "unformatted.txt", "formatted.txt"}
-    complete = {k: v for k, v in groups.items() if _REQUIRED <= set(v.keys())}
-
-    # Decode mel arrays and compute audio_lengths; sort ascending.
-    # (audio_len, mel_arr, ref_unfmt, ref_fmt, key)
-    raw: list[tuple[int, Any, str, str, str]] = []
-    for key, members in complete.items():
-        mel = np.load(io.BytesIO(members["mel.npy"])).astype(np.float32)
-        T   = mel.shape[1]
-        raw.append(
-            ((T // 2 + 3) // 4, mel,
-             members["unformatted.txt"].decode("utf-8"),
-             members["formatted.txt"].decode("utf-8"),
-             key),
-        )
-    # Python's sort is stable and tarfile member order is fixed for a given
-    # file, so equal-length samples keep shard order — the batching (and hence
-    # every downstream per-sample position) is reproducible across runs.
-    raw.sort(key=lambda x: x[0])
+    # Python's sort is stable and read_eval_shard returns tarfile member order,
+    # which is fixed for a given file, so equal-length samples keep shard order —
+    # the batching (and hence every downstream per-sample position) is
+    # reproducible across runs.
+    samples_in = sorted(read_eval_shard(shard_path), key=lambda s: s.audio_length)
 
     # Chunk into contiguous batches and collate each one.
     batches: list[tuple] = []
-    for start in range(0, len(raw), batch_size):
-        chunk = raw[start : start + batch_size]
+    for start in range(0, len(samples_in), batch_size):
+        chunk = samples_in[start : start + batch_size]
         samples = [
-            (mel, ids_unfmt, ids_fmt, ref_unfmt, ref_fmt, key)
-            for (_, mel, ref_unfmt, ref_fmt, key) in chunk
+            (s.mel, ids_unfmt, ids_fmt, s.ref_unformatted, s.ref_formatted, s.key)
+            for s in chunk
         ]
         batches.append(_eval_collate_batch(samples))
 
