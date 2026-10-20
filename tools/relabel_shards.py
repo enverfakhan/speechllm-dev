@@ -79,7 +79,7 @@ def load_labels(path: Path) -> Labels:
     """Read a labels JSONL into ok-text and failed-key sets.
 
     Accepts the output of tools/label_formatted.py finalize (which carries a
-    `validation` field) and of tools/precompute_labels.py (which does not — every
+    `validation` field) and of older labels files (which do not — every
     record is then treated as usable, matching that tool's own semantics).
     """
     labels = Labels()

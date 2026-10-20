@@ -1,7 +1,7 @@
 """Generate self-contained stub WebDataset shards for local stub runs.
 
 The stub configs (configs/stub*.yaml) used to point at data_dev/, a directory
-of REAL dev shards built by tools/make_dev_dataset.py from LibriSpeech audio —
+of REAL dev shards built from LibriSpeech audio (a since-removed tool) —
 so a fresh checkout could not run a stub at all.  A stub model is a tiny
 random Llama: it learns nothing from the audio, so the mel can be noise.  What
 must be real is the LABEL text, because PrunedTokenizer.encode silently drops

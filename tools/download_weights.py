@@ -8,7 +8,7 @@
    Meta/HuggingFace (requires licence acceptance — cannot be automated).
 
 Usage:
-    python scripts/download_weights.py --output_dir weights/
+    python tools/download_weights.py --output_dir weights/
 """
 
 from __future__ import annotations

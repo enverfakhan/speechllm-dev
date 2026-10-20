@@ -1,16 +1,14 @@
 # stub_probes.yaml — CPU/small-GPU sanity config for tools/run_probes.py.
 # Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
 #
-# A tiny randomly-initialised Llama under the CHAT convention, so the probe
+# A tiny randomly-initialised Llama, so the probe
 # harness can be exercised — prompt assembly for five different instruction
 # shapes, the audio mask, the TEXT-ONLY control (a prompt with no audio in it at
 # all), batching and the JSONL schema — without an 8B model or a pod.  The
 # hypotheses are garbage by construction; the plumbing and the prompts are what
 # is under test, which is why --print-prompts exists.
 #
-# Mirrors stub_longform.yaml: same tokenizer (the CHAT vocabulary — the probe
-# suite is aimed at the Instruct line), same swiglu bridge, and a non-zero
-# audio_adapter_r so the in-layer adapters actually read the audio mask.  That
+# Mirrors stub_longform.yaml: a non-zero audio_adapter_r so the in-layer adapters actually read the audio mask.  That
 # matters here for the same reason it matters there: the text-only P4 control
 # hands the model an all-zero mask, and with the adapters disabled nothing would
 # ever look at it.
@@ -23,12 +21,8 @@
 model:
   stub: true
   whisper_ckpt: null
-  input_convention:   chat
-  bridge_type:        swiglu
   audio_adapter_r:    16
-  audio_adapter_type: swiglu
 data:
-  tokenizer:   data/pruned_tokenizer_chat/
   shards: data_stub/stub-train-{000000..000001}.tar   # unused here; config validation wants one
   num_workers: 0
   eval:

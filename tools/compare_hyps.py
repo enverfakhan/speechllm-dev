@@ -42,10 +42,10 @@ for k in diffs[:5]:
 
 print()
 if not diffs:
-    print("PASS — every hypothesis is identical; the flat path is bit-for-bit intact.")
+    print("PASS — every hypothesis is identical; the decode path is bit-for-bit intact.")
 elif len(diffs) / len(shared) < 0.01:
     print(f"PASS (with noise) — {len(diffs)}/{len(shared)} differ (<1%), consistent with "
           "fp16 non-determinism rather than a code change. Eyeball the samples above.")
 else:
-    print(f"FAIL — {len(diffs)}/{len(shared)} hypotheses changed. The flat path is NOT intact.")
+    print(f"FAIL — {len(diffs)}/{len(shared)} hypotheses changed. The decode path is NOT intact.")
     sys.exit(1)

@@ -49,7 +49,7 @@ USAGE
 -----
     python tools/prepare_ood_earnings22.py --download \\
         --output_dir data/ood_shards/earnings22/ \\
-        --tokenizer  data/pruned_tokenizer/ \\
+        --tokenizer  data/pruned_tokenizer_chat/ \\
         --sources 40 --n 2000 --seed 42
 
     python tools/prepare_ood_earnings22.py --self-test
@@ -455,7 +455,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--download", action=argparse.BooleanOptionalAction, default=True,
                    help="Fetch missing metadata and per-call tarballs (default: on).")
     p.add_argument("--output_dir", type=Path, default=Path("data/ood_shards/earnings22/"))
-    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer/"))
+    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer_chat/"))
     p.add_argument("--n", type=int, default=2000, help="Target segment count.")
     p.add_argument("--sources", type=int, default=40, dest="n_sources",
                    help="Calls to draw from, at ~80 MB each (default: 40 of 125).")

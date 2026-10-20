@@ -1,7 +1,7 @@
 # stub_longform.yaml — CPU/small-GPU sanity config for tools/run_longform.py.
 # Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
 #
-# A tiny randomly-initialised Llama under the CHAT convention, so the multi-turn
+# A tiny randomly-initialised Llama, so the multi-turn
 # harness can be exercised — sequence layout, audio masks across several turns,
 # batching, JSONL schema — without an 8B model or a pod.  The hypotheses are
 # garbage by construction; the plumbing is what is under test.
@@ -17,12 +17,8 @@
 model:
   stub: true
   whisper_ckpt: null
-  input_convention:   chat
-  bridge_type:        swiglu
   audio_adapter_r:    16
-  audio_adapter_type: swiglu
 data:
-  tokenizer:   data/pruned_tokenizer_chat/
   shards: data_stub/stub-train-{000000..000001}.tar   # unused here; config validation wants one
   num_workers: 0
 logging: {wandb: false, project: speech-llm-dev}

@@ -10,7 +10,7 @@ import json
 import torch
 
 from data import load_pruned_config
-from model.adapter import build_bridge_adapter, BridgeAdapter
+from model.adapter import AudioSwiGLUBridge
 from model.llama import Llama, LlamaConfig
 from model.whisper_encoder import WhisperEncoder
 from utils.checkpoint import load_weights
@@ -31,11 +31,14 @@ def _report_special_rows(llama: Llama, vocab_map: dict, tokenizer_dir) -> None:
         vocab_map:     {str(old_id): new_id} used for the pruned embedding init
         tokenizer_dir: pruned tokenizer directory (for the error message)
     """
-    pruned = load_pruned_config(tokenizer_dir)
-    ids    = {k: v for k, v in pruned.chat_special_ids.items() if v is not None}
-    if not ids:
-        print("[build] vocabulary defines no chat specials (flat-convention vocab)")
-        return
+    pruned  = load_pruned_config(tokenizer_dir)
+    ids     = pruned.chat_special_ids
+    missing = sorted(k for k, v in ids.items() if v is None)
+    if missing:
+        raise ValueError(
+            f"{tokenizer_dir}: vocabulary defines no {missing} — the chat template "
+            "needs all four; rebuild it with tools/build_vocab.py"
+        )
 
     reverse = {new: int(old) for old, new in vocab_map.items()}
     rows    = llama.embed_tokens.weight
@@ -61,7 +64,7 @@ def build_models(
     *,
     train: bool = True,
     apply_init_from: bool = True,
-) -> tuple[WhisperEncoder, BridgeAdapter, Llama, list[str]]:
+) -> tuple[WhisperEncoder, AudioSwiGLUBridge, Llama, list[str]]:
     """Instantiate and initialise all three model components.
 
     Args:
@@ -91,8 +94,6 @@ def build_models(
             **cfg.model.stub_dims,
             vocab_size=vocab_size,
             audio_adapter_r=cfg.model.audio_adapter_r,
-            audio_adapter_type=cfg.model.audio_adapter_type,
-            audio_adapter_zero_writer_layers=cfg.model.audio_adapter_zero_writer_layers,
         )
         llama_dim = cfg.model.stub_dims["d_model"]
         print("STUB mode: tiny randomly-initialised model (no pretrained weights).")
@@ -100,17 +101,11 @@ def build_models(
         llama_cfg = LlamaConfig(
             vocab_size=vocab_size,
             audio_adapter_r=cfg.model.audio_adapter_r,
-            audio_adapter_type=cfg.model.audio_adapter_type,
-            audio_adapter_zero_writer_layers=cfg.model.audio_adapter_zero_writer_layers,
         )
         llama_dim = 4096
 
     encoder = WhisperEncoder()
-    adapter = build_bridge_adapter(
-        cfg.model.bridge_type,
-        llama_dim=llama_dim,
-        pca_init_path=cfg.model.adapter_pca_init,
-    )
+    adapter = AudioSwiGLUBridge(llama_dim=llama_dim)
     llama = Llama(llama_cfg)
 
     if not cfg.model.stub:

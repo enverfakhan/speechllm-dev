@@ -18,7 +18,7 @@
 #
 # WHAT IT RUNS
 #   0. preflight   — resolve the config and refuse to decode with the wrong
-#                    tokenizer or input convention, which fail SILENTLY
+#                    tokenizer or backbone, which fail SILENTLY
 #                    (PrunedTokenizer.encode drops ids it does not have)
 #   1. smoke       — one batch per set through the identical code path
 #   2. decode      — three run_wer.py invocations (see the note on grouping)
@@ -27,26 +27,23 @@
 #   4. slices      — analyze_slices.py + count_degeneracies.py per set
 #
 # USAGE
-#   tools/run_ood_eval.sh --checkpoint checkpoints/staged-full-stack/step0018720.pt
+#   tools/run_ood_eval.sh --checkpoint checkpoints/instruct-chat-3stage/step0015040.pt
 #
 #   tools/run_ood_eval.sh --checkpoint ... --dry-run      # print, run nothing
 #   tools/run_ood_eval.sh --checkpoint ... --smoke-only   # 1 batch/set, then stop
 #   tools/run_ood_eval.sh --checkpoint ... --skip-smoke   # straight to the full decode
 #   tools/run_ood_eval.sh --checkpoint ... --max-batches 4  # cap the "full" pass
 #
-#   The two preflight checks that match on PATH NAMES (chat vocabulary, Instruct
-#   backbone) are heuristics.  If your directories are named differently, pass
-#   --force to downgrade them to warnings; the existence checks always apply.
-#
-#   For the chat line, pass its config — everything else is the same:
-#   tools/run_ood_eval.sh --config configs/instruct-chat-3stage_resume.yaml \
-#       --checkpoint checkpoints/instruct-chat-3stage/step0018720.pt --tag chat
+#   The Instruct-backbone check matches on the PATH NAME and is a heuristic;
+#   if your directory is named differently, pass --force to downgrade it to a
+#   warning.  The tokenizer checks (exists, defines the chat specials) always
+#   apply.
 #
 set -euo pipefail
 
-CONFIG="configs/staged_full_stack.yaml"
+CONFIG="configs/instruct-chat-3stage.yaml"
 CHECKPOINT=""
-TAG="base"
+TAG="chat"
 SHARDS_DIR="data/ood_shards"
 CONTROL_DIR="out"
 REPORT_DIR="out"
@@ -141,15 +138,15 @@ for f in "${CONTROL_FILES[@]}"; do
 done
 [[ $MISSING_CONTROL -eq 1 ]] && echo "[warn] the report will have no Δ column for those sets."
 
-# The decode must use the SAME tokenizer and input convention the checkpoint was
-# trained under.  Neither mismatch raises: PrunedTokenizer.encode silently drops
-# unmapped ids, and the flat/chat assembly difference just produces a prompt the
-# model never saw.  Both come out as a plausible-looking bad WER.
+# The decode must use the SAME tokenizer and backbone the checkpoint was trained
+# under.  A wrong vocabulary does not raise: PrunedTokenizer.encode silently
+# drops unmapped ids, which comes out as a plausible-looking bad WER.
 python - "$CONFIG" "$CHECKPOINT" "$FORCE" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, ".")
 from utils.config import load_config
+from data import load_pruned_config
 
 cfg = load_config(Path(sys.argv[1]))
 ckpt = sys.argv[2]
@@ -172,41 +169,35 @@ def fail(msg: str) -> None:
 print(f"  config          {sys.argv[1]}")
 print(f"  checkpoint      {ckpt}")
 print(f"  tokenizer       {cfg.data.tokenizer}")
-print(f"  convention      {cfg.model.input_convention}")
 print(f"  llama_ckpt      {cfg.model.llama_ckpt}")
 print(f"  eval_batch_size {cfg.metrics.eval_batch_size}")
 
 if not Path(cfg.data.tokenizer).exists():
     sys.exit(f"[error] data.tokenizer does not exist: {cfg.data.tokenizer}")
 
-# The chat convention needs the chat vocabulary and vice versa: a flat config
-# pointed at pruned_tokenizer_chat/ would index every embedding row wrong.
-chat_vocab = "chat" in str(cfg.data.tokenizer)
-if (cfg.model.input_convention == "chat") != chat_vocab:
-    fail(
-        f"input_convention={cfg.model.input_convention!r} but "
-        f"data.tokenizer={cfg.data.tokenizer} — these must match "
-        "(flat → pruned_tokenizer/, chat → pruned_tokenizer_chat/)."
-    )
+# The chat template needs a vocabulary with the four chat specials; the legacy
+# data/pruned_tokenizer/ has none and would index every embedding row wrong.
+missing = [k for k, v in load_pruned_config(cfg.data.tokenizer).chat_special_ids.items()
+           if v is None]
+if missing:
+    sys.exit(f"[error] data.tokenizer={cfg.data.tokenizer} defines no {missing} — "
+             "point it at the chat vocabulary (data/pruned_tokenizer_chat/).")
 
-# The flat line trained against BASE Llama, the chat line against Instruct.
+# The model was trained against Llama 3.1 8B Instruct, not the base checkpoint.
 if not cfg.model.stub and cfg.model.llama_ckpt:
-    instruct = "instruct" in str(cfg.model.llama_ckpt).lower()
-    if instruct != (cfg.model.input_convention == "chat"):
+    if "instruct" not in str(cfg.model.llama_ckpt).lower():
         fail(
-            f"llama_ckpt={cfg.model.llama_ckpt} does not match "
-            f"input_convention={cfg.model.input_convention!r} — the flat line "
-            "trained against the base checkpoint, the chat line against Instruct."
+            f"llama_ckpt={cfg.model.llama_ckpt} does not look like the Instruct "
+            "checkpoint this model was trained against."
         )
 if overridden:
     print("  [warn] preflight overridden — you are responsible for the pairing")
 else:
-    print("  [ok] tokenizer, convention and backbone agree")
+    print("  [ok] tokenizer and backbone agree")
 PY
 
 # The vocabulary the decode actually ran under, taken from the SAME config the
-# preflight just validated rather than hardcoded — the chat line reads a
-# different tokenizer dir, and the covered-only slice must judge reachability
+# preflight just validated rather than hardcoded — the covered-only slice must judge reachability
 # against the vocabulary the model was trained on, not against a default path.
 TOKENIZER_DIR="$(python -c "
 import sys; sys.path.insert(0, '.')

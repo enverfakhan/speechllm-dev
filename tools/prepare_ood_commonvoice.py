@@ -57,7 +57,7 @@ USAGE
     # download the sources (711 MB tar + 5 MB tsv), then build
     python tools/prepare_ood_commonvoice.py --download \\
         --output_dir data/ood_shards/commonvoice-en-test/ \\
-        --tokenizer  data/pruned_tokenizer/ --n 5000 --seed 42
+        --tokenizer  data/pruned_tokenizer_chat/ --n 5000 --seed 42
 
     python tools/prepare_ood_commonvoice.py --self-test
 """
@@ -411,7 +411,7 @@ def main(argv: list[str] | None = None) -> None:
                    help="Fetch the sources to --tar/--tsv if they are not already there.")
     p.add_argument("--output_dir", type=Path,
                    default=Path("data/ood_shards/commonvoice-en-test/"))
-    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer/"))
+    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer_chat/"))
     p.add_argument("--n", type=int, default=5000, help="Subset size (default: 5000).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-label-len", type=int, default=41, dest="max_label_len",

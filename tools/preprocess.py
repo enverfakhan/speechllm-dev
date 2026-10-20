@@ -10,7 +10,7 @@ Per-sample processing:
        c. _capitalize_sentences → sentence-initial capitalisation
        d. spaCy en_core_web_sm PROPN tagger → proper nouns capitalised
 
-When --labels_file is provided (output of tools/precompute_labels.py or of
+When --labels_file is provided (output of
 tools/label_formatted.py finalize), steps 3 and 4 are skipped entirely and labels
 are looked up from the precomputed JSONL file instead. This avoids loading
 PunctuationModel and spaCy and reduces sharding time from ~1 hour to a few
@@ -21,7 +21,7 @@ labelling run could not align its formatted text to the reference transcript, so
 its two labels disagree about which words were spoken (FORMATTING_SPEC.md §7).
 Shipping it would train the formatted and unformatted instructions toward
 contradictory targets on the same audio. Records with no `validation` field —
-everything tools/precompute_labels.py writes — are treated as usable.
+everything an older labels file holds — are treated as usable.
 
 To apply new labels to shards that already exist, use tools/relabel_shards.py
 instead: it swaps the label members and drops the failed samples without
@@ -212,7 +212,7 @@ def _load_labels(labels_file: Path) -> dict[str, dict]:
     """Load a precomputed labels JSONL file into a key → record dict.
 
     Args:
-        labels_file: JSONL file produced by tools/precompute_labels.py
+        labels_file: JSONL file produced by tools/label_formatted.py
 
     Returns:
         dict mapping utterance key → {"key": ..., "unformatted": ..., "formatted": ...}
@@ -434,7 +434,7 @@ def preprocess_all(
         shard_duration_mins: target total audio duration per shard, in minutes
         max_duration_s:      samples longer than this are skipped
         seed:                global shuffle seed applied to every split independently
-        labels_file:         JSONL from precompute_labels.py; skips NLP model loading
+        labels_file:         JSONL from label_formatted.py; skips NLP model loading
     """
     splits = sorted(
         d for d in librispeech_dir.iterdir()
@@ -557,7 +557,7 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "JSONL file from tools/precompute_labels.py; skips loading "
+            "JSONL file from tools/label_formatted.py; skips loading "
             "PunctuationModel and spaCy — labels are looked up by key"
         ),
     )

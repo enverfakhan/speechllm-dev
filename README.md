@@ -112,12 +112,12 @@ speech-llm/
 ├── model/                  # from-scratch model code
 │   ├── whisper_encoder.py  #   Whisper small encoder (conv stem, pre-LN blocks)
 │   ├── llama.py            #   Llama 3.1 8B (RMSNorm, RoPE, GQA, SwiGLU)
-│   ├── adapter.py          #   mean-pool + 2-layer MLP bridge
+│   ├── adapter.py          #   mean-pool + SwiGLU bridge, learned audio markers
 │   └── sequence.py         #   sequence assembly, loss masking, batched generation
 ├── utils/                  # checkpoint, config, evaluate, generate, optim
 ├── tools/                  # artifact creation & analysis
-│   ├── download_weights.py, download_data.py, precompute_labels.py,
-│   ├── build_vocab.py, preprocess.py, create_subset.py, make_dev_dataset.py,
+│   ├── download_weights.py, download_data.py, label_formatted.py,
+│   ├── build_vocab.py, preprocess.py, create_subset.py, make_eval_subset.py,
 │   └── compute_baselines.py, find_max_batch.py, run_wer.py, …
 ├── configs/                # YAML configs — sparse overrides on base.yaml
 ├── docs/                   # Parts 0–3 (this README's companion documents)
@@ -126,7 +126,6 @@ speech-llm/
 ├── stages.py               # multi-stage training definitions
 ├── metrics.py              # training-time diagnostic signals
 ├── training.py             # training entry point
-├── smoke_test.py           # end-to-end pipeline verification
 └── Dockerfile
 ```
 
@@ -137,8 +136,8 @@ See [Part 0](docs/00-creating-the-artifacts.md) for the full artifact-creation w
 ```bash
 python tools/download_weights.py --output_dir weights/            # Whisper (verified) + Llama instructions
 python tools/download_data.py                                     # LibriSpeech 960h
-python tools/precompute_labels.py --librispeech_dir data/librispeech/LibriSpeech/ --output data/labels.jsonl
-python tools/build_vocab.py --librispeech_dir data/librispeech/LibriSpeech/ --llama_dir weights/llama3.1-8b/ --output_dir data/pruned_tokenizer/
+python tools/label_formatted.py …                                 # LLM labelling run → data/labels.jsonl
+python tools/build_vocab.py --labels_file data/labels.jsonl --llama_dir weights/Llama3.1-8B-Instruct/ --output_dir data/pruned_tokenizer_chat/
 python tools/preprocess.py --input_dir … --output_dir data/shards/ --labels_file data/labels.jsonl
-python training.py --config configs/base.yaml
+python training.py --config configs/instruct-chat-3stage.yaml
 ```

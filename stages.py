@@ -62,7 +62,7 @@ class StageContext:
     """
     shards:               list[str]
     tokenizer_path:       Path
-    terminator_id:        int   # EOS target: SEP (flat) or <|eot_id|> (chat)
+    terminator_id:        int   # EOS target, <|eot_id|>
     num_workers:          int
     seed:                 int
     # Both variants: [(unfmt_text, "unformatted.txt"), (fmt_text, "formatted.txt")]
@@ -203,7 +203,7 @@ class Stage:
 
         Args:
             encoder:        WhisperEncoder module
-            adapter:        AudioAdapter module
+            adapter:        bridge (AudioSwiGLUBridge) module
             llama:          Llama module
             prev_optimizer: reserved for the future "inherit" path; ignored for "fresh"
 
@@ -267,7 +267,8 @@ class Stage:
                 "lr":     self._config.lrs[mod_name],
             }
             # Zero weight decay for the gated adapters: global wd would pull the
-            # scalar gate (init 1.0) closed and decay the adapter RMSNorm off 1.
+            # zero-initialised gate_proj back to zero and decay the adapter
+            # RMSNorm off 1.
             if mod_name == "audio_adapters":
                 group["weight_decay"] = 0.0
             param_groups.append(group)
@@ -393,8 +394,8 @@ if __name__ == "__main__":
     fake_shards = [f"shard_{i:03d}.tar" for i in range(6)]
     ctx = StageContext(
         shards               = fake_shards,
-        tokenizer_path       = Path("data/pruned_tokenizer/"),
-        terminator_id        = 40033,
+        tokenizer_path       = Path("data/pruned_tokenizer_chat/"),
+        terminator_id        = 40038,
         num_workers          = 0,
         seed                 = 42,
         instruction_pairs    = [

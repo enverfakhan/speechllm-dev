@@ -412,8 +412,8 @@ def _write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
 def _synthetic_rows() -> list[dict]:
     """A four-stage sweep: 3 checkpoints per stage, one epoch increment in stage 1.
 
-    Mirrors configs/staged_full_stack.yaml — 4680 steps per stage, handoffs at
-    4680/9360/14040/18720 — and deliberately OMITS one checkpoint (step 6120) so
+    A four-stage, 4680-steps-per-stage layout — handoffs at
+    4680/9360/14040/18720 — that deliberately OMITS one checkpoint (step 6120) so
     the partial-CSV path is exercised.
     """
     stages = ["bridge_only", "audio_adapters_only", "bridge_plus_adapters", "full_stack"]

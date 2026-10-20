@@ -386,9 +386,8 @@ def decode_single_turn(
         gen  = greedy_generate(
             encoder, adapter, llama,
             mel, audio_lengths, ids_t, lens_t,
-            stop_token_id  = terminator_id,
+            chat,
             max_new_tokens = _generation_cap(refs, tokenizer, slack),
-            chat           = chat,
         )
         for i, hyp_ids in enumerate(gen):
             hyps[i].append(tokenizer.decode(hyp_ids))
@@ -507,8 +506,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--config", type=Path, required=True,
-                   help="Training config YAML — supplies model dims, tokenizer and "
-                        "input_convention.  Must be a chat-convention config.")
+                   help="Training config YAML — supplies model dims and tokenizer.")
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Checkpoint to evaluate.  Omitting it evaluates the "
                         "pretrained/stub base and is only useful for plumbing tests.")
@@ -554,12 +552,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     cfg  = load_config(args.config)
 
-    if cfg.model.input_convention != "chat":
-        print(f"[error] input_convention is {cfg.model.input_convention!r}. "
-              "Multi-turn evaluation only means anything under the chat convention — "
-              "the flat layout has no turn structure to extend.")
-        return 1
-
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -578,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[error] chat scaffold does not open with [bos] "
               f"({chat.seg_pre_audio[0]} != {tokenizer.bos_token_id})")
         return 1
-    print(f"Chat convention: audio offset {chat.audio_offset}, "
+    print(f"Chat template: audio offset {chat.audio_offset}, "
           f"terminator <|eot_id|> = {terminator_id}")
 
     instruction_ids = {

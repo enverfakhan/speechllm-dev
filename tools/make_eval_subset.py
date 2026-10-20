@@ -20,7 +20,7 @@ Usage:
         --n          480 \\
         --seed       42 \\
         --max-label-len 41 \\
-        --tokenizer  data/pruned_tokenizer/
+        --tokenizer  data/pruned_tokenizer_chat/
 
 Self-test (no real data needed):
     python tools/make_eval_subset.py --self-test
@@ -334,10 +334,10 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
-        "--tokenizer", type=Path, default=Path("data/pruned_tokenizer/"),
+        "--tokenizer", type=Path, default=Path("data/pruned_tokenizer_chat/"),
         metavar="PATH",
         help=(
-            "Path to the pruned tokenizer directory (default: data/pruned_tokenizer/). "
+            "Path to the pruned tokenizer directory (default: data/pruned_tokenizer_chat/). "
             "Required when --max-label-len > 0."
         ),
     )

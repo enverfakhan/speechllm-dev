@@ -9,14 +9,14 @@ split directory is not re-extracted.
 
 Usage:
     # Download all three training splits (default):
-    python scripts/download_data.py --output_dir data/librispeech/
+    python tools/download_data.py --output_dir data/librispeech/
 
     # Download eval splits only:
-    python scripts/download_data.py --output_dir data/librispeech/ \\
+    python tools/download_data.py --output_dir data/librispeech/ \\
         --splits dev-clean dev-other test-clean test-other
 
     # Download a specific split:
-    python scripts/download_data.py --output_dir data/librispeech/ \\
+    python tools/download_data.py --output_dir data/librispeech/ \\
         --splits train-clean-100
 """
 

@@ -43,13 +43,10 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from data import PrunedTokenizer
 
-# Ground truth is data/pruned_tokenizer/pruned_config.json. MetricCollector takes
-# vocab_size as an argument (training.py passes what it read from that file), so
-# this constant is only the FALLBACK/self-test default — entropy normalisation is
-# no longer silently wrong when the vocabulary is rebuilt.
-# (40,148  BasicTextNormalizer/spaCy labels;
-#  40,034  LLM-labelled corpus, flat convention with the 锦 SEP;
-#  40,039  LLM-labelled corpus + the four Llama 3.1 chat specials.)
+# Ground truth is data/pruned_tokenizer_chat/pruned_config.json. MetricCollector
+# takes vocab_size as an argument (training.py passes what it read from that
+# file), so this constant is only the FALLBACK/self-test default — entropy
+# normalisation is not silently wrong when the vocabulary is rebuilt.
 _VOCAB_SIZE  = 40039
 
 
@@ -345,9 +342,8 @@ class FirstTokenVotesMetric(_Metric):
         self.emit_period = emit_period
         self._top_k      = top_k
         self._tok        = tokenizer
-        # The EOS target: <|eot_id|> under the chat convention, SEP under the
-        # flat one.  The W&B key keeps its "sep_fraction" name for dashboard
-        # continuity — the signal (how often the model wants to terminate
+        # The EOS target, <|eot_id|>.  The W&B key keeps its historical
+        # "sep_fraction" name for dashboard continuity — the signal (how often the model wants to terminate
         # instead of transcribing) is unchanged.
         self._sep_id     = terminator_id
         _s               = "train" if phase == "train" else "eval"
@@ -367,9 +363,8 @@ class FirstTokenVotesMetric(_Metric):
                 continue
             # In shifted coordinates shift_logits[i, t] predicts shift_labels[i, t],
             # so the first unmasked position IS the first-transcript-token
-            # prediction — the same index FirstTokenLossMetric reads.  (This used
-            # to read first_pos - 1, i.e. the prediction of the token BEFORE the
-            # transcript: the SEP under flat, "\n\n" under chat.)
+            # prediction — the same index FirstTokenLossMetric reads (NOT
+            # first_pos - 1, the prediction of the "\n\n" before the transcript).
             first_pos  = int(nz[0].item())
             pred_logit = inter.shift_logits[i, first_pos]
             self._n_samples += 1

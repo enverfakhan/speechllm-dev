@@ -62,7 +62,7 @@ USAGE
     python tools/prepare_ood_tedlium.py \\
         --download \\
         --output_dir data/ood_shards/tedlium3-test/ \\
-        --tokenizer  data/pruned_tokenizer/ \\
+        --tokenizer  data/pruned_tokenizer_chat/ \\
         --max-label-len 41 64
 
     # 50-utterance smoke shard
@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--download", action="store_true",
                    help="Fetch the source parquet to --parquet if it is not already there.")
     p.add_argument("--output_dir", type=Path, default=Path("data/ood_shards/tedlium3-test/"))
-    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer/"),
+    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer_chat/"),
                    help="Pruned tokenizer dir, for the label-length filter.")
     p.add_argument("--max-label-len", type=int, nargs="*", default=[41, 64],
                    dest="max_label_lens", metavar="L",

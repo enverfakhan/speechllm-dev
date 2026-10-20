@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass, field, replace  # noqa: F401 (replace used in __main__)
+from dataclasses import dataclass, field, fields, replace  # noqa: F401 (replace used in __main__)
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +52,7 @@ class DataConfig:
     """Data loading configuration."""
     shards_file: Path | None = None
     shards:      str  | None = None
-    tokenizer:   Path | None = Path("data/pruned_tokenizer/")
+    tokenizer:   Path | None = Path("data/pruned_tokenizer_chat/")
     diag_shard:  Path | None = None
     eval:        EvalShards  = field(default_factory=EvalShards)
     num_workers: int         = 4
@@ -66,22 +66,11 @@ class ModelConfig:
         "n_layers": 6, "d_model": 512, "n_heads": 8, "n_kv_heads": 2, "intermediate_size": 1024,
     })
     whisper_ckpt:           Path | None = Path("weights/whisper_small.pt")
-    llama_ckpt:             Path | None = Path("weights/Llama3.1-8B/")
-    adapter_pca_init:       Path | None = None
+    llama_ckpt:             Path | None = Path("weights/Llama3.1-8B-Instruct/")
     gradient_checkpointing: bool        = False   # Llama transformer layers
     encoder_gradient_checkpointing: bool = True   # Whisper encoder blocks
     init_from:              Path | None = None
-    audio_adapter_r:        int         = 0   # gated audio adapter rank; 0 = disabled
-    bridge_type:            str         = "mlp"   # encoder→llama bridge: "mlp" | "swiglu"
-    audio_adapter_type:     str         = "mlp"   # "mlp" | "swiglu"
-    # swiglu only: first N adapter layers zero their writer (down_proj) instead
-    # of gate_proj; 0 = every layer uses the default zero-gate_proj scheme.
-    audio_adapter_zero_writer_layers: int = 0
-    # Sequence layout fed to Llama (see model/sequence.py):
-    #   "flat"  [audio] [SEP] [instruction] [SEP] [transcript] [SEP]
-    #   "chat"  the Llama 3.1 Instruct chat template, audio spliced into the user
-    #           turn between two learned marker vectors, <|eot_id|> as the EOS target
-    input_convention:       str         = "flat"
+    audio_adapter_r:        int         = 0   # SwiGLU audio adapter width; 0 = disabled
 
 
 @dataclass(frozen=True)
@@ -214,15 +203,10 @@ def _build_model(d: dict) -> ModelConfig:
         stub_dims              = dict(d.get("stub_dims") or {}),
         whisper_ckpt           = _opt_path(d.get("whisper_ckpt")),
         llama_ckpt             = _opt_path(d.get("llama_ckpt")),
-        adapter_pca_init       = _opt_path(d.get("adapter_pca_init")),
         gradient_checkpointing = bool(d.get("gradient_checkpointing", False)),
         encoder_gradient_checkpointing = bool(d.get("encoder_gradient_checkpointing", True)),
         init_from              = _opt_path(d.get("init_from")),
         audio_adapter_r        = int(d.get("audio_adapter_r", 0)),
-        bridge_type            = str(d.get("bridge_type", "mlp")),
-        audio_adapter_type     = str(d.get("audio_adapter_type", "mlp")),
-        audio_adapter_zero_writer_layers = int(d.get("audio_adapter_zero_writer_layers", 0)),
-        input_convention       = str(d.get("input_convention", "flat")),
     )
 
 
@@ -328,19 +312,86 @@ _VALID_INSTRUCTION_MODES = {"unformatted", "formatted", "both"}
 # "audio_adapters" is a name-selected subset of llama's parameters (the gated
 # per-layer audio adapters), not a separate nn.Module — see stages.Stage.setup.
 _VALID_TRAINABLE         = {"encoder", "adapter", "llama", "audio_adapters"}
-# Mirror model.llama.AUDIO_ADAPTER_TYPES / model.adapter.BRIDGE_TYPES; duplicated
-# so config loading stays import-light (utils.config must not pull in torch to
-# validate a YAML file).
-_VALID_AUDIO_ADAPTER_TYPES = {"mlp", "swiglu"}
-_VALID_BRIDGE_TYPES        = {"mlp", "swiglu"}
-# Mirror model.sequence.INPUT_CONVENTIONS (same import-light reason as above).
-_VALID_INPUT_CONVENTIONS   = {"flat", "chat"}
 _VALID_OPTIMIZER_INIT    = {"fresh", "inherit"}
 _VALID_EXIT_STRATEGIES   = {
     "first_token_below", "eval_loss_below", "max_steps", "epochs", "never",
 }
 _EXIT_NEEDS_THRESHOLD    = {"first_token_below", "eval_loss_below", "epochs"}
 _VALID_METRIC_FAMILIES   = {"grads", "logits", "loss"}
+
+
+# Keys deleted when the codebase was narrowed to the E1 structure (Instruct
+# backbone, chat template, SwiGLU bridge + SwiGLU in-layer adapters).  An old
+# config that still sets one must fail rather than run something different.
+_REMOVED_KEYS: dict[tuple[str, str], str] = {
+    ("model", "input_convention"):
+        "the chat template is the only sequence layout",
+    ("model", "bridge_type"):
+        "the SwiGLU bridge is the only bridge",
+    ("model", "audio_adapter_type"):
+        "the SwiGLU in-layer adapter is the only variant",
+    ("model", "audio_adapter_zero_writer_layers"):
+        "every in-layer adapter zero-initialises gate_proj",
+    ("model", "adapter_pca_init"):
+        "PCA bridge initialisation was removed",
+    ("stage", "paired_prompts"):
+        "paired-prompt batching does not exist in this codebase",
+}
+
+# Sub-sections that are themselves dataclasses, so their keys are checked too.
+# Free-form dict fields (model.stub_dims, metrics.train_periods,
+# metrics.compute_only_on_emit, stage lrs) are not descended into; their keys
+# are validated by meaning in _validate or by LlamaConfig.
+_NESTED: dict[tuple[type, str], type] = {
+    (Config, "data"): DataConfig,          (DataConfig, "eval"): EvalShards,
+    (Config, "model"): ModelConfig,        (Config, "optim"): OptimConfig,
+    (OptimConfig, "grad_clip"): GradClip,  (Config, "logging"): LoggingConfig,
+    (Config, "checkpoint"): CheckpointConfig, (Config, "metrics"): MetricsConfig,
+    (MetricsConfig, "wer"): WerConfig,     (Config, "run"): RunConfig,
+    (StageConfig, "schedule"): Schedule,   (StageConfig, "exit"): ExitConfig,
+}
+
+
+def _check_keys(d: dict, cls: type, path: str, section: str) -> None:
+    """Raise ValueError on any key *cls* does not declare, recursively.
+
+    Every field is read with ``d.get(key, default)``, so without this check a
+    misspelled or retired key would be silently ignored and the run would use
+    the default instead.
+
+    Args:
+        d:       raw YAML mapping for this section
+        cls:     dataclass whose field names are the allowed keys
+        path:    key path for the error message, e.g. "model" or "stages[2]"
+        section: lookup name for _REMOVED_KEYS ("model", "stage", ...)
+    """
+    allowed = {f.name for f in fields(cls)}
+    for key, val in d.items():
+        where = f"{path}.{key}" if path else key
+        if key not in allowed:
+            why = _REMOVED_KEYS.get((section, key))
+            if why is not None:
+                raise ValueError(f"{where}: this setting was removed — {why}. Delete it.")
+            raise ValueError(f"{where}: unknown key (allowed: {sorted(allowed)})")
+        sub = _NESTED.get((cls, key))
+        if sub is not None and isinstance(val, dict):
+            _check_keys(val, sub, where, key)
+
+
+def _check_all_keys(merged: dict, stage_defaults: dict, raw_stages: list) -> None:
+    """Key-whitelist the merged config, stage_defaults and every stage entry."""
+    top_allowed = {f.name for f in fields(Config)} - {"resume"} | {"stage_defaults"}
+    for key in merged:
+        if key not in top_allowed:
+            raise ValueError(f"{key}: unknown top-level key (allowed: {sorted(top_allowed)})")
+    for key, cls in ((k, c) for (parent, k), c in _NESTED.items() if parent is Config):
+        if isinstance(merged.get(key), dict):
+            _check_keys(merged[key], cls, key, key)
+    _check_keys(stage_defaults, StageConfig, "stage_defaults", "stage")
+    for i, s in enumerate(raw_stages):
+        if not isinstance(s, dict):
+            raise ValueError(f"stages[{i}]: must be a mapping, got {type(s).__name__}")
+        _check_keys(s, StageConfig, f"stages[{i}]", "stage")
 
 
 def _validate(cfg: Config) -> None:
@@ -363,33 +414,6 @@ def _validate(cfg: Config) -> None:
             raise ValueError("model.llama_ckpt: required when model.stub is false")
     if cfg.model.audio_adapter_r < 0:
         raise ValueError(f"model.audio_adapter_r: must be >= 0, got {cfg.model.audio_adapter_r}")
-    if cfg.model.bridge_type not in _VALID_BRIDGE_TYPES:
-        raise ValueError(
-            f"model.bridge_type: must be one of {sorted(_VALID_BRIDGE_TYPES)}, "
-            f"got {cfg.model.bridge_type!r}"
-        )
-    if cfg.model.audio_adapter_type not in _VALID_AUDIO_ADAPTER_TYPES:
-        raise ValueError(
-            f"model.audio_adapter_type: must be one of "
-            f"{sorted(_VALID_AUDIO_ADAPTER_TYPES)}, got {cfg.model.audio_adapter_type!r}"
-        )
-    if cfg.model.audio_adapter_zero_writer_layers < 0:
-        raise ValueError(
-            f"model.audio_adapter_zero_writer_layers: must be >= 0, "
-            f"got {cfg.model.audio_adapter_zero_writer_layers}"
-        )
-    if cfg.model.input_convention not in _VALID_INPUT_CONVENTIONS:
-        raise ValueError(
-            f"model.input_convention: must be one of "
-            f"{sorted(_VALID_INPUT_CONVENTIONS)}, got {cfg.model.input_convention!r}"
-        )
-    if cfg.model.audio_adapter_zero_writer_layers > 0 and cfg.model.audio_adapter_type != "swiglu":
-        # The mlp variant already zeroes its writer in every layer, so the split
-        # would be a silent no-op rather than the requested per-depth scheme.
-        raise ValueError(
-            "model.audio_adapter_zero_writer_layers: only applies to "
-            f"audio_adapter_type: swiglu, got {cfg.model.audio_adapter_type!r}"
-        )
 
     # run
     if cfg.run.instruction_mode not in _VALID_INSTRUCTION_MODES:
@@ -578,6 +602,10 @@ def load_config(
 
     run_inst_mode = (merged.get("run") or {}).get("instruction_mode", "unformatted")
     raw_stages    = merged.get("stages") or []
+    _check_all_keys(
+        {k: v for k, v in merged.items() if k != "stages"} | {"stages": raw_stages},
+        stage_defaults, raw_stages,
+    )
     stages        = [
         _build_stage(_merge_stage(stage_defaults, s), run_inst_mode)
         for s in raw_stages
@@ -743,6 +771,43 @@ if __name__ == "__main__":
     # empty stages
     _assert_raises(replace(cfg, stages=[]), "stages")
     print("[OK] empty stages")
+
+    # ── 4. Key whitelist: removed and unknown keys fail at load time ──────────
+    def _load_yaml_raises(text: str, fragment: str) -> None:
+        with tempfile.TemporaryDirectory() as _td:
+            _p = Path(_td) / "bad.yaml"
+            _p.write_text(textwrap.dedent(text))
+            try:
+                load_config(_p)
+            except ValueError as exc:
+                assert fragment in str(exc), f"{str(exc)!r} lacks {fragment!r}"
+            else:
+                raise AssertionError(f"config containing {fragment!r} loaded silently")
+
+    _STAGE = "stages: [{name: s, trainable: [adapter], lrs: {adapter: 1.0e-4}}]\n"
+    _DATA  = "data: {shards: x.tar}\n"
+    for _model_key in ("input_convention: chat", "bridge_type: swiglu",
+                       "audio_adapter_type: swiglu", "audio_adapter_zero_writer_layers: 0",
+                       "adapter_pca_init: null"):
+        _load_yaml_raises(_DATA + f"model: {{{_model_key}}}\n" + _STAGE, "was removed")
+    _load_yaml_raises(
+        _DATA + "stages: [{name: s, trainable: [adapter], lrs: {adapter: 1.0e-4},"
+                " paired_prompts: true}]\n",
+        "stages[0].paired_prompts: this setting was removed",
+    )
+    _load_yaml_raises(_DATA + "model: {strub: true}\n" + _STAGE, "model.strub: unknown key")
+    _load_yaml_raises(_DATA + "metrics: {wer: {enabeld: true}}\n" + _STAGE,
+                      "metrics.wer.enabeld: unknown key")
+    _load_yaml_raises(_DATA + "stage_defaults: {exit: {threshhold: 3}}\n" + _STAGE,
+                      "stage_defaults.exit.threshhold: unknown key")
+    _load_yaml_raises(_DATA + "trainig: {}\n" + _STAGE, "trainig: unknown top-level key")
+    print("[OK] removed / unknown config keys rejected at load")
+
+    # Every shipped config must load under the whitelist.
+    for _yaml in sorted((_PROJECT_ROOT / "configs").glob("*.yaml")):
+        if _yaml.name != "base.yaml":
+            load_config(_yaml)
+    print("[OK] every configs/*.yaml loads")
 
     print("\nPASSED")
     sys.exit(0)

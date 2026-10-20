@@ -37,7 +37,7 @@ USAGE
         --manifest data/ood_shards/tedlium3-test/manifest.jsonl \\
         --manifest data/ood_shards/commonvoice-en-test/manifest.jsonl \\
         --manifest data/eval_shards/manifest.jsonl --split dev-clean \\
-        --tokenizer data/pruned_tokenizer/ \\
+        --tokenizer data/pruned_tokenizer_chat/ \\
         --out-json out/ood-vocab-coverage.json \\
         --out-md   out/ood-vocab-coverage.md
 
@@ -433,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="Eval shard .tar to measure directly; repeatable.  Use "
                         "--manifest instead where one exists: a shard cannot say "
                         "whether its formatted.txt is a real reference or a placeholder.")
-    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer/"))
+    p.add_argument("--tokenizer", type=Path, default=Path("data/pruned_tokenizer_chat/"))
     p.add_argument("--split", type=str, default=None,
                    help="Restrict manifests that carry a 'split' field to this split.")
     p.add_argument("--top", type=int, default=20, help="Unreachable words to list (default 20).")

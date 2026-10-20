@@ -1,7 +1,7 @@
 """WER evaluation engine for speech-llm.
 
-evaluate_all_splits is the shared WER engine used by train.py (--eval_at_end)
-and will be reused by tools/run_wer.py in a later step.
+evaluate_all_splits is the WER engine behind tools/run_wer.py; compute_wer is
+also used by training.py's in-loop diag WER.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from utils.generate import greedy_generate
 if TYPE_CHECKING:
     from data import PrunedTokenizer
     from model.sequence import ChatTemplate
-    from model.adapter import BridgeAdapter
+    from model.adapter import AudioSwiGLUBridge
     from model.llama import Llama
     from model.whisper_encoder import WhisperEncoder
 
@@ -49,18 +49,17 @@ def _transcription_row(
 
 def evaluate_all_splits(
     encoder:      "WhisperEncoder",
-    adapter:      "BridgeAdapter",
+    adapter:      "AudioSwiGLUBridge",
     llama:        "Llama",
     eval_loaders: dict[str, Any],
     tokenizer:    "PrunedTokenizer",
-    terminator_id: int,
+    chat:         "ChatTemplate",
     device:       torch.device,
     max_batches:       int | None = None,
     n_samples:         int = 20,
     sample_seed:       int = 0,
     formats:           list[str] | None = None,
     progress_interval: float | None = None,
-    chat:              "ChatTemplate | None" = None,
     return_all_transcriptions: bool = False,
 ) -> tuple[dict[str, float], list[dict]] | tuple[dict[str, float], list[dict], list[dict]]:
     """Run batched greedy WER evaluation on every eval split.
@@ -79,16 +78,13 @@ def evaluate_all_splits(
         eval_loaders:      split name → finite iterable of 9-tuples
                            (from build_sorted_eval_dataloader)
         tokenizer:         PrunedTokenizer for decoding generated IDs to text
-        terminator_id:     EOS token generation stops on — SEP under the flat
-                           convention, <|eot_id|> under the chat one
+        chat:              scaffold segments; generation stops on chat.eot_token_id
         max_batches:       cap per split (None = full eval)
         n_samples:         number of (ref, hyp) pairs to sample per split per format
         sample_seed:       RNG seed for reproducible sampling
         formats:           which instruction variants to run; None (default) runs both.
                            Pass ["unformatted"] or ["formatted"] to restrict.
         progress_interval: print a progress line every this many seconds; None = silent.
-        chat:              ChatTemplate when the run uses the chat input
-                           convention, None for the flat one
         return_all_transcriptions:
                            when True, ALSO return every (ref, hyp) pair evaluated,
                            not just the n_samples subset — for post-hoc analysis
@@ -153,9 +149,7 @@ def evaluate_all_splits(
                 batch_hyps_unfmt = greedy_generate(
                     encoder, adapter, llama,
                     mel, audio_lengths, unfmt_ids, unfmt_lens,
-                    stop_token_id=terminator_id,
-                    max_new_tokens=max_new_tokens,
-                    chat=chat,
+                    chat, max_new_tokens=max_new_tokens,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_unfmt):
                     pairs_unfmt.append(
@@ -168,9 +162,7 @@ def evaluate_all_splits(
                 batch_hyps_fmt = greedy_generate(
                     encoder, adapter, llama,
                     mel, audio_lengths, fmt_ids, fmt_lens,
-                    stop_token_id=terminator_id,
-                    max_new_tokens=max_new_tokens,
-                    chat=chat,
+                    chat, max_new_tokens=max_new_tokens,
                 )
                 for i, hyp_ids in enumerate(batch_hyps_fmt):
                     pairs_fmt.append(

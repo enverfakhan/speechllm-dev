@@ -15,7 +15,7 @@ ready to be loaded by data.list_shards() or passed directly to
 data.build_dataloader().
 
 Usage:
-    python scripts/create_subset.py \\
+    python tools/create_subset.py \\
       --shard_dir   data/shards/ \\
       --split       train-clean-100 \\
       --n_shards    10 \\
@@ -67,7 +67,7 @@ def create_shard_subset(
     if not all_shards:
         raise FileNotFoundError(
             f"No shards matching '{pattern}'. "
-            "Run scripts/preprocess.py first."
+            "Run tools/preprocess.py first."
         )
 
     # Apply the same epoch shuffle as the training loop

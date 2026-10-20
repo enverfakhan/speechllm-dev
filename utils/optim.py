@@ -18,9 +18,9 @@ def build_adamw8bit(
 
     Per-group weight decay: a group may carry its own ``"weight_decay"`` key,
     which overrides the global default for that group only.  This is required by
-    the ``audio_adapters`` group, which must train at wd=0 — global decay on a
-    zero-init scalar gate is a constant force closing the gate, and it also
-    decays the adapter RMSNorm weights away from 1.  Groups without the key fall
+    the ``audio_adapters`` group, which must train at wd=0 — global decay on the
+    zero-initialised gate_proj is a constant force pulling it back to zero, and
+    it also decays the adapter RMSNorm weights away from 1.  Groups without the key fall
     back to the global ``weight_decay``.
     """
     import bitsandbytes as bnb

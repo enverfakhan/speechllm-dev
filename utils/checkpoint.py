@@ -122,7 +122,7 @@ def _load_bridge_state_tolerant(adapter: nn.Module, state: dict) -> None:
     audio markers existed keeps its fresh (normal-init) markers and prints one
     message; any OTHER missing key, or any unexpected key, stays a hard error.
     A blanket strict=False would swallow a real bridge-variant mismatch — which
-    is exactly the mlp↔swiglu confusion this project wants to fail loudly.
+    is exactly the kind of error (e.g. an old MLP-bridge checkpoint) that must fail loudly.
     """
     result     = adapter.load_state_dict(state, strict=False)
     missing    = list(result.missing_keys)

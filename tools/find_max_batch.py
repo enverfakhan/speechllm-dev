@@ -3,8 +3,7 @@
 The probe is CONFIG-DRIVEN: it builds the exact stack the run will build, through
 the same two entry points training.py uses —
 
-    build.build_models(cfg)      architecture: bridge_type, audio_adapter_r/type,
-                                 audio_adapter_zero_writer_layers, gradient
+    build.build_models(cfg)      architecture: audio_adapter_r, gradient
                                  checkpointing on Llama AND on the Whisper encoder
     stages.Stage.setup(...)      trainability + optimizer: per-stage `trainable`
                                  set (including the name-selected "audio_adapters"
@@ -30,10 +29,10 @@ Eval mode (--eval):
   gradient checkpointing.  Use this for metrics.eval_batch_size / WER runs.
 
 Usage:
-    python tools/find_max_batch.py --config configs/staged_full_stack.yaml --stage 4
-    python tools/find_max_batch.py --config configs/staged_full_stack.yaml --stage-name full_stack
-    python tools/find_max_batch.py --config configs/staged_full_stack.yaml --stage 4 --accum 1 2 3
-    python tools/find_max_batch.py --config configs/staged_full_stack.yaml --eval
+    python tools/find_max_batch.py --config configs/instruct-chat-3stage.yaml --stage 3
+    python tools/find_max_batch.py --config configs/instruct-chat-3stage.yaml --stage-name full_stack
+    python tools/find_max_batch.py --config configs/instruct-chat-3stage.yaml --stage 3 --accum 1 2 3
+    python tools/find_max_batch.py --config configs/instruct-chat-3stage.yaml --eval
 """
 
 
@@ -51,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from build import build_models
 from data import INSTRUCTION_VARIANTS, load_pruned_config
-from model.sequence import assemble_inputs, ChatTemplate
+from model.sequence import ChatTemplate, prepare_input
 from stages import Stage, StageContext
 from utils.config import Config, load_config
 
@@ -103,16 +102,14 @@ def _vocab_meta(cfg: Config) -> tuple[int, int]:
     return pruned.vocab_size, pruned.terminator_id
 
 
-def _chat_template(cfg: Config) -> ChatTemplate | None:
-    """Build the run's ChatTemplate, or None under the flat convention.
+def _chat_template(cfg: Config) -> ChatTemplate:
+    """Build the run's ChatTemplate.
 
     The probe MUST assemble sequences the way the run will: the chat scaffold adds
     fixed tokens per sample and the whole point of this tool is the sequence
     length that fits in VRAM.  Loading the tokenizer is the only reason this tool
     touches transformers, so it happens lazily, here.
     """
-    if cfg.model.input_convention != "chat":
-        return None
     from data import PrunedTokenizer
     return ChatTemplate.from_tokenizer(PrunedTokenizer(cfg.data.tokenizer))
 
@@ -197,9 +194,8 @@ def _try_batch(
     batch_size:   int,
     accum_steps:  int,
     vocab_size:   int,
-    terminator_id: int,
+    chat:         ChatTemplate,
     mel_frames:   int = _MEL_FRAMES,
-    chat:         ChatTemplate | None = None,
 ) -> tuple[bool, float, float]:
     """One training step: accum_steps micro-batches + clip + optimizer step.
 
@@ -223,14 +219,11 @@ def _try_batch(
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out = encoder(mel)
                 adp_out = adapter(enc_out)
-                inputs, labels, a_mask = assemble_inputs(
+                inputs, labels, a_mask = prepare_input(
                     adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
-                    llama.embed_tokens, terminator_id,
-                    chat      = chat,
-                    audio_bos = adapter.audio_bos if chat is not None else None,
-                    audio_eos = adapter.audio_eos if chat is not None else None,
+                    llama.embed_tokens, chat, adapter.audio_bos, adapter.audio_eos,
                 )
-                _, loss = llama(inputs, labels, audio_lengths=a_lens, audio_mask=a_mask)
+                _, loss = llama(inputs, labels, audio_mask=a_mask)
 
             (loss / accum_steps).backward()
 
@@ -265,8 +258,7 @@ def _try_batch_eval(
     llama:        torch.nn.Module,
     batch_size:   int,
     vocab_size:   int,
-    terminator_id: int,
-    chat:         ChatTemplate | None = None,
+    chat:         ChatTemplate,
 ) -> tuple[bool, float, float]:
     """Forward-only pass under torch.no_grad().  Returns (fits, alloc_gb, reserved_gb)."""
     device = torch.device("cuda")
@@ -279,14 +271,11 @@ def _try_batch_eval(
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             enc_out = encoder(mel)
             adp_out = adapter(enc_out)
-            inputs, labels, a_mask = assemble_inputs(
+            inputs, labels, a_mask = prepare_input(
                 adp_out, a_lens, inst_ids, inst_lens, tr_ids, tr_lens,
-                llama.embed_tokens, terminator_id,
-                chat      = chat,
-                audio_bos = adapter.audio_bos if chat is not None else None,
-                audio_eos = adapter.audio_eos if chat is not None else None,
+                llama.embed_tokens, chat, adapter.audio_bos, adapter.audio_eos,
             )
-            llama(inputs, labels, audio_lengths=a_lens, audio_mask=a_mask)
+            llama(inputs, labels, audio_mask=a_mask)
 
         return (True,
                 torch.cuda.max_memory_allocated(device) / 1e9,
@@ -310,8 +299,7 @@ def _warmup_optimizer(
     llama:        torch.nn.Module,
     optimizer:    torch.optim.Optimizer,
     vocab_size:   int,
-    terminator_id: int,
-    chat:         ChatTemplate | None = None,
+    chat:         ChatTemplate,
     n_steps:      int = 4,
 ) -> None:
     """Run n_steps real optimizer steps at batch=1 to materialise bnb 8-bit state.
@@ -324,8 +312,7 @@ def _warmup_optimizer(
         ok, _, _ = _try_batch(
             cfg, encoder, adapter, llama, optimizer,
             batch_size=1, accum_steps=1,
-            vocab_size=vocab_size, terminator_id=terminator_id,
-            mel_frames=_WARMUP_MEL, chat=chat,
+            vocab_size=vocab_size, chat=chat, mel_frames=_WARMUP_MEL,
         )
         if not ok:
             raise SystemExit(
@@ -409,13 +396,9 @@ def main() -> None:
     print(f"Total VRAM: {_TOTAL_VRAM_GB:.1f} GB")
     print(f"Config: {args.config}")
     print(f"Vocab: {vocab_size} tokens  terminator id: {terminator_id}")
-    _scaffold = (
-        0 if chat is None
-        else len(chat.seg_pre_audio) + 2 + len(chat.seg_pre_instruction)
-             + len(chat.seg_pre_transcript) + 1
-    )
-    print(f"Convention: {cfg.model.input_convention}"
-          + (f"  (+{_scaffold} scaffold/marker positions per sample)" if chat else ""))
+    _scaffold = (len(chat.seg_pre_audio) + 2 + len(chat.seg_pre_instruction)
+                 + len(chat.seg_pre_transcript) + 1)
+    print(f"Chat template: +{_scaffold} scaffold/marker positions per sample")
     print(f"Sequence: {_MEL_FRAMES} mel frames → {_audio_tokens(_MEL_FRAMES)} audio tokens "
           f"+ {_INST_TOKS} instruction + {_TRANS_TOKS} transcript")
 
@@ -432,7 +415,7 @@ def main() -> None:
         print()
         best, alloc, reserved = _search(
             lambda bs: _try_batch_eval(
-                encoder, adapter, llama, bs, vocab_size, terminator_id, chat
+                encoder, adapter, llama, bs, vocab_size, chat
             ),
             args.min_batch, args.max_batch,
         )
@@ -468,7 +451,7 @@ def main() -> None:
 
     print(f"Pre-warming optimizer (4 steps at batch=1, mel_t={_WARMUP_MEL}) …")
     _warmup_optimizer(
-        cfg, encoder, adapter, llama, optimizer, vocab_size, terminator_id, chat,
+        cfg, encoder, adapter, llama, optimizer, vocab_size, chat,
     )
     n_total = sum(len(g["params"]) for g in optimizer.param_groups)
     print(f"  bnb state = {_optimizer_state_gb(optimizer):.2f} GB  "
@@ -482,7 +465,7 @@ def main() -> None:
         best, alloc, reserved = _search(
             lambda bs, _a=accum: _try_batch(
                 cfg, encoder, adapter, llama, optimizer, bs, _a,
-                vocab_size, terminator_id, chat=chat,
+                vocab_size, chat,
             ),
             args.min_batch, args.max_batch,
         )

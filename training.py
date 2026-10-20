@@ -1,13 +1,9 @@
 """Config-driven multi-stage training loop for speech-llm.
 
-Replaces train.py with a declarative, stage-based design driven by YAML configs.
-A single-stage stub run on the same seed and data produces identical loss
-trajectories to train.py.
-
 Usage:
-    python training.py --config configs/example.yaml [--resume path/to/ckpt.pt]
-    python training.py --config configs/stub.yaml        # local stub run (model.stub: true)
-    python training.py --config configs/example.yaml --wandb --run-name my-run
+    python training.py --config configs/instruct-chat-3stage.yaml [--resume path/to/ckpt.pt]
+    python training.py --config configs/stub_chat.yaml   # local stub run (model.stub: true)
+    python training.py --config configs/instruct-chat-3stage.yaml --wandb --run-name my-run
 """
 
 from __future__ import annotations
@@ -31,9 +27,9 @@ from data import (
     INSTRUCTION_VARIANTS,
     PrunedTokenizer,
 )
-from model.adapter import BridgeAdapter
+from model.adapter import AudioSwiGLUBridge
 from model.llama import Llama
-from model.sequence import assemble_inputs, ChatTemplate
+from model.sequence import ChatTemplate, prepare_input
 from model.whisper_encoder import WhisperEncoder
 from metrics import MetricCollector, render
 from stages import Stage, StageContext
@@ -87,27 +83,17 @@ class RunState:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _marker(adapter: BridgeAdapter, chat: ChatTemplate | None, name: str):
-    """The bridge's audio_bos / audio_eos parameter, or None under the flat convention.
-
-    Keeps the "which convention are we in" branch in exactly one place instead of
-    at every assembly call site.
-    """
-    return getattr(adapter, name) if chat is not None else None
-
-
 def run_eval_pass(
     encoder:      WhisperEncoder,
-    adapter:      BridgeAdapter,
+    adapter:      AudioSwiGLUBridge,
     llama:        Llama,
     diag_loader:  torch.utils.data.DataLoader,
     diag_iter:    Any,
     metrics:      MetricCollector,
-    terminator_id: int,
+    chat:         ChatTemplate,
     device:       torch.device,
     n_batches:    int,
     global_step:  int,
-    chat:         ChatTemplate | None = None,
 ) -> tuple[dict, list, Any]:
     """Run n_batches of teacher-forced eval on the diag shard.
 
@@ -134,17 +120,13 @@ def run_eval_pass(
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             d_enc  = encoder(d_mel)
             d_ada  = adapter(d_enc)
-            d_inp, d_lbl, d_mask = assemble_inputs(
+            d_inp, d_lbl, d_mask = prepare_input(
                 d_ada, d_audio_len,
                 d_inst_ids, d_inst_lens,
                 d_trans_ids, d_trans_lens,
-                llama.embed_tokens, terminator_id,
-                chat=chat, audio_bos=_marker(adapter, chat, "audio_bos"),
-                audio_eos=_marker(adapter, chat, "audio_eos"),
+                llama.embed_tokens, chat, adapter.audio_bos, adapter.audio_eos,
             )
-            d_logits, d_loss = llama(
-                d_inp, d_lbl, audio_lengths=d_audio_len, audio_mask=d_mask,
-            )
+            d_logits, d_loss = llama(d_inp, d_lbl, audio_mask=d_mask)
 
         metrics.observe("eval", global_step, logits=d_logits, labels=d_lbl, loss=d_loss.detach())
         retained.append((d_mel, d_audio_len, d_inst_ids, d_inst_lens, d_trans_ids, d_trans_lens))
@@ -163,13 +145,12 @@ def maybe_run_wer(
     global_step:  int,
     eval_subset:  list[tuple],
     encoder:      WhisperEncoder,
-    adapter:      BridgeAdapter,
+    adapter:      AudioSwiGLUBridge,
     llama:        Llama,
     tokenizer:    PrunedTokenizer,
-    terminator_id: int,
+    chat:         ChatTemplate,
     device:       torch.device,
     use_wandb:    bool,
-    chat:         ChatTemplate | None = None,
 ) -> dict:
     """Optionally run greedy WER decode on retained eval batches.
 
@@ -199,8 +180,7 @@ def maybe_run_wer(
         gen_ids = greedy_generate(
             encoder, adapter, llama,
             mel, audio_lengths, inst_ids, inst_lens,
-            terminator_id,
-            chat=chat,
+            chat,
         )
         for i in range(len(gen_ids)):
             hyp = tokenizer.decode(gen_ids[i])
@@ -238,7 +218,7 @@ def maybe_run_wer(
 
 def run_stage(
     encoder:      WhisperEncoder,
-    adapter:      BridgeAdapter,
+    adapter:      AudioSwiGLUBridge,
     llama:        Llama,
     optimizer:    torch.optim.Optimizer,
     scheduler:    torch.optim.lr_scheduler.LRScheduler,
@@ -252,9 +232,8 @@ def run_stage(
     run:          RunState,
     cfg:          Config,
     device:       torch.device,
-    terminator_id: int,
     use_wandb:    bool,
-    chat:         ChatTemplate | None,
+    chat:         ChatTemplate,
     ckpt_dir:     Path,
     baselines_data: dict,
     train_start:  float,
@@ -318,7 +297,7 @@ def run_stage(
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 enc_out     = encoder(mel)
                 adapter_out = adapter(enc_out)
-                inputs, labels, audio_mask = assemble_inputs(
+                inputs, labels, audio_mask = prepare_input(
                     adapter_out,
                     audio_lengths,
                     instruction_ids,
@@ -326,18 +305,11 @@ def run_stage(
                     transcript_ids,
                     transcript_lengths,
                     llama.embed_tokens,
-                    terminator_id,
-                    chat      = chat,
-                    audio_bos = _marker(adapter, chat, "audio_bos"),
-                    audio_eos = _marker(adapter, chat, "audio_eos"),
+                    chat,
+                    adapter.audio_bos,
+                    adapter.audio_eos,
                 )
-                # audio_mask is None under the flat convention, where
-                # audio_lengths describes the layout on its own.
-                logits, loss = llama(
-                    inputs, labels,
-                    audio_lengths = audio_lengths,
-                    audio_mask    = audio_mask,
-                )
+                logits, loss = llama(inputs, labels, audio_mask=audio_mask)
 
             metrics.observe("train", run.global_step, logits=logits, labels=labels)
             scaler.scale(loss / stage.accum_steps).backward()
@@ -395,16 +367,14 @@ def run_stage(
                 eval_metrics, eval_subset, diag_iter = run_eval_pass(
                     encoder, adapter, llama,
                     diag_loader, diag_iter,
-                    metrics, terminator_id, device,
+                    metrics, chat, device,
                     cfg.metrics.eval_batches,
                     run.global_step,
-                    chat=chat,
                 )
                 wer_metrics = maybe_run_wer(
                     cfg, eval_metrics, run.global_step, eval_subset,
                     encoder, adapter, llama, tokenizer,
-                    terminator_id, device, use_wandb,
-                    chat=chat,
+                    chat, device, use_wandb,
                 )
 
             # ── Train metrics flush ───────────────────────────────────────────
@@ -503,8 +473,7 @@ def main(argv: list[str] | None = None) -> None:
     terminator_id = pruned_cfg.terminator_id
     print(
         f"Pruned vocab: {pruned_cfg.vocab_size} tokens  "
-        f"terminator id: {terminator_id}  "
-        f"input_convention: {cfg.model.input_convention}"
+        f"terminator <|eot_id|>: {terminator_id}"
     )
 
     # ── Baselines (for W&B reference lines) ───────────────────────────────────
@@ -531,19 +500,17 @@ def main(argv: list[str] | None = None) -> None:
 
     # Built once per run: the scaffold segments are fixed, and building them per
     # batch would re-tokenize the same four strings thousands of times.
-    chat: ChatTemplate | None = None
-    if cfg.model.input_convention == "chat":
-        chat = ChatTemplate.from_tokenizer(tokenizer)
-        if terminator_id != chat.eot_token_id:
-            raise ValueError(
-                f"terminator id {terminator_id} != <|eot_id|> {chat.eot_token_id}; "
-                "rebuild the vocabulary with tools/build_vocab.py"
-            )
-        print(
-            f"Chat convention: audio starts at offset {chat.audio_offset}, "
-            f"scaffold {len(chat.seg_pre_audio)}+{len(chat.seg_pre_instruction)}"
-            f"+{len(chat.seg_pre_transcript)}+1 tokens, eot id {chat.eot_token_id}"
+    chat = ChatTemplate.from_tokenizer(tokenizer)
+    if terminator_id != chat.eot_token_id:
+        raise ValueError(
+            f"terminator id {terminator_id} != <|eot_id|> {chat.eot_token_id}; "
+            "rebuild the vocabulary with tools/build_vocab.py"
         )
+    print(
+        f"Chat template: audio starts at offset {chat.audio_offset}, "
+        f"scaffold {len(chat.seg_pre_audio)}+{len(chat.seg_pre_instruction)}"
+        f"+{len(chat.seg_pre_transcript)}+1 tokens, eot id {chat.eot_token_id}"
+    )
 
     metrics   = MetricCollector(
         tokenizer     = tokenizer,
@@ -625,7 +592,6 @@ def main(argv: list[str] | None = None) -> None:
                 "seed":                    cfg.seed,
                 "n_stages":                len(cfg.stages),
                 "instruction_mode":        cfg.run.instruction_mode,
-                "input_convention":        cfg.model.input_convention,
                 "stub":                    cfg.model.stub,
                 "gradient_checkpointing":  cfg.model.gradient_checkpointing,
                 "resume":                  str(cfg.resume) if cfg.resume else None,
@@ -697,7 +663,7 @@ def main(argv: list[str] | None = None) -> None:
             metrics, tokenizer,
             _diag_loader, _diag_iter,
             stage, stage_idx, run,
-            cfg, device, terminator_id, use_wandb, chat,
+            cfg, device, use_wandb, chat,
             ckpt_dir, baselines_data, train_start,
             modules_dirty,
         )

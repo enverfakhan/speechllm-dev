@@ -1,12 +1,14 @@
 """WebDataset-based dataloader for preprocessed LibriSpeech shards.
 
-Consumes shards written by scripts/preprocess.py. Each shard sample contains:
+Consumes shards written by tools/preprocess.py. Each shard sample contains:
   {key}.mel.npy          float16 numpy array, shape (80, T); T varies by utterance
-  {key}.unformatted.txt  plain text, BasicTextNormalizer output
-  {key}.formatted.txt    plain text, two-pass formatted transcript
+  {key}.unformatted.txt  verbatim label: lowercase, no punctuation
+  {key}.formatted.txt    written-form label: cased, punctuated, numerals as digits
 
-Does not perform any preprocessing — mel computation and transcript normalisation
-happen offline in scripts/preprocess.py.
+Both labels come from tools/label_formatted.py (an LLM labelling run; contract
+in claude_project_documents/FORMATTING_SPEC.md) via data/labels.jsonl, and
+tools/relabel_shards.py swaps them into existing shards.  Nothing here
+preprocesses — mel computation and labelling happen offline.
 
 Batch format returned by the DataLoader:
   mel                (B, 80, T_max)    float32  — zero-padded to T_max (multiple of 8)
@@ -16,7 +18,8 @@ Batch format returned by the DataLoader:
   transcript_ids     (B, T_trans_max)  int64    — tokenised transcript in pruned vocab
   transcript_lengths (B,)              int64    — real transcript token count per sample
 
-Pass this tuple directly to model.adapter.prepare_input().
+Pass this tuple (plus the embedding, ChatTemplate and bridge markers) to
+model.sequence.prepare_input().
 
 Epoch-level shard shuffling is the caller's responsibility:
 
@@ -72,14 +75,14 @@ class PrunedConfig:
     instead of hardcoding sizes or ids.
 
     The four chat special ids are None for a vocabulary built before the chat
-    convention existed (those files carry only ``sep_token_id``).  Such a
-    vocabulary can still run the flat convention — ``terminator_id`` resolves to
-    whichever EOS target the file defines — but not the chat one, which needs all
-    four (ChatTemplate.from_tokenizer says so loudly).
+    template existed (data/pruned_tokenizer/, which carries only
+    ``sep_token_id``).  Such a vocabulary still loads — the encode-only tools
+    (e.g. tools/check_vocab_coverage.py) read it — but nothing can train or
+    decode with it: ChatTemplate.from_tokenizer needs all four and says so.
     """
 
     vocab_size:      int
-    terminator_id:   int          # the EOS target: eot under chat, SEP under flat
+    terminator_id:   int          # the EOS target: eot (legacy vocab: its SEP)
     sep_token_id:    int | None = None
     bos_token_id:    int | None = None
     start_header_id: int | None = None
@@ -135,8 +138,8 @@ def load_pruned_config(tokenizer_path: Path | str) -> PrunedConfig:
 class PrunedTokenizer:
     """Loads a HuggingFace tokenizer and remaps IDs to the pruned vocabulary space.
 
-    Used in data.py for encoding during training and in train.py for decoding
-    generated token IDs back to text during WER evaluation.
+    Encodes labels and instructions for training, and decodes generated token
+    IDs back to text for WER evaluation.
     """
 
     def __init__(self, tokenizer_path: Path) -> None:
@@ -263,8 +266,8 @@ def build_dataloader(
         shard_pattern:        brace/glob pattern string, or an explicit list of
                               shard paths already in the desired consumption order
         tokenizer_path:       path to pruned tokenizer directory (build_vocab.py output)
-        terminator_id:        EOS token ID in the pruned vocabulary (SEP under the
-                              flat convention, <|eot_id|> under chat).  Not used for
+        terminator_id:        EOS token ID in the pruned vocabulary (<|eot_id|>).
+                              Not used for
                               collation — the batch carries bare transcript ids and
                               model/sequence.py appends the terminator during
                               assembly — but kept here so a loader and the sequences
@@ -624,9 +627,9 @@ if __name__ == "__main__":
         assert _pc.terminator_id == _pc.eot_token_id == 40038
         assert all(v is not None for v in _pc.chat_special_ids.values())
 
-        # A vocabulary built before the chat convention: terminator falls back to
-        # SEP and the chat ids stay None, so the flat convention still runs and
-        # the chat one refuses loudly (rather than assembling a broken scaffold).
+        # A vocabulary built before the chat template: terminator falls back to
+        # SEP and the chat ids stay None, so ChatTemplate refuses it loudly
+        # (rather than assembling a broken scaffold).
         (_dir / "pruned_config.json").write_text(
             _json.dumps({"vocab_size": 40034, "sep_token_id": 40033})
         )

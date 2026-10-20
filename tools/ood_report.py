@@ -61,7 +61,7 @@ USAGE
         --ours    commonvoice-en-test=results/ood/0015040_commonvoice-en-test.jsonl \\
         --control commonvoice-en-test=out/ood-commonvoice-whisper.jsonl \\
         --coverage out/ood-vocab-coverage.json \\
-        --vocab    data/pruned_tokenizer/ \\
+        --vocab    data/pruned_tokenizer_chat/ \\
         --out-md out/ood-report.md --out-json out/ood-report.json
 
 ``--vocab`` is optional and adds the fully-covered-utterances slice: the same
@@ -619,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--coverage", type=Path, default=None,
                    help="tools/check_vocab_coverage.py --out-json output.")
     p.add_argument("--vocab", type=Path, default=None,
-                   help="Pruned tokenizer dir (data/pruned_tokenizer/). When given, "
+                   help="Pruned tokenizer dir (data/pruned_tokenizer_chat/). When given, "
                         "the report adds a WER slice over fully-reachable utterances.")
     p.add_argument("--out-md", type=Path, default=None, dest="out_md")
     p.add_argument("--out-json", type=Path, default=None, dest="out_json")

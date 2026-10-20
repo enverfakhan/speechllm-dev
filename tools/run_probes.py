@@ -80,7 +80,7 @@ from probe_spec import (  # noqa: E402
 from build import build_models
 from data import (
     INSTRUCTION_VARIANTS, EvalSample, PrunedTokenizer,
-    _eval_collate_batch, load_pruned_config, read_eval_shard,
+    _eval_collate_batch, read_eval_shard,
 )
 from model.sequence import ChatTemplate, ConversationPrefix, ConversationPrefixBatch
 from utils.checkpoint import apply_weights, read_checkpoint
@@ -179,8 +179,7 @@ def decode_with_audio(
     *,
     encoder, adapter, llama,
     tokenizer:     PrunedTokenizer,
-    chat:          ChatTemplate | None,
-    terminator_id: int,
+    chat:          ChatTemplate,
     device:        torch.device,
     batch_size:    int,
     slack:         int = DEFAULT_SLACK,
@@ -232,9 +231,7 @@ def decode_with_audio(
         gen = greedy_generate(
             encoder, adapter, llama,
             mel, audio_lengths, instr_t, instr_lens,
-            stop_token_id  = terminator_id,
-            max_new_tokens = cap,
-            chat           = chat,
+            chat, max_new_tokens=cap,
         )
         hyps.extend(tokenizer.decode(g) for g in gen)
         if label:
@@ -296,7 +293,7 @@ def decode_text_only(
 
     pfx = ConversationPrefixBatch(prefixes, flags)
     gen = greedy_generate_from_prefix(
-        llama, pfx, terminator_id, max_new_tokens, audio_lengths=None,
+        llama, pfx, terminator_id, max_new_tokens,
     )
     return [tokenizer.decode(g) for g in gen]
 
@@ -454,11 +451,6 @@ def run_p4(samples, ctx, n_per_question: int, max_new: int) -> list[dict]:
             rows.append(row)
 
     # ── Text-only control ────────────────────────────────────────────────────
-    if ctx["chat"] is None:
-        print("[warn] flat convention: the text-only control needs the chat "
-              "scaffold to build a prompt with no audio — skipping it.")
-        return rows
-
     instr_lists = [tokenizer.encode(probe_instrs[q.qid]) for q in P4_QUESTIONS]
     hyps = decode_text_only(
         instr_lists,
@@ -540,10 +532,6 @@ def print_prompts(samples, probe_ids, ctx, n: int) -> None:
     its embedding table and the bridge markers.
     """
     chat = ctx["chat"]
-    if chat is None:
-        print("[warn] --print-prompts only renders the chat scaffold; the flat "
-              "convention has no layout to dump.")
-        return
     tokenizer = ctx["tokenizer"]
     decode    = _special_decoder(tokenizer)
     encoder, adapter, llama = ctx["encoder"], ctx["adapter"], ctx["llama"]
@@ -641,7 +629,7 @@ def apply_gate(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--config", type=Path, default=None,
-                   help="Training config YAML (model dims, tokenizer, convention). "
+                   help="Training config YAML (model dims, tokenizer). "
                         "Required for everything except --self-test.")
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Full checkpoint ('step*.pt' / '*-stage-handoff.pt'). "
@@ -694,8 +682,8 @@ def main(argv: list[str] | None = None) -> int:
         _self_test()
         return 0
     if args.config is None:
-        print("[error] --config is required (it carries the model dims, the "
-              "tokenizer and the input convention).")
+        print("[error] --config is required (it carries the model dims and the "
+              "tokenizer).")
         return 1
 
     cfg = load_config(args.config)
@@ -714,18 +702,12 @@ def main(argv: list[str] | None = None) -> int:
               "the string the model was trained on.")
         return 1
 
-    # ── Tokenizer / convention ───────────────────────────────────────────────
+    # ── Tokenizer / chat template ────────────────────────────────────────────
     tokenizer     = PrunedTokenizer(cfg.data.tokenizer)
-    terminator_id = load_pruned_config(cfg.data.tokenizer).terminator_id
-    chat: ChatTemplate | None = None
-    if cfg.model.input_convention == "chat":
-        chat = ChatTemplate.from_tokenizer(tokenizer)
-        print(f"Chat convention: audio offset {chat.audio_offset}, "
-              f"terminator <|eot_id|> = {terminator_id}")
-    else:
-        print(f"[warn] input_convention is {cfg.model.input_convention!r}. The "
-              "probes run, but P4's text-only control needs the chat scaffold "
-              "and will be skipped.")
+    chat          = ChatTemplate.from_tokenizer(tokenizer)
+    terminator_id = chat.eot_token_id
+    print(f"Chat template: audio offset {chat.audio_offset}, "
+          f"terminator <|eot_id|> = {terminator_id}")
 
     # ── Gate ─────────────────────────────────────────────────────────────────
     gate = read_gate(args.feasibility)
@@ -789,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         "device": device, "encoder": encoder, "adapter": adapter, "llama": llama,
         "gen": {
             "encoder": encoder, "adapter": adapter, "llama": llama,
-            "tokenizer": tokenizer, "chat": chat, "terminator_id": terminator_id,
+            "tokenizer": tokenizer, "chat": chat,
             "device": device, "batch_size": batch_size, "slack": args.slack,
         },
         "meta": {
@@ -834,7 +816,6 @@ def main(argv: list[str] | None = None) -> int:
         "step":         step,
         "config":       str(args.config),
         "tokenizer":    str(cfg.data.tokenizer),
-        "input_convention": cfg.model.input_convention,
         "shard":        str(shard),
         "split":        args.split,
         "seed":         args.seed,

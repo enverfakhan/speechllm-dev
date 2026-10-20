@@ -1,35 +1,28 @@
 """Sequence assembly and batched-generation utilities.
 
-Two input conventions, selected by cfg.model.input_convention and dispatched by
-assemble_inputs():
+Every sequence follows the Llama 3.1 Instruct chat template (prepare_input):
 
-  "flat"  (prepare_input)       the original layout
-              [audio] [SEP] [instruction] [SEP] [transcript] [SEP]
-          The trailing SEP is the EOS target: the model is trained to predict it
-          after the last transcript token so greedy decoding terminates.
+    [bos] [start_header] "user" [end_header] "\n\n"
+        AUDIO_BOS [audio] AUDIO_EOS "\n" [instruction]
+    [eot]
+    [start_header] "assistant" [end_header] "\n\n"
+        [transcript]
+    [eot]                          <- EOS target
 
-  "chat"  (prepare_input_chat)  the Llama 3.1 Instruct chat template
-              [bos] [start_header] "user" [end_header] "\n\n"
-                  AUDIO_BOS [audio] AUDIO_EOS "\n" [instruction]
-              [eot]
-              [start_header] "assistant" [end_header] "\n\n"
-                  [transcript]
-              [eot]                          <- EOS target
-          Only the TRAILING eot is a label; the user-turn eot and every scaffold
-          token are -100.  AUDIO_BOS/AUDIO_EOS are two learned vectors owned by
-          the bridge (model/adapter.py) - input-only embeddings, NOT vocabulary
-          tokens, so they own no logit row and can never be generated.
+Only the TRAILING eot is a label; the user-turn eot and every scaffold token are
+-100.  AUDIO_BOS/AUDIO_EOS are two learned vectors owned by the bridge
+(model/adapter.py) - input-only embeddings, NOT vocabulary tokens, so they own
+no logit row and can never be generated.
 
 Audio-first inside the user turn is deliberate: every token before AUDIO_BOS is
 fixed scaffold, so the audio always starts at the SAME offset
-(ChatTemplate.audio_offset) in every sample, and swapping instructions in a
-later experiment only ever touches the tail.  That constant offset is what lets
-prepare_input_chat hand Llama an exact audio mask for the in-layer adapters:
-under the chat convention the audio is NOT at [0, audio_lengths[i]).
+(ChatTemplate.audio_offset) in every sample, and swapping instructions only ever
+touches the tail.  That constant offset is what lets prepare_input hand Llama an
+exact audio mask for the in-layer adapters.
 
-EvalPrefixBatch handles batched greedy generation under either convention
-without causal attention ever seeing padding tokens in the history of real
-tokens.
+EvalPrefixBatch handles batched greedy generation without causal attention ever
+seeing padding tokens in the history of real tokens.  ConversationPrefix /
+ConversationPrefixBatch extend the same layout to multi-turn evaluation.
 """
 
 from __future__ import annotations
@@ -41,9 +34,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# Valid cfg.model.input_convention values; utils/config.py mirrors this set.
-INPUT_CONVENTIONS: frozenset[str] = frozenset({"flat", "chat"})
 
 # The ordinary (non-special) text the chat scaffold is built from.  Named here,
 # in the module that assembles the sequence, because tools/build_vocab.py must
@@ -59,106 +49,7 @@ CHAT_SCAFFOLD_TEXTS: tuple[str, ...] = (
 )
 
 
-def prepare_input(
-    adapter_out: torch.Tensor,
-    audio_lengths: torch.Tensor,
-    instruction_ids: torch.Tensor,
-    instruction_lengths: torch.Tensor,
-    transcript_ids: torch.Tensor,
-    transcript_lengths: torch.Tensor,
-    embed_layer: nn.Embedding,
-    sep_token_id: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assemble per-sample embedded sequences and loss masks, then batch-pad.
-
-    Each sample's sequence layout:
-        [audio: audio_lengths[i]] [SEP] [instruction: instruction_lengths[i]]
-        [SEP] [transcript: transcript_lengths[i]] [SEP]
-
-    The trailing SEP is the EOS target (not masked to -100); the model is
-    trained to predict it as the last output token.
-
-    Padding tokens beyond each length are stripped before concatenation, so
-    no pad token ever enters the sequence or the loss computation.
-    Samples are zero-padded at the end to the longest sequence in the batch.
-
-    The loss mask is -100 everywhere except the real transcript positions.
-
-    This function processes samples one at a time (simple Python loop).
-    If it becomes a throughput bottleneck a CUDA kernel can replace the loop
-    while keeping the same interface.
-
-    Args:
-        adapter_out:          (B, T_audio_max, 4096) — AudioAdapter output
-        audio_lengths:        (B,) — real audio tokens per sample, in [1, T_audio_max]
-        instruction_ids:      (B, T_inst_max)  — tokenised instruction prompts
-        instruction_lengths:  (B,) — real instruction tokens per sample
-        transcript_ids:       (B, T_trans_max) — tokenised transcripts
-        transcript_lengths:   (B,) — real transcript tokens per sample
-        embed_layer:          Llama's token embedding (nn.Embedding)
-        sep_token_id:         integer ID of the SEP token
-
-    Returns:
-        inputs: (B, L_max, 4096) — batch-padded embedded sequences (zero-padded)
-        labels: (B, L_max)       — -100 except at real transcript positions;
-                                   end-padding positions are also -100
-    """
-    B      = adapter_out.shape[0]
-    device = adapter_out.device
-
-    # Batch-embed instructions and transcripts up-front (single kernel call each)
-    inst_embeds  = embed_layer(instruction_ids)   # (B, T_inst_max,  d_model)
-    trans_embeds = embed_layer(transcript_ids)    # (B, T_trans_max, d_model)
-
-    sep_id    = torch.tensor([sep_token_id], dtype=torch.long, device=device)
-    sep_embed = embed_layer(sep_id)               # (1, d_model)
-
-    # Build one (sequence, label) pair per sample, then pad to a common length
-    seqs:   list[torch.Tensor] = []
-    labels: list[torch.Tensor] = []
-
-    for i in range(B):
-        T_audio = int(audio_lengths[i].item())
-        T_inst  = int(instruction_lengths[i].item())
-        T_trans = int(transcript_lengths[i].item())
-
-        # Slice to real lengths, discarding pad tokens
-        audio_emb = adapter_out[i, :T_audio, :]      # (T_audio, d_model)
-        inst_emb  = inst_embeds[i,  :T_inst,  :]     # (T_inst,  d_model)
-        trans_emb = trans_embeds[i, :T_trans, :]     # (T_trans, d_model)
-
-        # Final SEP serves as EOS: the model is trained to predict it after the
-        # last transcript token so generation naturally terminates.
-        seq_i = torch.cat(
-            [audio_emb, sep_embed, inst_emb, sep_embed, trans_emb, sep_embed], dim=0
-        )
-        seqs.append(seq_i)
-
-        T_prefix = T_audio + 1 + T_inst + 1          # audio + SEP + instruction + SEP
-        lbl_i = torch.cat([
-            torch.full((T_prefix,), -100, dtype=torch.long, device=device),
-            transcript_ids[i, :T_trans],
-            torch.tensor([sep_token_id], dtype=torch.long, device=device),
-        ], dim=0)
-        labels.append(lbl_i)
-
-    # Pad every sample to the longest sequence in this batch
-    L_max = max(s.shape[0] for s in seqs)
-
-    inputs = torch.stack([
-        F.pad(s, (0, 0, 0, L_max - s.shape[0]))      # zero-pad time dim
-        for s in seqs
-    ], dim=0)  # (B, L_max, d_model)
-
-    padded_labels = torch.stack([
-        F.pad(lbl, (0, L_max - lbl.shape[0]), value=-100)
-        for lbl in labels
-    ], dim=0)  # (B, L_max)
-
-    return inputs, padded_labels
-
-
-# ── Chat convention ───────────────────────────────────────────────────────────
+# ── Chat template ───────────────────────────────────────────────────────────
 
 class _SpecialTokens(Protocol):
     """What ChatTemplate.from_tokenizer needs of a tokenizer.
@@ -182,7 +73,7 @@ class _SpecialTokens(Protocol):
 class ChatTemplate:
     """The fixed Llama 3.1 Instruct scaffold segments, precomputed once.
 
-    Single source of truth for chat assembly: prepare_input_chat and
+    Single source of truth for sequence assembly: prepare_input and
     EvalPrefixBatch both build their sequences out of exactly these segments, and
     tools/build_vocab.py anchors them against the tokenizer's own
     ``apply_chat_template`` output at vocabulary-build time.
@@ -258,7 +149,7 @@ class ChatTemplate:
         missing = sorted(k for k, v in specials.items() if v is None)
         if missing:
             raise ValueError(
-                f"input_convention 'chat' needs the chat special ids {missing}, "
+                f"the chat template needs the special ids {missing}, "
                 "which this tokenizer does not define. Rebuild the vocabulary "
                 "with tools/build_vocab.py (it forces the four Llama 3.1 chat "
                 "specials into the keep-set and writes their pruned ids into "
@@ -290,7 +181,7 @@ class ChatTemplate:
         )
 
 
-def prepare_input_chat(
+def prepare_input(
     adapter_out: torch.Tensor,
     audio_lengths: torch.Tensor,
     instruction_ids: torch.Tensor,
@@ -310,8 +201,7 @@ def prepare_input_chat(
         [instruction]  seg_pre_transcript  [transcript]  [eot]
 
     Padding is stripped from audio / instruction / transcript before
-    concatenation exactly as in the flat path, then the batch is zero-padded to
-    the longest sequence.
+    concatenation, then the batch is zero-padded to the longest sequence.
 
     Labels are -100 everywhere except the assistant-turn transcript tokens and
     the TRAILING eot (the EOS target).  The user-turn eot inside
@@ -419,79 +309,19 @@ def prepare_input_chat(
     return inputs, padded_labels, audio_mask
 
 
-def assemble_inputs(
-    adapter_out: torch.Tensor,
-    audio_lengths: torch.Tensor,
-    instruction_ids: torch.Tensor,
-    instruction_lengths: torch.Tensor,
-    transcript_ids: torch.Tensor,
-    transcript_lengths: torch.Tensor,
-    embed_layer: nn.Embedding,
-    terminator_id: int,
-    chat: ChatTemplate | None = None,
-    audio_bos: torch.Tensor | None = None,
-    audio_eos: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Dispatch to the flat or chat assembler and return a uniform triple.
-
-    ``chat=None`` selects the flat convention and returns audio_mask=None, so
-    the caller passes ``audio_lengths`` to Llama.forward and gets exactly the
-    pre-chat behaviour.  With a ChatTemplate, the returned audio_mask is the
-    authoritative one and Llama.forward uses it verbatim.
-
-    Args:
-        (as prepare_input / prepare_input_chat)
-        terminator_id: EOS target id — the SEP under "flat", <|eot_id|> under
-                       "chat" (where it must equal chat.eot_token_id)
-        chat:          ChatTemplate for the chat convention, None for flat
-        audio_bos:     (d_model,) AUDIO_BOS marker; required when chat is set
-        audio_eos:     (d_model,) AUDIO_EOS marker; required when chat is set
-
-    Returns:
-        (inputs, labels, audio_mask | None)
-    """
-    if chat is None:
-        inputs, labels = prepare_input(
-            adapter_out, audio_lengths,
-            instruction_ids, instruction_lengths,
-            transcript_ids, transcript_lengths,
-            embed_layer, terminator_id,
-        )
-        return inputs, labels, None
-
-    if audio_bos is None or audio_eos is None:
-        raise ValueError(
-            "chat convention needs the bridge's audio_bos/audio_eos markers; "
-            "pass adapter.audio_bos / adapter.audio_eos"
-        )
-    if terminator_id != chat.eot_token_id:
-        raise ValueError(
-            f"terminator id {terminator_id} != chat.eot_token_id "
-            f"{chat.eot_token_id} — the chat convention has exactly one "
-            "terminator and it is <|eot_id|>"
-        )
-    return prepare_input_chat(
-        adapter_out, audio_lengths,
-        instruction_ids, instruction_lengths,
-        transcript_ids, transcript_lengths,
-        embed_layer, chat, audio_bos, audio_eos,
-    )
-
 class EvalPrefixBatch:
     """Stateful batched-generation context that never exposes padding to causal attention.
 
     Each sample starts with a fixed prefix ending exactly where the transcript
-    begins, so the first generated token is the first transcript token:
+    begins, so the first generated token is the first transcript token::
 
-        flat  [audio] [SEP] [instruction] [SEP]
-        chat  seg_pre_audio AUDIO_BOS [audio] AUDIO_EOS seg_pre_instruction
-              [instruction] seg_pre_transcript
-              (i.e. ending at the assistant header — see ChatTemplate)
+        seg_pre_audio AUDIO_BOS [audio] AUDIO_EOS seg_pre_instruction
+        [instruction] seg_pre_transcript
+        (i.e. ending at the assistant header — see ChatTemplate)
 
-    Under the chat convention the batch also carries an audio mask over the
-    prefix's audio-content span, exposed as :attr:`audio_mask` and grown with a
-    zero column per generated token (a generated token is never audio).  Pass it
-    to Llama.forward; ``audio_lengths`` alone cannot describe the chat layout.
+    The batch also carries an audio mask over the prefix's audio-content span,
+    exposed as :attr:`audio_mask` and grown with a zero column per generated
+    token (a generated token is never audio).  Pass it to Llama.forward.
 
     Prefixes differ in length across samples (different audio durations / instruction
     lengths). To batch them, shorter prefixes are right-padded with zeros to the
@@ -507,107 +337,58 @@ class EvalPrefixBatch:
     number of generation steps so far), so stacking into a single batched tensor is
     trivially correct at every step.
 
-    Usage::
-
-        pfx = EvalPrefixBatch(adapter_out, audio_lengths, instruction_ids,
-                              instruction_lengths, llama.embed_tokens, sep_token_id)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-        generated = [[] for _ in range(B)]
-        for _ in range(max_new_tokens):
-            context = pfx.get_batch()          # (B, current_len, d)
-            # Flat: audio_lengths keeps the gated adapters on the [0, T_a) prefix.
-            # Chat: pfx.audio_mask is the authoritative span (audio_mask wins).
-            logits, _ = llama(context, None, audio_lengths=audio_lengths,
-                              audio_mask=pfx.audio_mask)  # (B, current_len, vocab)
-            next_ids = logits[torch.arange(B), pfx.logit_indices, :].argmax(dim=-1)
-            for i in range(B):
-                if not finished[i]:
-                    if int(next_ids[i].item()) == sep_token_id:
-                        finished[i] = True
-                    else:
-                        generated[i].append(int(next_ids[i].item()))
-            if finished.all():
-                break
-            safe_ids    = next_ids.masked_fill(finished, 0)
-            next_embeds = llama.embed_tokens(safe_ids.unsqueeze(1))  # (B, 1, d)
-            pfx.append(next_embeds, finished)
+    The decoding loop that drives it is utils.generate.greedy_generate_from_prefix.
     """
 
     def __init__(
         self,
-        adapter_out: torch.Tensor,
-        audio_lengths: torch.Tensor,
-        instruction_ids: torch.Tensor,
+        adapter_out:         torch.Tensor,
+        audio_lengths:       torch.Tensor,
+        instruction_ids:     torch.Tensor,
         instruction_lengths: torch.Tensor,
-        embed_layer: nn.Embedding,
-        sep_token_id: int,
-        *,
-        chat:      "ChatTemplate | None" = None,
-        audio_bos: torch.Tensor | None   = None,
-        audio_eos: torch.Tensor | None   = None,
+        embed_layer:         nn.Embedding,
+        chat:                ChatTemplate,
+        audio_bos:           torch.Tensor,
+        audio_eos:           torch.Tensor,
     ) -> None:
         """Build per-sample prefix tensors and right-pad to max prefix length.
 
         Args:
-            adapter_out:         (B, T_audio_max, d_model) — AudioAdapter output
+            adapter_out:         (B, T_audio_max, d_model) — bridge output
             audio_lengths:       (B,) — real audio tokens per sample
             instruction_ids:     (B, T_inst_max) — tokenised instruction
             instruction_lengths: (B,) — real instruction tokens per sample
             embed_layer:         Llama's token embedding nn.Embedding
-            sep_token_id:        integer ID of the SEP / EOS token; unused for
-                                 assembly under the chat convention, whose
-                                 scaffold carries its own eot ids
-            chat:                ChatTemplate to assemble the chat prefix, or
-                                 None for the flat prefix
-            audio_bos/audio_eos: (d_model,) learned bridge markers; required
-                                 when chat is set
+            chat:                precomputed scaffold segments
+            audio_bos/audio_eos: (d_model,) learned bridge markers
         """
         B      = adapter_out.shape[0]
         device = adapter_out.device
 
         inst_embeds = embed_layer(instruction_ids)   # (B, T_inst_max, d)
 
-        if chat is not None and (audio_bos is None or audio_eos is None):
-            raise ValueError(
-                "chat convention needs the bridge\'s audio_bos/audio_eos markers"
-            )
+        def _seg(ids: tuple[int, ...]) -> torch.Tensor:
+            return embed_layer(torch.tensor(ids, dtype=torch.long, device=device))
+
+        pre_audio_emb       = _seg(chat.seg_pre_audio)
+        pre_instruction_emb = _seg(chat.seg_pre_instruction)
+        pre_transcript_emb  = _seg(chat.seg_pre_transcript)
+        marker_bos = audio_bos.unsqueeze(0).to(pre_audio_emb.dtype)
+        marker_eos = audio_eos.unsqueeze(0).to(pre_audio_emb.dtype)
 
         prefixes: list[torch.Tensor] = []
-        if chat is None:
-            sep_id  = torch.tensor([sep_token_id], dtype=torch.long, device=device)
-            sep_emb = embed_layer(sep_id)            # (1, d)
-            for i in range(B):
-                T_a = int(audio_lengths[i].item())
-                T_i = int(instruction_lengths[i].item())
-                pfx = torch.cat([
-                    adapter_out[i, :T_a, :],   # audio tokens
-                    sep_emb,                    # SEP
-                    inst_embeds[i, :T_i, :],   # instruction tokens
-                    sep_emb,                    # SEP (before transcript slot)
-                ], dim=0)  # (L_prefix_i, d)
-                prefixes.append(pfx)
-        else:
-            def _seg(ids: tuple[int, ...]) -> torch.Tensor:
-                return embed_layer(torch.tensor(ids, dtype=torch.long, device=device))
-
-            pre_audio_emb       = _seg(chat.seg_pre_audio)
-            pre_instruction_emb = _seg(chat.seg_pre_instruction)
-            pre_transcript_emb  = _seg(chat.seg_pre_transcript)
-            marker_bos = audio_bos.unsqueeze(0).to(pre_audio_emb.dtype)
-            marker_eos = audio_eos.unsqueeze(0).to(pre_audio_emb.dtype)
-            for i in range(B):
-                T_a = int(audio_lengths[i].item())
-                T_i = int(instruction_lengths[i].item())
-                pfx = torch.cat([
-                    pre_audio_emb,                 # user header
-                    marker_bos,                    # AUDIO_BOS
-                    adapter_out[i, :T_a, :],       # audio content
-                    marker_eos,                    # AUDIO_EOS
-                    pre_instruction_emb,           # "\n"
-                    inst_embeds[i, :T_i, :],       # instruction
-                    pre_transcript_emb,            # eot + assistant header
-                ], dim=0)  # (L_prefix_i, d)
-                prefixes.append(pfx)
+        for i in range(B):
+            T_a = int(audio_lengths[i].item())
+            T_i = int(instruction_lengths[i].item())
+            prefixes.append(torch.cat([
+                pre_audio_emb,                 # user header
+                marker_bos,                    # AUDIO_BOS
+                adapter_out[i, :T_a, :],       # audio content
+                marker_eos,                    # AUDIO_EOS
+                pre_instruction_emb,           # "\n"
+                inst_embeds[i, :T_i, :],       # instruction
+                pre_transcript_emb,            # eot + assistant header
+            ], dim=0))                         # (L_prefix_i, d)
 
         # gen_pos[i]: index of the next slot to write a generated token into
         self._gen_pos = torch.tensor(
@@ -623,22 +404,18 @@ class EvalPrefixBatch:
             ctx[i, : p.shape[0]] = p
         self._ctx = ctx   # (B, L_max, d) — grows by 1 column each step
 
-        # Chat convention: the audio sits at a constant offset inside the
-        # scaffold, so the gated in-layer adapters need an explicit mask.  Flat
-        # convention: None, and the caller keeps passing audio_lengths (audio is
-        # the [0, T_a) prefix there).
-        self._audio_mask: torch.Tensor | None = None
-        if chat is not None:
-            offset = chat.audio_offset
-            mask   = torch.zeros(B, L_max, 1, device=device, dtype=ctx.dtype)
-            for i in range(B):
-                T_a = int(audio_lengths[i].item())
-                mask[i, offset : offset + T_a, 0] = 1.0
-            self._audio_mask = mask
+        # The audio sits at a constant offset inside the scaffold, so the gated
+        # in-layer adapters need an explicit mask.
+        offset = chat.audio_offset
+        mask   = torch.zeros(B, L_max, 1, device=device, dtype=ctx.dtype)
+        for i in range(B):
+            T_a = int(audio_lengths[i].item())
+            mask[i, offset : offset + T_a, 0] = 1.0
+        self._audio_mask = mask
 
     @property
-    def audio_mask(self) -> torch.Tensor | None:
-        """(B, current_len, 1) audio-content mask, or None under the flat convention."""
+    def audio_mask(self) -> torch.Tensor:
+        """(B, current_len, 1) audio-content mask."""
         return self._audio_mask
 
     @property
@@ -670,7 +447,7 @@ class EvalPrefixBatch:
 
         Args:
             token_embeds: (B, 1, d_model) — embedding of the just-chosen token
-            finished:     (B,) bool — sequences that have already emitted SEP
+            finished:     (B,) bool — sequences that have already emitted the eot
         """
         B, _, d = token_embeds.shape
         device  = self._ctx.device
@@ -681,9 +458,8 @@ class EvalPrefixBatch:
 
         # Generated tokens are never audio, so the mask grows with zeros — and
         # it must grow, or it would no longer line up with the context.
-        if self._audio_mask is not None:
-            mask_col = torch.zeros(B, 1, 1, device=device, dtype=self._audio_mask.dtype)
-            self._audio_mask = torch.cat([self._audio_mask, mask_col], dim=1)
+        mask_col = torch.zeros(B, 1, 1, device=device, dtype=self._audio_mask.dtype)
+        self._audio_mask = torch.cat([self._audio_mask, mask_col], dim=1)
 
         # Overwrite the gen_pos slot for each unfinished sequence
         for i in range(B):
@@ -1060,7 +836,7 @@ if __name__ == "__main__":
     audio_bos = nn.Parameter(torch.randn(DIM))
     audio_eos = nn.Parameter(torch.randn(DIM))
 
-    inputs, labels, audio_mask = prepare_input_chat(
+    inputs, labels, audio_mask = prepare_input(
         adapter_out, audio_lengths,
         instruction_ids, instruction_lengths,
         transcript_ids, transcript_lengths,
@@ -1133,76 +909,10 @@ if __name__ == "__main__":
             )
     print("[OK] scaffold ids: every non-audio position matches the intended token")
 
-    # ── Test (d): flat path unchanged (regression guard) ──────────────────────
-    SEP = 39
-    flat_inputs, flat_labels = prepare_input(
-        adapter_out, audio_lengths,
-        instruction_ids, instruction_lengths,
-        transcript_ids, transcript_lengths,
-        embed, SEP,
-    )
-    sep_emb = embed.weight[SEP]
-    for i in range(B):
-        T_a, T_i = int(audio_lengths[i].item()), int(instruction_lengths[i].item())
-        T_t      = int(transcript_lengths[i].item())
-        want = torch.cat([
-            adapter_out[i, :T_a], sep_emb[None],
-            embed.weight[instruction_ids[i, :T_i]], sep_emb[None],
-            embed.weight[transcript_ids[i, :T_t]], sep_emb[None],
-        ], dim=0)
-        assert torch.allclose(flat_inputs[i, : want.shape[0]], want), f"flat sample {i}"
-        assert (flat_inputs[i, want.shape[0]:] == 0).all(), "flat tail must be zero-padded"
-        want_lbl = ([-100] * (T_a + 1 + T_i + 1)
-                    + transcript_ids[i, :T_t].tolist() + [SEP])
-        assert flat_labels[i, : len(want_lbl)].tolist() == want_lbl, f"flat labels {i}"
-    # assemble_inputs must route to it unchanged, mask None.
-    a_inputs, a_labels, a_mask = assemble_inputs(
-        adapter_out, audio_lengths,
-        instruction_ids, instruction_lengths,
-        transcript_ids, transcript_lengths,
-        embed, SEP,
-    )
-    assert a_mask is None, "flat convention must report no audio mask"
-    assert torch.equal(a_inputs, flat_inputs) and torch.equal(a_labels, flat_labels)
-    print("[OK] flat path bit-identical, and assemble_inputs dispatches to it")
-
-    # assemble_inputs on the chat path must agree with prepare_input_chat, and
-    # must refuse a terminator that is not the chat eot.
-    c_inputs, c_labels, c_mask = assemble_inputs(
-        adapter_out, audio_lengths,
-        instruction_ids, instruction_lengths,
-        transcript_ids, transcript_lengths,
-        embed, chat.eot_token_id, chat=chat, audio_bos=audio_bos, audio_eos=audio_eos,
-    )
-    assert torch.equal(c_inputs, inputs) and torch.equal(c_labels, labels)
-    assert torch.equal(c_mask, audio_mask)
-    for bad_kwargs in ({"chat": chat}, {"chat": chat, "audio_bos": audio_bos}):
-        try:
-            assemble_inputs(
-                adapter_out, audio_lengths, instruction_ids, instruction_lengths,
-                transcript_ids, transcript_lengths, embed, chat.eot_token_id,
-                **bad_kwargs,
-            )
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("chat assembly without both markers must raise")
-    try:
-        assemble_inputs(
-            adapter_out, audio_lengths, instruction_ids, instruction_lengths,
-            transcript_ids, transcript_lengths, embed, SEP,
-            chat=chat, audio_bos=audio_bos, audio_eos=audio_eos,
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("a terminator that is not chat.eot_token_id must raise")
-    print("[OK] assemble_inputs: chat dispatch, marker and terminator guards")
-
     # ── EvalPrefixBatch: chat prefix ends at the assistant header ─────────────
     pfx = EvalPrefixBatch(
         adapter_out, audio_lengths, instruction_ids, instruction_lengths,
-        embed, chat.eot_token_id, chat=chat, audio_bos=audio_bos, audio_eos=audio_eos,
+        embed, chat, audio_bos, audio_eos,
     )
     ctx = pfx.get_batch()
     for i in range(B):
@@ -1230,18 +940,8 @@ if __name__ == "__main__":
     assert float(pfx.audio_mask[:, -1].sum()) == 0.0, "generated tokens are never audio"
     for i in range(B):
         assert float(pfx.audio_mask[i].sum()) == int(audio_lengths[i].item())
-    print("[OK] EvalPrefixBatch (chat): prefix ends at the assistant header, "
+    print("[OK] EvalPrefixBatch: prefix ends at the assistant header, "
           "mask covers only the audio span and grows with zeros")
-
-    # ── EvalPrefixBatch: flat mode unchanged ──────────────────────────────────
-    flat_pfx = EvalPrefixBatch(
-        adapter_out, audio_lengths, instruction_ids, instruction_lengths, embed, SEP,
-    )
-    assert flat_pfx.audio_mask is None, "flat mode must expose no audio mask"
-    for i in range(B):
-        want_len = int(audio_lengths[i].item()) + 1 + int(instruction_lengths[i].item()) + 1
-        assert int(flat_pfx.logit_indices[i].item()) == want_len - 1
-    print("[OK] EvalPrefixBatch (flat): unchanged")
 
     # ── Multi-turn: turn 1 must reproduce the single-turn prefix exactly ──────
     # The whole multi-turn eval rests on this: if turn 1 differs from what the
@@ -1256,7 +956,7 @@ if __name__ == "__main__":
 
     single = EvalPrefixBatch(
         adapter_out, audio_lengths, instruction_ids, instruction_lengths,
-        embed, chat.eot_token_id, chat=chat, audio_bos=audio_bos, audio_eos=audio_eos,
+        embed, chat, audio_bos, audio_eos,
     )
     single_ctx = single.get_batch()
     for i, cp in enumerate(convs):

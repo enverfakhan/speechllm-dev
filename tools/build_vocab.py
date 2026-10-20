@@ -8,7 +8,7 @@ full 960h corpus regardless of which splits have been processed.
 Two sources of label text, and they must match whatever the shards actually hold:
 
   --labels_file  read the label text straight out of a labels JSONL
-                 (tools/label_formatted.py finalize, or tools/precompute_labels.py).
+                 (tools/label_formatted.py finalize).
                  Records marked "validation": "failed" are skipped, exactly as
                  tools/preprocess.py and tools/relabel_shards.py skip them, so the
                  vocabulary covers the shipped corpus and nothing else.
@@ -76,19 +76,19 @@ Output directory layout:
 pruned_config.json carries the pruned-space ids of the four chat specials
 (bos_token_id, start_header_id, end_header_id, eot_token_id) plus vocab_size.
 eot_token_id is THE terminator: the only emitted stop token and the only trailing
-EOS target.  sep_token_id is written as an alias of it so that a run still using
-the flat convention against this vocabulary terminates on the same token.
+EOS target.  sep_token_id is written as an alias of it, so a reader that still
+looks the terminator up under the older key gets the same token.
 
 Usage:
     python tools/build_vocab.py \\
       --labels_file      data/labels.jsonl \\
-      --llama_dir        weights/llama3.1-8b/ \\
-      --output_dir       data/pruned_tokenizer/
+      --llama_dir        weights/Llama3.1-8B-Instruct/ \\
+      --output_dir       data/pruned_tokenizer_chat/
 
     python tools/build_vocab.py \\
       --librispeech_dir  data/librispeech/LibriSpeech/ \\
-      --llama_dir        weights/llama3.1-8b/ \\
-      --output_dir       data/pruned_tokenizer/
+      --llama_dir        weights/Llama3.1-8B-Instruct/ \\
+      --output_dir       data/pruned_tokenizer_chat/
 """
 
 from __future__ import annotations
@@ -378,7 +378,7 @@ def _iter_label_texts(labels_file: Path) -> Iterator[str]:
     A record marked "validation": "failed" is skipped: tools/preprocess.py and
     tools/relabel_shards.py drop those samples, so their tokens are not in the
     corpus and have no business reserving embedding rows. Records with no
-    `validation` field (tools/precompute_labels.py output) count as usable.
+    `validation` field (older labels files) count as usable.
     """
     n_ok = n_failed = 0
     with labels_file.open(encoding="utf-8") as f:
@@ -711,8 +711,8 @@ def build_vocab(
         "vocab_size": pruned_size,
         # <|eot_id|> is THE terminator: the only emitted stop token and the only
         # trailing EOS target.  sep_token_id is written as an alias of it so a
-        # flat-convention run against this vocabulary stops on the same token
-        # (there is no separate SEP any more).
+        # reader using the older key gets the same token (there is no separate
+        # SEP any more).
         "eot_token_id":     eot_new_id,
         "sep_token_id":     eot_new_id,
         "bos_token_id":     pruned_special_ids["bos_token_id"],
@@ -735,8 +735,7 @@ def build_vocab(
     print(f"Tokenizer files      : {copied}")
     print(f"Output directory     : {output_dir}")
     print()
-    print("Remember: rebuilding REASSIGNS every id. Update metrics.py:_VOCAB_SIZE "
-          "and tools/probe_accum.py:_VOCAB_SIZE to "
+    print("Remember: rebuilding REASSIGNS every id. Update metrics.py:_VOCAB_SIZE to "
           f"{pruned_size}, and rebuild baselines.json (tools/compute_baselines.py).")
 
 

@@ -1,23 +1,18 @@
-# stub_chat.yaml — 20-step stub TRAINING run under the chat convention.
+# stub_chat.yaml — 20-step, two-stage stub TRAINING run.
 # Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
 #
-# The local stand-in for configs/instruct-chat-3stage.yaml: a tiny random Llama
-# with the same input_convention / bridge / in-layer adapter shape, so the
-# training loop's chat path — ChatTemplate assembly, audio_mask at the constant
-# offset, <|eot_id|> as the EOS target — runs end to end on the RTX 3060.
-# (Replaces the retired `--stub --max-steps 20` CLI flags, which never existed
-# and were silently ignored.)
+# A tiny random Llama with the E1 bridge and in-layer adapter shape, so the
+# training loop — ChatTemplate assembly, audio_mask at the constant offset,
+# <|eot_id|> as the EOS target — runs end to end on the RTX 3060.  Also the
+# model tools/equivalence_check.py captures.  configs/stub_chat_3stage.yaml
+# covers the full three-stage curriculum.
 #
 #   python training.py --config configs/stub_chat.yaml
 model:
   stub: true
   whisper_ckpt: null
-  input_convention:   chat
-  bridge_type:        swiglu
   audio_adapter_r:    16
-  audio_adapter_type: swiglu
 data:
-  tokenizer:   data/pruned_tokenizer_chat/
   shards: data_stub/stub-train-{000000..000001}.tar
   diag_shard:  data_stub/stub-diag-000000.tar
   num_workers: 0
