@@ -5,7 +5,8 @@ A single-stage stub run on the same seed and data produces identical loss
 trajectories to train.py.
 
 Usage:
-    python training.py --config configs/example.yaml [--stub] [--resume path/to/ckpt.pt]
+    python training.py --config configs/example.yaml [--resume path/to/ckpt.pt]
+    python training.py --config configs/stub.yaml        # local stub run (model.stub: true)
     python training.py --config configs/example.yaml --wandb --run-name my-run
 """
 

@@ -1,0 +1,41 @@
+# stub_longform.yaml — CPU/small-GPU sanity config for tools/run_longform.py.
+# Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
+#
+# A tiny randomly-initialised Llama under the CHAT convention, so the multi-turn
+# harness can be exercised — sequence layout, audio masks across several turns,
+# batching, JSONL schema — without an 8B model or a pod.  The hypotheses are
+# garbage by construction; the plumbing is what is under test.
+#
+# audio_adapter_r is deliberately non-zero: the in-layer adapters are the one
+# component that reads the audio MASK rather than the sequence, and under a
+# multi-turn layout that mask has several disjoint spans.  A stub run with the
+# adapters disabled would never exercise it.
+#
+#   python tools/run_longform.py --config configs/stub_longform.yaml \
+#       --shard stub=data_stub/stub-diag-000000.tar \
+#       --turns 3 --max-convs 2 --print-layout 1 --out-dir out/longform-stub
+model:
+  stub: true
+  whisper_ckpt: null
+  input_convention:   chat
+  bridge_type:        swiglu
+  audio_adapter_r:    16
+  audio_adapter_type: swiglu
+data:
+  tokenizer:   data/pruned_tokenizer_chat/
+  shards: data_stub/stub-train-{000000..000001}.tar   # unused here; config validation wants one
+  num_workers: 0
+logging: {wandb: false, project: speech-llm-dev}
+checkpoint: {dir: checkpoints/stub, save_every: null}
+run: {max_steps: 1, instruction_mode: both}
+metrics:
+  eval_every: 5
+  eval_batches: 2
+  eval_batch_size: 4
+  wer: {enabled: false}
+stages:
+  - name: adapter_only
+    trainable: [adapter]
+    lrs: {adapter: 1.0e-4}
+    batch_size: 2
+    exit: {strategy: never}

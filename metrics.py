@@ -355,24 +355,31 @@ class FirstTokenVotesMetric(_Metric):
         self._k_top5     = f"{_p}/first_token_top5"
         self._k_sep      = f"collapse/{_s}_sep_fraction"
         self.name        = [self._k_top5, self._k_sep]
-        self._votes:  dict[int, int] = {}
-        self._micros: int            = 0
+        self._votes:     dict[int, int] = {}
+        self._n_samples: int            = 0   # samples with a first transcript token
+        self._n_sep_top1: int           = 0   # ... whose argmax prediction is the terminator
 
     def update(self, *, inter: _LogitsInter) -> None:
-        self._micros += 1
         for i in range(inter.B):
             row_mask = inter.unmasked[i]
             nz = row_mask.nonzero(as_tuple=False)
             if len(nz) == 0:
                 continue
-            first_pos = int(nz[0].item())
-            if first_pos > 0:
-                pred_logit = inter.shift_logits[i, first_pos - 1]
-                for tid in pred_logit.topk(self._top_k).indices.tolist():
-                    self._votes[tid] = self._votes.get(tid, 0) + 1
+            # In shifted coordinates shift_logits[i, t] predicts shift_labels[i, t],
+            # so the first unmasked position IS the first-transcript-token
+            # prediction — the same index FirstTokenLossMetric reads.  (This used
+            # to read first_pos - 1, i.e. the prediction of the token BEFORE the
+            # transcript: the SEP under flat, "\n\n" under chat.)
+            first_pos  = int(nz[0].item())
+            pred_logit = inter.shift_logits[i, first_pos]
+            self._n_samples += 1
+            if int(inter.top1_preds[i, first_pos].item()) == self._sep_id:
+                self._n_sep_top1 += 1
+            for tid in pred_logit.topk(self._top_k).indices.tolist():
+                self._votes[tid] = self._votes.get(tid, 0) + 1
 
     def compute(self) -> dict[str, float | str]:
-        if not self._votes:
+        if self._n_samples == 0:
             return {}
         top = sorted(self._votes.items(), key=lambda kv: kv[1], reverse=True)[: self._top_k]
         parts = []
@@ -380,17 +387,23 @@ class FirstTokenVotesMetric(_Metric):
             # The terminator has no printable text (and PrunedTokenizer.decode
             # filters it), so label it rather than showing an empty string.
             tok_text = self._tok.decode([tid]) if tid != self._sep_id else "<EOS>"
-            frac     = count / max(self._micros, 1)
+            # Fraction of SAMPLES with this token among their top-k first-token
+            # predictions — in [0, 1].  Each sample casts top_k votes, so these
+            # fractions sum to at most top_k, not to 1.
+            frac     = count / self._n_samples
             parts.append(f"'{tok_text}'({frac:.0%})")
-        sep_frac = self._votes.get(self._sep_id, 0) / max(sum(self._votes.values()), 1)
+        # Fraction of samples whose ARGMAX first token is the terminator: the
+        # rate at which greedy decoding would stop before emitting a word.
+        sep_frac = self._n_sep_top1 / self._n_samples
         return {
             self._k_top5: "  ".join(parts),
             self._k_sep:  sep_frac,
         }
 
     def reset(self) -> None:
-        self._votes  = {}
-        self._micros = 0
+        self._votes      = {}
+        self._n_samples  = 0
+        self._n_sep_top1 = 0
 
 
 class EntropyMetric(_Metric):
@@ -768,6 +781,43 @@ if __name__ == "__main__":
     class _FakeTok:
         def decode(self, ids: list[int]) -> str:
             return f"w{ids[0]}"
+
+    # ── FirstTokenVotesMetric: hand-computed B=4 batch ────────────────────────
+    # V=8, terminator=7, top_k=5.  Rows are given an explicit ranking at the
+    # first-transcript-token prediction (shift index first_pos), so top-5 sets
+    # and argmaxes are known by hand:
+    #     s0: [7,1,2,3,4]  argmax = SEP     s1: [1,7,2,3,4]  argmax = 1
+    #     s2: [1,2,3,4,5]  argmax = 1       s3: [7,2,3,4,5]  argmax = SEP
+    # Top-5 sample counts: 2,3,4 → 4/4;  7,1 → 3/4;  5 → 2/4.
+    # SEP fraction (argmax == SEP) = 2/4 = 0.5.  The old slot-share definition
+    # gave 3 SEP votes / 20 votes = 0.15; the old /micro-batch normaliser gave
+    # 400% for tokens 2,3,4 once update() ran twice.
+    # Decoy rows at first_pos - 1 put a huge logit on token 0, so reading the
+    # pre-fix (off-by-one) position would surface token 0 and fail.
+    _V, _SEP, _K = 8, 7, 5
+    _rank = {0: [7, 1, 2, 3, 4], 1: [1, 7, 2, 3, 4], 2: [1, 2, 3, 4, 5], 3: [7, 2, 3, 4, 5]}
+    _first_label = {0: 3, 1: 3, 2: 4, 3: 4}      # unshifted label index of 1st transcript token
+    _labels = torch.full((4, 7), -100, dtype=torch.long)
+    _logits = torch.zeros(4, 7, _V)
+    for _b in range(4):
+        _p = _first_label[_b]
+        _labels[_b, _p:_p + 2] = torch.tensor([1, _SEP])  # transcript token + terminator
+        _fp = _p - 1                                      # shift index of the first prediction
+        for _score, _tid in zip((5.0, 4.0, 3.0, 2.0, 1.0), _rank[_b]):
+            _logits[_b, _fp, _tid] = _score
+        _logits[_b, _fp - 1, 0] = 100.0                   # decoy at the old, wrong index
+    _m = FirstTokenVotesMetric("eval", 1, _K, _FakeTok(), _SEP)
+    _inter = _compute_inter(_logits, _labels)
+    _m.update(inter=_inter)
+    _m.update(inter=_inter)                               # 2 micro-batches, 8 samples
+    _r = _m.compute()
+    assert _r["collapse/eval_sep_fraction"] == 0.5, _r
+    assert _r["diag_eval/first_token_top5"] == (
+        "'w2'(100%)  'w3'(100%)  'w4'(100%)  '<EOS>'(75%)  'w1'(75%)"
+    ), _r["diag_eval/first_token_top5"]
+    _m.reset()
+    assert _m.compute() == {}, "reset must clear the vote accumulators"
+    print("[OK] FirstTokenVotesMetric: top-5 per-sample fractions, argmax SEP fraction")
 
     SEP_ID    = _VOCAB_SIZE - 1   # stands in for the terminator (eot / SEP)
     LOG_EVERY = 10

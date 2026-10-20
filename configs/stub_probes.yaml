@@ -1,0 +1,49 @@
+# stub_probes.yaml — CPU/small-GPU sanity config for tools/run_probes.py.
+# Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
+#
+# A tiny randomly-initialised Llama under the CHAT convention, so the probe
+# harness can be exercised — prompt assembly for five different instruction
+# shapes, the audio mask, the TEXT-ONLY control (a prompt with no audio in it at
+# all), batching and the JSONL schema — without an 8B model or a pod.  The
+# hypotheses are garbage by construction; the plumbing and the prompts are what
+# is under test, which is why --print-prompts exists.
+#
+# Mirrors stub_longform.yaml: same tokenizer (the CHAT vocabulary — the probe
+# suite is aimed at the Instruct line), same swiglu bridge, and a non-zero
+# audio_adapter_r so the in-layer adapters actually read the audio mask.  That
+# matters here for the same reason it matters there: the text-only P4 control
+# hands the model an all-zero mask, and with the adapters disabled nothing would
+# ever look at it.
+#
+#   python tools/run_probes.py --config configs/stub_probes.yaml \
+#       --shard data_stub/stub-diag-000000.tar \
+#       --feasibility out/probe-feasibility.json \
+#       --probes P3 P4 --n 5 --print-prompts 2 --decode-anyway \
+#       --out-dir out/probes-stub
+model:
+  stub: true
+  whisper_ckpt: null
+  input_convention:   chat
+  bridge_type:        swiglu
+  audio_adapter_r:    16
+  audio_adapter_type: swiglu
+data:
+  tokenizer:   data/pruned_tokenizer_chat/
+  shards: data_stub/stub-train-{000000..000001}.tar   # unused here; config validation wants one
+  num_workers: 0
+  eval:
+    dev_clean: data_stub/stub-diag-000000.tar
+logging: {wandb: false, project: speech-llm-dev}
+checkpoint: {dir: checkpoints/stub, save_every: null}
+run: {max_steps: 1, instruction_mode: both}
+metrics:
+  eval_every: 5
+  eval_batches: 2
+  eval_batch_size: 4
+  wer: {enabled: false}
+stages:
+  - name: adapter_only
+    trainable: [adapter]
+    lrs: {adapter: 1.0e-4}
+    batch_size: 2
+    exit: {strategy: never}

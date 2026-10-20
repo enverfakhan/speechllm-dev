@@ -217,6 +217,21 @@ class ChatTemplate:
         """
         return len(self.seg_pre_audio) + 1
 
+    @property
+    def seg_user_continuation(self) -> tuple[int, ...]:
+        """User-turn opener for every user turn AFTER the first.
+
+        ``seg_pre_audio`` opens the CONVERSATION, so its first id is [bos].  A
+        second user turn opens with the same header minus that bos, preceded by
+        the [eot] that closes the assistant turn before it — the exact mirror of
+        ``seg_pre_transcript``, whose leading [eot] closes the user turn.
+
+        Training is single-turn and never touches this; multi-turn EVALUATION
+        (tools/run_longform.py) is the only consumer.  It is derived from the
+        same segments rather than re-encoded so the two layouts cannot drift.
+        """
+        return (self.eot_token_id,) + self.seg_pre_audio[1:]
+
     @classmethod
     def from_tokenizer(cls, tokenizer: _SpecialTokens) -> "ChatTemplate":
         """Precompute the scaffold segments from a tokenizer's ids.
@@ -677,6 +692,311 @@ class EvalPrefixBatch:
                 self._gen_pos[i] += 1
 
 
+# ── Multi-turn (evaluation only) ──────────────────────────────────────────────
+#
+# The model is trained SINGLE-TURN.  Everything below assembles the same chat
+# scaffold into a multi-turn conversation so a zero-shot eval can ask what the
+# model does when audio arrives as successive user turns
+# (tools/run_longform.py).  Nothing here is reachable from training.py.
+
+# Sentinels for the human-readable id trace a ConversationPrefix keeps alongside
+# its embeddings.  Audio positions carry no token id at all — that is the whole
+# point of splicing bridge output straight into the residual stream — so the
+# trace records what occupies the slot instead.
+AUDIO_SLOT:     str = "<audio>"
+AUDIO_BOS_SLOT: str = "<AUDIO_BOS>"
+AUDIO_EOS_SLOT: str = "<AUDIO_EOS>"
+
+
+class ConversationPrefix:
+    """One conversation's chat sequence, grown turn by turn in embedding space.
+
+    Built out of ChatTemplate's own segments, so the single-turn layout and the
+    multi-turn one cannot drift::
+
+        turn 1  seg_pre_audio        ▸BOS [audio] ▸EOS  seg_pre_instruction
+                {instruction}  seg_pre_transcript  {transcript}
+        turn t  seg_user_continuation ▸BOS [audio] ▸EOS  seg_pre_instruction
+                {instruction}  seg_pre_transcript  {transcript}
+
+    The [eot] closing each assistant turn is the FIRST id of the next turn's
+    ``seg_user_continuation``, exactly as the [eot] closing each user turn is the
+    first id of ``seg_pre_transcript``.  A conversation therefore ends without a
+    trailing eot in the prefix — the model is expected to generate the final one,
+    which is precisely what the eval measures.
+
+    Three parallel records are kept, all the same length:
+      * embeddings — the actual model input
+      * audio mask — 1.0 on audio CONTENT positions only, across every turn
+      * id trace   — token id per position, or one of the AUDIO_* sentinels,
+                     so a layout can be printed and asserted position by position
+
+    Concatenation is deferred: segments accumulate in a list and are joined only
+    when :attr:`embeddings` is read.
+    """
+
+    def __init__(
+        self,
+        chat:        ChatTemplate,
+        embed_layer: nn.Embedding,
+        audio_bos:   torch.Tensor,
+        audio_eos:   torch.Tensor,
+    ) -> None:
+        """Start an empty conversation.
+
+        Args:
+            chat:        precomputed scaffold segments (pruned id space)
+            embed_layer: Llama's token embedding (nn.Embedding)
+            audio_bos:   (d_model,) learned AUDIO_BOS marker (bridge param)
+            audio_eos:   (d_model,) learned AUDIO_EOS marker (bridge param)
+        """
+        self._chat  = chat
+        self._embed = embed_layer
+        self._device = embed_layer.weight.device
+        self._marker_bos = audio_bos.detach().unsqueeze(0)   # (1, d_model)
+        self._marker_eos = audio_eos.detach().unsqueeze(0)
+
+        self._parts:  list[torch.Tensor] = []   # each (L_k, d_model)
+        self._flags:  list[torch.Tensor] = []   # each (L_k,) float, 1.0 = audio
+        self._trace:  list[int | str]    = []
+        self._n_turns: int = 0
+
+    # ── internals ────────────────────────────────────────────────────────────
+
+    def _add_ids(self, ids: torch.Tensor | tuple[int, ...]) -> None:
+        """Append a run of token ids (scaffold, instruction or transcript)."""
+        if not isinstance(ids, torch.Tensor):
+            ids = torch.tensor(ids, dtype=torch.long, device=self._device)
+        if ids.numel() == 0:
+            return
+        emb = self._embed(ids)                                  # (L, d_model)
+        self._parts.append(emb)
+        self._flags.append(torch.zeros(emb.shape[0], device=self._device))
+        self._trace.extend(int(i) for i in ids.tolist())
+
+    def _add_embeds(self, emb: torch.Tensor, is_audio: bool, slot: str) -> None:
+        """Append raw embeddings that have no token id (audio, markers)."""
+        self._parts.append(emb)
+        self._flags.append(
+            torch.full((emb.shape[0],), 1.0 if is_audio else 0.0, device=self._device)
+        )
+        self._trace.extend([slot] * emb.shape[0])
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def add_user_turn(
+        self,
+        audio_emb:       torch.Tensor,
+        instruction_ids: torch.Tensor,
+    ) -> None:
+        """Append one complete user turn plus the assistant header that follows it.
+
+        After this call the prefix ends exactly where the assistant's transcript
+        begins — the same place EvalPrefixBatch's single-turn prefix ends — so
+        the next generated token is the first transcript token.
+
+        Args:
+            audio_emb:       (T_audio, d_model) bridge output for this turn's
+                             utterance, already sliced to its real length
+            instruction_ids: (T_inst,) pruned token ids of the instruction,
+                             already sliced to its real length
+        """
+        opener = (
+            self._chat.seg_pre_audio if self._n_turns == 0
+            else self._chat.seg_user_continuation
+        )
+        self._add_ids(opener)
+        self._add_embeds(self._marker_bos, is_audio=False, slot=AUDIO_BOS_SLOT)
+        self._add_embeds(audio_emb,        is_audio=True,  slot=AUDIO_SLOT)
+        self._add_embeds(self._marker_eos, is_audio=False, slot=AUDIO_EOS_SLOT)
+        self._add_ids(self._chat.seg_pre_instruction)
+        self._add_ids(instruction_ids)
+        self._add_ids(self._chat.seg_pre_transcript)
+        self._n_turns += 1
+
+    def add_assistant_text(self, ids: list[int] | torch.Tensor) -> None:
+        """Append an assistant turn's transcript tokens — WITHOUT a trailing eot.
+
+        The closing eot is supplied by the next turn's ``seg_user_continuation``.
+        Appending one here would double it.
+
+        Args:
+            ids: pruned token ids — the model's own generated transcript under
+                 the `self` context variant, the gold transcript under `oracle`
+        """
+        if isinstance(ids, list):
+            ids = torch.tensor(ids, dtype=torch.long, device=self._device)
+        self._add_ids(ids)
+
+    @property
+    def n_turns(self) -> int:
+        """Number of user turns appended so far."""
+        return self._n_turns
+
+    def __len__(self) -> int:
+        return len(self._trace)
+
+    @property
+    def embeddings(self) -> torch.Tensor:
+        """(L, d_model) — the assembled prefix."""
+        return torch.cat(self._parts, dim=0)
+
+    @property
+    def audio_flags(self) -> torch.Tensor:
+        """(L,) — 1.0 on audio CONTENT positions, 0.0 on scaffold and markers."""
+        return torch.cat(self._flags, dim=0)
+
+    @property
+    def trace(self) -> list[int | str]:
+        """Per-position token id, or an AUDIO_* sentinel where there is none."""
+        return list(self._trace)
+
+    def render(self, decode) -> str:
+        """Human-readable layout dump: text runs verbatim, audio spans as counts.
+
+        Consecutive token ids are decoded as one run (a BPE run only detokenises
+        correctly together) and each audio span collapses to a token count, so a
+        six-turn conversation prints in a screenful and every turn boundary is
+        eyeballable.
+
+        Args:
+            decode: callable list[int] -> str.  Note PrunedTokenizer.decode DROPS
+                    the scaffold specials by design, so pass a decoder that keeps
+                    them when the specials themselves are what needs inspecting.
+
+        Returns:
+            multi-line string, one line per run
+        """
+        out: list[str] = []
+        run: list[int] = []
+        audio_start: int | None = None
+
+        def flush_text(at: int) -> None:
+            if run:
+                out.append(f"  [{at - len(run):>5}:{at:>5}]  text   {decode(run)!r}")
+                run.clear()
+
+        def flush_audio(at: int) -> None:
+            nonlocal audio_start
+            if audio_start is not None:
+                out.append(f"  [{audio_start:>5}:{at:>5}]  AUDIO  "
+                           f"{at - audio_start} adapter tokens")
+                audio_start = None
+
+        for pos, item in enumerate(self._trace):
+            if isinstance(item, int):
+                flush_audio(pos)
+                run.append(item)
+                continue
+            flush_text(pos)
+            if item == AUDIO_SLOT:
+                if audio_start is None:
+                    audio_start = pos
+                continue
+            flush_audio(pos)
+            out.append(f"  [{pos:>5}]        {item}")
+
+        flush_text(len(self._trace))
+        flush_audio(len(self._trace))
+        return "\n".join(out)
+
+
+class ConversationPrefixBatch:
+    """EvalPrefixBatch's multi-turn sibling: batched greedy decoding over
+    prebuilt, unequal-length prefixes.
+
+    EvalPrefixBatch builds its own single-turn prefixes from an adapter output
+    and an instruction; this one is handed finished prefixes (from
+    ConversationPrefix) because a conversation's prefix accumulates across turns
+    and cannot be rederived from one utterance.  The padding and insert-at-
+    gen_pos discipline is identical and load-bearing for the same reason: causal
+    attention must never see a padding zero in the history of a real token.
+
+    The single-turn class is deliberately left untouched — the WER sweeps and
+    every banked number come through it.
+    """
+
+    def __init__(
+        self,
+        prefixes:    list[torch.Tensor],
+        audio_flags: list[torch.Tensor],
+    ) -> None:
+        """Right-pad the prefixes to a common length and build the audio mask.
+
+        Args:
+            prefixes:    per-conversation (L_i, d_model) assembled prefixes
+            audio_flags: per-conversation (L_i,) audio-content masks, same L_i
+        """
+        if not prefixes:
+            raise ValueError("ConversationPrefixBatch needs at least one prefix")
+        if len(prefixes) != len(audio_flags):
+            raise ValueError(
+                f"{len(prefixes)} prefixes but {len(audio_flags)} audio masks"
+            )
+        for i, (p, f) in enumerate(zip(prefixes, audio_flags)):
+            if p.shape[0] != f.shape[0]:
+                raise ValueError(
+                    f"conversation {i}: prefix length {p.shape[0]} != audio mask "
+                    f"length {f.shape[0]}"
+                )
+
+        B      = len(prefixes)
+        device = prefixes[0].device
+        d      = prefixes[0].shape[-1]
+
+        self._gen_pos = torch.tensor(
+            [p.shape[0] for p in prefixes], dtype=torch.long, device=device
+        )
+        L_max = int(self._gen_pos.max().item())
+
+        ctx  = torch.zeros(B, L_max, d, device=device, dtype=prefixes[0].dtype)
+        mask = torch.zeros(B, L_max, 1, device=device, dtype=prefixes[0].dtype)
+        for i, (p, f) in enumerate(zip(prefixes, audio_flags)):
+            ctx[i, : p.shape[0]]     = p
+            mask[i, : f.shape[0], 0] = f.to(mask.dtype)
+        self._ctx        = ctx
+        self._audio_mask = mask
+
+    @property
+    def audio_mask(self) -> torch.Tensor:
+        """(B, current_len, 1) audio-content mask over every turn's audio."""
+        return self._audio_mask
+
+    @property
+    def logit_indices(self) -> torch.Tensor:
+        """(B,) index of the last real position — where the next-token logit lives."""
+        return self._gen_pos - 1
+
+    def get_batch(self) -> torch.Tensor:
+        """(B, current_len, d_model) — the current batched context."""
+        return self._ctx
+
+    def generated_lengths(self) -> torch.Tensor:
+        """(B,) current per-conversation real length, including generated tokens."""
+        return self._gen_pos.clone()
+
+    def append(self, token_embeds: torch.Tensor, finished: torch.Tensor) -> None:
+        """Grow the context by one step, inserting generated embeddings at gen_pos.
+
+        Args:
+            token_embeds: (B, 1, d_model) — embedding of the just-chosen token
+            finished:     (B,) bool — conversations that already emitted the eot
+        """
+        B, _, d = token_embeds.shape
+        device  = self._ctx.device
+
+        zero_col  = torch.zeros(B, 1, d, device=device, dtype=self._ctx.dtype)
+        self._ctx = torch.cat([self._ctx, zero_col], dim=1)
+
+        mask_col = torch.zeros(B, 1, 1, device=device, dtype=self._audio_mask.dtype)
+        self._audio_mask = torch.cat([self._audio_mask, mask_col], dim=1)
+
+        for i in range(B):
+            if not finished[i]:
+                self._ctx[i, self._gen_pos[i]] = token_embeds[i, 0]
+                self._gen_pos[i] += 1
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -922,6 +1242,120 @@ if __name__ == "__main__":
         want_len = int(audio_lengths[i].item()) + 1 + int(instruction_lengths[i].item()) + 1
         assert int(flat_pfx.logit_indices[i].item()) == want_len - 1
     print("[OK] EvalPrefixBatch (flat): unchanged")
+
+    # ── Multi-turn: turn 1 must reproduce the single-turn prefix exactly ──────
+    # The whole multi-turn eval rests on this: if turn 1 differs from what the
+    # model was trained and previously evaluated on, every later turn is
+    # measuring the harness rather than the model.
+    convs = []
+    for i in range(B):
+        T_a, T_i = int(audio_lengths[i].item()), int(instruction_lengths[i].item())
+        cp = ConversationPrefix(chat, embed, audio_bos, audio_eos)
+        cp.add_user_turn(adapter_out[i, :T_a, :], instruction_ids[i, :T_i])
+        convs.append(cp)
+
+    single = EvalPrefixBatch(
+        adapter_out, audio_lengths, instruction_ids, instruction_lengths,
+        embed, chat.eot_token_id, chat=chat, audio_bos=audio_bos, audio_eos=audio_eos,
+    )
+    single_ctx = single.get_batch()
+    for i, cp in enumerate(convs):
+        L = len(cp)
+        assert int(single.logit_indices[i].item()) == L - 1, (
+            f"conv {i}: multi-turn prefix length {L} != single-turn "
+            f"{int(single.logit_indices[i].item()) + 1}"
+        )
+        assert torch.allclose(cp.embeddings, single_ctx[i, :L]), (
+            f"conv {i}: turn-1 multi-turn prefix differs from the single-turn one"
+        )
+        assert torch.equal(cp.audio_flags, single.audio_mask[i, :L, 0])
+    print("[OK] ConversationPrefix turn 1 == EvalPrefixBatch prefix (embeddings + mask)")
+
+    # ── Multi-turn: layout of a three-turn conversation ───────────────────────
+    T_A, T_I = 4, 3
+    cp = ConversationPrefix(chat, embed, audio_bos, audio_eos)
+    gold = [[30, 31], [32], [33, 34, 35]]
+    boundaries: list[int] = []
+    for t in range(3):
+        boundaries.append(len(cp))
+        cp.add_user_turn(adapter_out[0, :T_A, :], instruction_ids[0, :T_I])
+        if t < 2:
+            cp.add_assistant_text(gold[t])
+
+    trace = cp.trace
+    per_turn = (len(chat.seg_pre_audio) + 1 + T_A + 1
+                + len(chat.seg_pre_instruction) + T_I + len(chat.seg_pre_transcript))
+    assert len(trace) == 3 * per_turn + len(gold[0]) + len(gold[1]), len(trace)
+    assert boundaries == [0, per_turn + len(gold[0]),
+                          2 * per_turn + len(gold[0]) + len(gold[1])], boundaries
+
+    # Turn 1 opens with [bos]; turns 2 and 3 open with the [eot] that closes the
+    # assistant turn before them, then the same user header minus the bos.
+    assert trace[0] == chat.seg_pre_audio[0], "turn 1 must open with [bos]"
+    for t in (1, 2):
+        opener = trace[boundaries[t] : boundaries[t] + len(chat.seg_user_continuation)]
+        assert opener == list(chat.seg_user_continuation), (turn := t, opener)
+        assert opener[0] == chat.eot_token_id, "a continuation opener starts with [eot]"
+    assert chat.seg_user_continuation[1:] == chat.seg_pre_audio[1:], (
+        "continuation and first-turn user headers must differ only in their first id"
+    )
+
+    # Exactly one [eot] closes each user turn and one closes each completed
+    # assistant turn; the FINAL assistant turn has none — the model must
+    # generate it, which is what the eval measures.
+    n_eot = sum(1 for x in trace if x == chat.eot_token_id)
+    assert n_eot == 3 + 2, f"{n_eot} eot ids in a 3-turn prefix, expected 5"
+
+    # Audio content is masked in exactly three times, markers never.
+    flags = cp.audio_flags
+    assert float(flags.sum()) == 3 * T_A, float(flags.sum())
+    for t in range(3):
+        C = boundaries[t] + len(
+            chat.seg_pre_audio if t == 0 else chat.seg_user_continuation
+        ) + 1
+        on = flags[C : C + T_A]
+        assert float(on.sum()) == T_A and float(flags[C - 1]) == 0.0, f"turn {t + 1}"
+        assert float(flags[C + T_A]) == 0.0, f"turn {t + 1}: AUDIO_EOS must not be audio"
+        assert trace[C - 1] == AUDIO_BOS_SLOT and trace[C + T_A] == AUDIO_EOS_SLOT
+    print("[OK] ConversationPrefix: 3-turn layout, eot placement, per-turn audio mask")
+
+    # ── ConversationPrefixBatch: padding, gen_pos and mask growth ─────────────
+    short = ConversationPrefix(chat, embed, audio_bos, audio_eos)
+    short.add_user_turn(adapter_out[1, :2, :], instruction_ids[1, :2])
+    batch = ConversationPrefixBatch(
+        [cp.embeddings, short.embeddings], [cp.audio_flags, short.audio_flags],
+    )
+    ctx = batch.get_batch()
+    assert ctx.shape[:2] == (2, max(len(cp), len(short)))
+    assert batch.logit_indices.tolist() == [len(cp) - 1, len(short) - 1]
+    assert batch.audio_mask.shape == (2, ctx.shape[1], 1)
+    assert float(batch.audio_mask[0].sum()) == 3 * T_A
+    assert float(batch.audio_mask[1].sum()) == 2
+    # The shorter conversation's tail is padding and must be zero, not audio.
+    assert (ctx[1, len(short):] == 0).all()
+
+    fin = torch.zeros(2, dtype=torch.bool)
+    batch.append(embed.weight[torch.tensor([[30], [31]])], fin)
+    assert batch.get_batch().shape[1] == ctx.shape[1] + 1
+    assert batch.audio_mask.shape[1] == batch.get_batch().shape[1]
+    assert float(batch.audio_mask[:, -1].sum()) == 0.0, "generated tokens are never audio"
+    assert batch.logit_indices.tolist() == [len(cp), len(short)]
+    # A generated token lands at gen_pos, NOT at the padded end.
+    assert torch.allclose(batch.get_batch()[1, len(short)], embed.weight[31])
+    assert (batch.get_batch()[1, len(short) + 1 :] == 0).all()
+
+    fin = torch.tensor([True, False])
+    batch.append(embed.weight[torch.tensor([[30], [32]])], fin)
+    assert batch.logit_indices.tolist() == [len(cp), len(short) + 1], \
+        "a finished conversation must not advance gen_pos"
+
+    try:
+        ConversationPrefixBatch([cp.embeddings], [short.audio_flags])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mismatched prefix/mask lengths must raise")
+    print("[OK] ConversationPrefixBatch: padding, insert-at-gen_pos, mask growth")
 
     print("\nPASSED")
     sys.exit(0)

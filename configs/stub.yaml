@@ -1,0 +1,25 @@
+# stub.yaml — single-stage stub run for pipeline validation.
+# Data: run `python tools/make_stub_shard.py` once to generate data_stub/.
+# Matches the seed / data / optimizer config needed to compare against train.py.
+model:
+  stub: true
+  whisper_ckpt: null   # no pretrained weights for trajectory comparison
+data:
+  shards: data_stub/stub-train-{000000..000001}.tar
+  diag_shard: data_stub/stub-diag-000000.tar
+  num_workers: 0
+logging: {wandb: false, project: speech-llm-dev}
+checkpoint: {dir: checkpoints/stub, save_every: null}
+run: {max_steps: 20, instruction_mode: unformatted}
+metrics:
+  eval_every: 5
+  eval_batches: 2
+  eval_batch_size: 4
+  wer: {enabled: false, period: 5}
+stages:
+  - name: adapter_only
+    trainable: [adapter]
+    lrs: {adapter: 1.0e-4}
+    batch_size: 4
+    accum_steps: 2
+    exit: {strategy: never}

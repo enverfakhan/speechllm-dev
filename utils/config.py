@@ -526,13 +526,17 @@ def load_config(
     effective_argv: list[str] = argv if argv is not None else []
 
     # Parse thin CLI first so --config can be used to resolve config_path.
-    parser = argparse.ArgumentParser(add_help=False)
+    # parse_args, NOT parse_known_args: an unknown flag must fail loudly.  The
+    # lenient form silently swallowed retired flags (`--stub`, `--max-steps`),
+    # so a command that looked like a 20-step stub run launched the YAML's real
+    # config instead.  Stub runs are YAML configs now (configs/stub*.yaml).
+    parser = argparse.ArgumentParser(prog="training.py")
     parser.add_argument("--config",         type=Path, default=None)
     parser.add_argument("--resume",         type=Path, default=None)
     parser.add_argument("--wandb",          action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--run-name",       dest="run_name",       default=None)
     parser.add_argument("--checkpoint-dir", dest="checkpoint_dir", default=None)
-    ns, _ = parser.parse_known_args(effective_argv)
+    ns = parser.parse_args(effective_argv)
 
     # Explicit arg wins over --config in argv.
     if config_path is None:
@@ -689,6 +693,19 @@ if __name__ == "__main__":
     assert cfg3.logging.wandb == True, cfg3.logging.wandb
 
     print("[OK] CLI overrides")
+
+    # Unknown flags (incl. the retired --stub / --max-steps) are rejected, not
+    # silently ignored.  argparse reports the error by raising SystemExit(2).
+    import contextlib, io
+    for _bad in (["--stub"], ["--max-steps", "20"], ["--no-such-flag"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                load_config(argv=["--config", str(_EXAMPLE), *_bad])
+            except SystemExit as e:
+                assert e.code == 2, (_bad, e.code)
+            else:
+                raise AssertionError(f"unknown flag accepted: {_bad}")
+    print("[OK] unknown CLI flags rejected")
 
     # ── 3. Negative tests ─────────────────────────────────────────────────────
 

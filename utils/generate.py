@@ -5,9 +5,81 @@ from __future__ import annotations
 import torch
 
 from model.adapter import BridgeAdapter
-from model.sequence import ChatTemplate, EvalPrefixBatch
+from model.sequence import ChatTemplate, ConversationPrefixBatch, EvalPrefixBatch
 from model.llama import Llama
 from model.whisper_encoder import WhisperEncoder
+
+
+@torch.no_grad()
+def greedy_generate_from_prefix(
+    llama:          Llama,
+    pfx:            EvalPrefixBatch | ConversationPrefixBatch,
+    stop_token_id:  int,
+    max_new_tokens: int,
+    audio_lengths:  torch.Tensor | None = None,
+) -> list[list[int]]:
+    """Greedy-decode from an already-assembled batched prefix.
+
+    The decoding loop itself, factored out so single-turn evaluation
+    (greedy_generate, below) and multi-turn evaluation
+    (tools/run_longform.py) run byte-for-byte the same generation and cannot
+    drift.  Everything convention-specific lives in the prefix object.
+
+    Args:
+        llama:          the model
+        pfx:            EvalPrefixBatch (single-turn) or ConversationPrefixBatch
+                        (multi-turn); must expose get_batch / logit_indices /
+                        audio_mask / append
+        stop_token_id:  generation halts for a sequence when it emits this
+        max_new_tokens: hard cap, applied per sequence
+        audio_lengths:  (B,) for the FLAT convention, where the audio is the
+                        per-sample prefix [0, L) and no explicit mask exists.
+                        None under the chat convention, where pfx.audio_mask is
+                        authoritative and wins inside Llama.forward anyway.
+
+    Returns:
+        list of B lists of pruned token IDs (stop token excluded)
+    """
+    ctx    = pfx.get_batch()
+    B      = ctx.shape[0]
+    device = ctx.device
+
+    finished   = torch.zeros(B, dtype=torch.bool, device=device)
+    generated: list[list[int]] = [[] for _ in range(B)]
+
+    for _ in range(max_new_tokens):
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            # Flat: audio_lengths is unchanged as the context grows — audio
+            # remains the per-sample prefix [0, audio_lengths[i]), so the same
+            # mask keeps the gated adapters firing on audio positions only while
+            # generated tokens land beyond it.
+            # Chat: the audio sits at a scaffold offset (and, multi-turn, at
+            # several of them), so the prefix object owns the mask and grows it;
+            # it takes precedence in Llama.forward.
+            logits, _ = llama(
+                pfx.get_batch(), labels=None,
+                audio_lengths=audio_lengths, audio_mask=pfx.audio_mask,
+            )  # (B, S, vocab)
+
+        # Read the logit at each sequence's current generation position
+        idx_t    = pfx.logit_indices                          # (B,)
+        next_ids = logits[torch.arange(B, device=device), idx_t, :].argmax(dim=-1)
+
+        for i in range(B):
+            if not finished[i]:
+                if int(next_ids[i].item()) == stop_token_id:
+                    finished[i] = True
+                else:
+                    generated[i].append(int(next_ids[i].item()))
+
+        if finished.all():
+            break
+
+        safe_ids    = next_ids.masked_fill(finished, 0)
+        next_embeds = llama.embed_tokens(safe_ids.unsqueeze(1))  # (B, 1, d)
+        pfx.append(next_embeds, finished)
+
+    return generated
 
 
 @torch.no_grad()
@@ -50,9 +122,6 @@ def greedy_generate(
     Returns:
         list of B lists of pruned token IDs (stop token excluded)
     """
-    B      = mel.shape[0]
-    device = mel.device
-
     with torch.amp.autocast("cuda", dtype=torch.float16):
         enc_out     = encoder(mel)
         adapter_out = adapter(enc_out)
@@ -66,38 +135,6 @@ def greedy_generate(
         audio_eos = adapter.audio_eos if chat is not None else None,
     )
 
-    finished   = torch.zeros(B, dtype=torch.bool, device=device)
-    generated: list[list[int]] = [[] for _ in range(B)]
-
-    for _ in range(max_new_tokens):
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            # Flat: audio_lengths is unchanged as the context grows — audio
-            # remains the per-sample prefix [0, audio_lengths[i]), so the same
-            # mask keeps the gated adapters firing on audio positions only while
-            # generated tokens land beyond it.
-            # Chat: the audio sits at a scaffold offset, so EvalPrefixBatch owns
-            # the mask and grows it; it takes precedence in Llama.forward.
-            logits, _ = llama(
-                pfx.get_batch(), labels=None,
-                audio_lengths=audio_lengths, audio_mask=pfx.audio_mask,
-            )  # (B, S, vocab)
-
-        # Read the logit at each sequence's current generation position
-        idx_t    = pfx.logit_indices                          # (B,)
-        next_ids = logits[torch.arange(B, device=device), idx_t, :].argmax(dim=-1)
-
-        for i in range(B):
-            if not finished[i]:
-                if int(next_ids[i].item()) == stop_token_id:
-                    finished[i] = True
-                else:
-                    generated[i].append(int(next_ids[i].item()))
-
-        if finished.all():
-            break
-
-        safe_ids    = next_ids.masked_fill(finished, 0)
-        next_embeds = llama.embed_tokens(safe_ids.unsqueeze(1))  # (B, 1, d)
-        pfx.append(next_embeds, finished)
-
-    return generated
+    return greedy_generate_from_prefix(
+        llama, pfx, stop_token_id, max_new_tokens, audio_lengths=audio_lengths,
+    )
